@@ -142,6 +142,7 @@ export default function App() {
     { to: 'admin/tasks', label: 'Задачи' },
     { to: 'admin/logs', label: 'Логи' },
     { to: 'admin/llm', label: 'LLM' },
+    { to: 'admin/ai-metrics', label: 'AI метрики' },
     { to: 'admin/collections', label: 'Коллекции' },
   ]), [])
 
