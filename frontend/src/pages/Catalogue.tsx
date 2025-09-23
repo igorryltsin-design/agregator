@@ -85,6 +85,11 @@ export default function Catalogue() {
   const [aiDeepSearch, setAiDeepSearch] = useState<boolean>(true)
   const [aiUseTags, setAiUseTags] = useState<boolean>(true)
   const [aiUseText, setAiUseText] = useState<boolean>(true)
+  const [aiMaxCandidates, setAiMaxCandidates] = useState<number>(60)
+  const [aiChunkChars, setAiChunkChars] = useState<number>(5000)
+  const [aiMaxChunks, setAiMaxChunks] = useState<number>(40)
+  const [aiMaxSnippets, setAiMaxSnippets] = useState<number>(3)
+  const [aiFullText, setAiFullText] = useState<boolean>(false)
   const [showAiSettings, setShowAiSettings] = useState<boolean>(false)
   const [facets, setFacets] = useState<{ types: [string|null, number][], tag_facets: Record<string,[string,number][]> } | null>(null)
   const [previewRel, setPreviewRel] = useState<string| null>(null)
@@ -93,9 +98,6 @@ export default function Catalogue() {
   const [aiKeywords, setAiKeywords] = useState<string[]>([])
   const [aiSources, setAiSources] = useState<any[]>([])
   const sentinelRef = useRef<HTMLDivElement|null>(null)
-  const aiAbortRef = useRef<AbortController | null>(null)
-  const fallbackTimers = useRef<number[]>([])
-  const PROGRESS_DELAY = 250
   const [localPage, setLocalPage] = useState(page)
   const [editItem, setEditItem] = useState<FileItem | null>(null)
   const [editForm, setEditForm] = useState<any>(null)
@@ -177,14 +179,7 @@ export default function Catalogue() {
   useEffect(() => {
     let cancelled = false;
 
-    const abortCurrent = () => {
-      if (aiAbortRef.current) {
-        aiAbortRef.current.abort();
-        aiAbortRef.current = null;
-      }
-      fallbackTimers.current.forEach(id => window.clearTimeout(id));
-      fallbackTimers.current = [];
-    };
+    const abortCurrent = () => {};
 
     const hydrateItems = async (items: any[]) => {
       const ids: number[] = (items || []).map((x: any) => x?.file_id).filter(Boolean);
@@ -206,28 +201,6 @@ export default function Catalogue() {
       setLocalPage(1);
     };
 
-    const playProgress = async (lines: string[]) => {
-      fallbackTimers.current.forEach(id => window.clearTimeout(id));
-      fallbackTimers.current = [];
-      setAiProgress([]);
-      if (!lines.length) return;
-      await new Promise<void>((resolve) => {
-        lines.forEach((line, idx) => {
-          const timer = window.setTimeout(() => {
-            if (!cancelled) {
-              setAiProgress(prev => prev.includes(line) ? prev : [...prev, line]);
-            }
-            if (idx === lines.length - 1) {
-              const doneTimer = window.setTimeout(() => resolve(), PROGRESS_DELAY);
-              fallbackTimers.current.push(doneTimer);
-            }
-          }, idx * PROGRESS_DELAY);
-          fallbackTimers.current.push(timer);
-        });
-        if (lines.length === 0) resolve();
-      });
-    };
-
     const runAiSearchFallback = async (payload: any) => {
       const resp = await fetch('/api/ai-search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       if (!resp.ok) {
@@ -238,107 +211,12 @@ export default function Catalogue() {
       if (cancelled) return;
       const items = Array.isArray(data.items) ? data.items : [];
       const progressLines = Array.isArray(data.progress) && data.progress.length ? data.progress : ['Поиск завершён'];
-      await playProgress(progressLines);
+      setAiProgress(prev => (prev.length ? [...prev, ...progressLines] : progressLines));
       if (cancelled) return;
       setAiSources(items);
       setAiAnswer(data.answer || '');
       setAiKeywords(Array.isArray(data.keywords) ? data.keywords : []);
       await hydrateItems(items);
-    };
-
-    const runAiSearchStream = async (payload: any): Promise<boolean> => {
-      if (typeof ReadableStream === 'undefined') {
-        return false;
-      }
-      const ctrl = new AbortController();
-      aiAbortRef.current = ctrl;
-      const progressSeen = new Set<string>();
-      let handled = false;
-      let encounteredError = false;
-      try {
-        const resp = await fetch('/api/ai-search/stream', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-          body: JSON.stringify(payload),
-          signal: ctrl.signal,
-        });
-        if (!resp.ok) {
-          const text = await resp.text();
-          throw new Error(text || `HTTP ${resp.status}`);
-        }
-        if (!resp.body) return false;
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        const flushEvents = async (chunk: string) => {
-          const events = chunk.split(/\n\n/);
-          for (const evtRaw of events) {
-            const trimmed = evtRaw.trim();
-            if (!trimmed) continue;
-            const line = trimmed.split(/\n/).find(l => l.startsWith('data:'));
-            if (!line) continue;
-            const payloadRaw = line.slice(5).trim();
-            if (!payloadRaw || payloadRaw === '[DONE]') {
-              continue;
-            }
-            let evt: any;
-            try { evt = JSON.parse(payloadRaw); } catch { continue; }
-            if (evt.type === 'progress' && typeof evt.line === 'string') {
-              if (!progressSeen.has(evt.line)) {
-                progressSeen.add(evt.line);
-                if (!cancelled) {
-                  setAiProgress(prev => prev.includes(evt.line) ? prev : [...prev, evt.line]);
-                }
-              }
-            } else if (evt.type === 'result') {
-              handled = true;
-              const body = evt.payload || {};
-              const items = Array.isArray(body.items) ? body.items : [];
-              if (!cancelled) {
-                setAiAnswer(body.answer || '');
-                setAiKeywords(Array.isArray(body.keywords) ? body.keywords : []);
-                setAiSources(items);
-                const lines = Array.isArray(body.progress) && body.progress.length
-                  ? body.progress
-                  : (progressSeen.size ? Array.from(progressSeen) : ['Поиск завершён']);
-                setAiProgress(lines);
-              }
-              await hydrateItems(items);
-            } else if (evt.type === 'error') {
-              handled = true;
-              encounteredError = true;
-              if (!cancelled) {
-                setAiProgress([`Ошибка поиска: ${evt.message || 'Неизвестная ошибка'}`]);
-              }
-            }
-          }
-        };
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (value) {
-            buffer += decoder.decode(value, { stream: true });
-            const parts = buffer.split(/\n\n/);
-            buffer = parts.pop() || '';
-            await flushEvents(parts.join('\n\n'));
-          }
-          if (done) break;
-        }
-        if (buffer) {
-          await flushEvents(buffer);
-          buffer = '';
-        }
-      } catch (error: any) {
-        if (ctrl.signal.aborted || cancelled) return true;
-        console.error('AI search stream error:', error);
-        return false;
-      } finally {
-        aiAbortRef.current = null;
-      }
-      if (encounteredError) {
-        return false;
-      }
-      return handled;
     };
 
     const load = async () => {
@@ -352,6 +230,11 @@ export default function Catalogue() {
           setAiSources([]);
           const payload: any = { query: dq, top_k: aiTopK, deep_search: aiDeepSearch };
           payload.sources = { tags: aiUseTags, text: aiUseText };
+          payload.max_candidates = aiMaxCandidates;
+          payload.chunk_chars = aiChunkChars;
+          payload.max_chunks = aiMaxChunks;
+          payload.max_snippets = aiMaxSnippets;
+          payload.full_text = aiFullText;
           if (collectionId) payload.collection_id = Number(collectionId);
           if (type) payload.material_types = [type];
           if (year_from) payload.year_from = year_from;
@@ -409,7 +292,7 @@ export default function Catalogue() {
       cancelled = true;
       abortCurrent();
     };
-  }, [params, offset, selectedTags, aiMode, commit, aiTopK, aiDeepSearch, aiUseTags, aiUseText, dq, collectionId, type, year_from, year_to, page]);
+  }, [params, offset, selectedTags, aiMode, commit, aiTopK, aiDeepSearch, aiUseTags, aiUseText, aiMaxCandidates, aiChunkChars, aiMaxChunks, aiMaxSnippets, aiFullText, dq, collectionId, type, year_from, year_to, page]);
 
   useEffect(() => {
     const load = async () => {
@@ -528,7 +411,7 @@ export default function Catalogue() {
                 {showAiSettings ? 'Скрыть настройки' : 'Настройки ИИ'}
               </button>
               <span className="muted" style={{fontSize: '0.9rem'}}>
-                Top {aiTopK} · {aiDeepSearch ? 'Глубокий поиск' : 'Быстрый режим'}
+                Top {aiTopK} · кандидатов {aiMaxCandidates} · {aiDeepSearch ? 'глубокий' : 'быстрый'}{aiFullText ? ' · full-text' : ''}
               </span>
             </>
           )}
@@ -536,23 +419,97 @@ export default function Catalogue() {
         {aiMode && showAiSettings && (
           <div className="card p-3 mb-2 bg-light">
             <div className="row g-3">
-              <div className="col-12 col-md-4">
+              <div className="col-12 col-lg-3">
                 <label className="form-label">Top K (1–5)</label>
-                <input type="number" className="form-control" min={1} max={5} value={aiTopK}
-                       onChange={e=>{
-                         const parsed = parseInt(e.target.value || '3', 10)
-                         const next = Number.isNaN(parsed) ? 3 : parsed
-                         setAiTopK(Math.max(1, Math.min(5, next)))
-                       }} />
+                <input
+                  type="number"
+                  className="form-control"
+                  min={1}
+                  max={5}
+                  value={aiTopK}
+                  onChange={e => {
+                    const parsed = parseInt(e.target.value || '3', 10)
+                    const next = Number.isNaN(parsed) ? 3 : parsed
+                    setAiTopK(Math.max(1, Math.min(5, next)))
+                  }}
+                />
               </div>
-              <div className="col-12 col-md-4">
-                <div className="form-check mt-4">
+              <div className="col-12 col-lg-3">
+                <label className="form-label">Макс. кандидатов</label>
+                <input
+                  type="number"
+                  className="form-control"
+                  min={5}
+                  max={400}
+                  value={aiMaxCandidates}
+                  onChange={e => {
+                    const parsed = parseInt(e.target.value || '60', 10)
+                    const next = Number.isNaN(parsed) ? 60 : parsed
+                    setAiMaxCandidates(Math.max(5, Math.min(400, next)))
+                  }}
+                />
+                <small className="text-muted">Ограничение кандидатов до углублённого анализа.</small>
+              </div>
+              <div className="col-12 col-lg-3">
+                <label className="form-label">Сниппетов на файл</label>
+                <input
+                  type="number"
+                  className="form-control"
+                  min={1}
+                  max={10}
+                  value={aiMaxSnippets}
+                  onChange={e => {
+                    const parsed = parseInt(e.target.value || '3', 10)
+                    const next = Number.isNaN(parsed) ? 3 : parsed
+                    setAiMaxSnippets(Math.max(1, Math.min(10, next)))
+                  }}
+                />
+              </div>
+              <div className="col-12 col-lg-3">
+                <label className="form-label">Размер чанка (симв.)</label>
+                <input
+                  type="number"
+                  className="form-control"
+                  min={500}
+                  max={20000}
+                  value={aiChunkChars}
+                  onChange={e => {
+                    const parsed = parseInt(e.target.value || '5000', 10)
+                    const next = Number.isNaN(parsed) ? 5000 : parsed
+                    setAiChunkChars(Math.max(500, Math.min(20000, next)))
+                  }}
+                />
+              </div>
+              <div className="col-12 col-lg-3">
+                <label className="form-label">Макс. чанков</label>
+                <input
+                  type="number"
+                  className="form-control"
+                  min={1}
+                  max={200}
+                  value={aiMaxChunks}
+                  onChange={e => {
+                    const parsed = parseInt(e.target.value || '40', 10)
+                    const next = Number.isNaN(parsed) ? 40 : parsed
+                    setAiMaxChunks(Math.max(1, Math.min(200, next)))
+                  }}
+                />
+              </div>
+              <div className="col-12 col-lg-3 d-flex flex-column justify-content-center">
+                <div className="form-check form-switch">
                   <input className="form-check-input" type="checkbox" id="aiDeep" checked={aiDeepSearch} onChange={e=>setAiDeepSearch(e.target.checked)} />
                   <label className="form-check-label" htmlFor="aiDeep">Глубокий поиск по документам</label>
                 </div>
-                <small className="text-muted">Читает топ документов кусками, включая стенограммы и описания изображений.</small>
+                <small className="text-muted">Читает топ файлы кусками, включая стенограммы и описания изображений.</small>
               </div>
-              <div className="col-12 col-md-4">
+              <div className="col-12 col-lg-3 d-flex flex-column justify-content-center">
+                <div className="form-check form-switch">
+                  <input className="form-check-input" type="checkbox" id="aiFullText" checked={aiFullText} onChange={e=>setAiFullText(e.target.checked)} />
+                  <label className="form-check-label" htmlFor="aiFullText">Полнотекстовое сканирование</label>
+                </div>
+                <small className="text-muted">Читает сам файл вместо кэша. Медленнее, но точнее.</small>
+              </div>
+              <div className="col-12 col-lg-3">
                 <div className="form-check">
                   <input className="form-check-input" type="checkbox" id="aiTags" checked={aiUseTags} onChange={e=>setAiUseTags(e.target.checked)} />
                   <label className="form-check-label" htmlFor="aiTags">Учитывать теги</label>

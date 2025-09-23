@@ -6,7 +6,7 @@
   "LMSTUDIO_API_KEY": "",
   "TRANSCRIBE_ENABLED": true,
   "TRANSCRIBE_BACKEND": "faster-whisper",
-  "TRANSCRIBE_MODEL_PATH": "large-v3",
+  "TRANSCRIBE_MODEL_PATH": "small",
   "TRANSCRIBE_LANGUAGE": "ru",
   "SUMMARIZE_AUDIO": true,
   "AUDIO_KEYWORDS_LLM": true,
