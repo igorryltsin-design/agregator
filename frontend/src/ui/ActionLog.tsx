@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useMemo, useState } from 'react'
+import { actionLogLevelRu } from '../utils/locale'
 
 type LogItem = { id: number; level: 'info'|'error'|'success'; text: string; t: number }
 type Ctx = { push: (text: string, level?: LogItem['level']) => void }
@@ -33,7 +34,7 @@ export default function ActionLogProvider({ children }: { children: React.ReactN
               {items.map(it => (
                 <div key={it.id}>
                   <span className="muted">{new Date(it.t).toLocaleTimeString()} </span>
-                  <span>[{it.level.toUpperCase()}]</span>
+                  <span>[{actionLogLevelRu(it.level)}]</span>
                   <span> {it.text}</span>
                 </div>
               ))}
@@ -44,4 +45,3 @@ export default function ActionLogProvider({ children }: { children: React.ReactN
     </ActionLogCtx.Provider>
   )
 }
-

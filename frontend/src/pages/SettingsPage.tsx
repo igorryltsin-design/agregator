@@ -474,7 +474,7 @@ export default function SettingsPage() {
         <div className="row g-3">
           <div className="col-md-8">
             <label className="form-label">Корневая папка</label>
-            <input className="form-control" placeholder="/path/to/library" value={s.scan_root} onChange={e => setS({ ...s, scan_root: e.target.value })} />
+            <input className="form-control" placeholder="C:/путь/к/библиотеке" value={s.scan_root} onChange={e => setS({ ...s, scan_root: e.target.value })} />
           </div>
           <div className="col-md-4 d-flex align-items-end">
             <div className="form-check form-switch">
@@ -531,11 +531,11 @@ export default function SettingsPage() {
         <div className="fw-semibold mb-2">LLM и типизация</div>
         <div className="row g-3">
           <div className="col-md-5">
-            <label className="form-label">LM API Base</label>
+            <label className="form-label">Базовый URL LLM</label>
             <input className="form-control" placeholder="http://localhost:1234/v1" value={s.lm_base} onChange={e => setS({ ...s, lm_base: e.target.value })} />
           </div>
           <div className="col-md-4">
-            <label className="form-label">LM Модель</label>
+            <label className="form-label">Модель LLM</label>
             <input className="form-control" placeholder="gpt-4o-mini" value={s.lm_model} onChange={e => setS({ ...s, lm_model: e.target.value })} />
           </div>
           <div className="col-md-3">
@@ -833,19 +833,19 @@ export default function SettingsPage() {
           <summary className="fw-semibold">Промпты LLM</summary>
           <div className="row g-2 mt-2">
             <div className="col-md-6">
-              <label className="form-label">metadata_system</label>
+              <label className="form-label">Промпт metadata_system</label>
               <textarea className="form-control" rows={4} value={s.prompts?.metadata_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, metadata_system: e.target.value } })} />
             </div>
             <div className="col-md-6">
-              <label className="form-label">summarize_audio_system</label>
+              <label className="form-label">Промпт summarize_audio_system</label>
               <textarea className="form-control" rows={4} value={s.prompts?.summarize_audio_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, summarize_audio_system: e.target.value } })} />
             </div>
             <div className="col-md-6">
-              <label className="form-label">keywords_system</label>
+              <label className="form-label">Промпт keywords_system</label>
               <textarea className="form-control" rows={4} value={s.prompts?.keywords_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, keywords_system: e.target.value } })} />
             </div>
             <div className="col-md-6">
-              <label className="form-label">vision_system</label>
+              <label className="form-label">Промпт vision_system</label>
               <textarea className="form-control" rows={4} value={s.prompts?.vision_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, vision_system: e.target.value } })} />
             </div>
           </div>
