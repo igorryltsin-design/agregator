@@ -137,7 +137,7 @@ export default function Catalogue() {
     icon: progressIconFor(line),
   })), [aiProgress, progressIconFor])
 
-  const sendFeedback = useCallback(async (payload: { action: string; file_id?: number; keyword?: string; score?: number }) => {
+  const sendFeedback = useCallback(async (payload: { action: string; file_id?: number; keyword?: string; score?: number }, onSuccess?: () => void) => {
     if (!aiQueryHash) return
     const ident = payload.file_id !== undefined && payload.file_id !== null ? `file-${payload.file_id}` : `kw-${payload.keyword}`
     const key = `${payload.action}:${ident}`
@@ -152,6 +152,7 @@ export default function Catalogue() {
         throw new Error(`HTTP ${resp.status}`)
       }
       setFeedbackStatus(prev => ({ ...prev, [key]: 'done' }))
+      onSuccess?.()
     } catch (error) {
       console.error('feedback error', error)
       setFeedbackStatus(prev => ({ ...prev, [key]: 'error' }))
@@ -166,6 +167,13 @@ export default function Catalogue() {
   const handleKeywordFeedback = useCallback((keyword: string, action: 'relevant' | 'irrelevant') => {
     if (!aiQueryHash) return
     sendFeedback({ keyword, action })
+  }, [aiQueryHash, sendFeedback])
+
+  const handleKeywordRestore = useCallback((keyword: string) => {
+    if (!aiQueryHash) return
+    sendFeedback({ keyword, action: 'relevant' }, () => {
+      setAiFilteredKeywords(prev => prev.filter(k => k !== keyword))
+    })
   }, [aiQueryHash, sendFeedback])
 
   const openEdit = (f: FileItem) => {
@@ -689,9 +697,24 @@ export default function Catalogue() {
               <div className="mt-2">
                 <div className="text-muted" style={{fontSize:'0.85rem'}}>Исключённые термины</div>
                 <div className="d-flex flex-wrap gap-2 mt-1">
-                  {aiFilteredKeywords.map((k,i)=> (
-                    <span key={i} className="badge bg-light text-secondary" style={{textDecoration:'line-through'}}>{k}</span>
-                  ))}
+                  {aiFilteredKeywords.map((k,i)=> {
+                    const busyKey = `relevant:kw-${k}`
+                    const status = feedbackStatus[busyKey]
+                    return (
+                      <div key={i} className="d-inline-flex align-items-center gap-1 border rounded px-2 py-1" style={{fontSize:12}}>
+                        <span style={{textDecoration:'line-through'}}>{k}</span>
+                        <button
+                          className="btn btn-sm btn-outline-success"
+                          style={{fontSize:11, padding:'0 6px'}}
+                          disabled={status === 'loading'}
+                          onClick={()=>handleKeywordRestore(k)}
+                        >
+                          Вернуть
+                        </button>
+                        {status === 'error' && <span className="text-danger">!</span>}
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )}
