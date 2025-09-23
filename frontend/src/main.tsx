@@ -16,6 +16,7 @@ import AdminTasksPage from './pages/AdminTasksPage'
 import AdminLogsPage from './pages/AdminLogsPage'
 import AdminLlmPage from './pages/AdminLlmPage'
 import AdminCollectionsPage from './pages/AdminCollectionsPage'
+import AdminAiMetricsPage from './pages/AdminAiMetricsPage'
 import ToastProvider from './ui/Toasts'
 import AuthProvider from './ui/Auth'
 
@@ -35,6 +36,7 @@ const router = createBrowserRouter([
       { path: 'admin/logs', element: <AdminLogsPage /> },
       { path: 'admin/llm', element: <AdminLlmPage /> },
       { path: 'admin/collections', element: <AdminCollectionsPage /> },
+      { path: 'admin/ai-metrics', element: <AdminAiMetricsPage /> },
     ],
   },
   { path: '/login', element: <LoginPage /> },

@@ -43,6 +43,9 @@ from models import (
     TaskRecord,
     LlmEndpoint,
     AiWordAccess,
+    AiSearchSnippetCache,
+    AiSearchKeywordFeedback,
+    AiSearchMetric,
 )
 
 import fitz  # библиотека PyMuPDF
@@ -187,6 +190,9 @@ AI_SCORE_TAG = _getf('AI_SCORE_TAG', 1.0)
 AI_BOOST_PHRASE = _getf('AI_BOOST_PHRASE', 3.0)
 AI_BOOST_MULTI = _getf('AI_BOOST_MULTI', 0.6)  # дополнительный бонус за каждое уникальное слово
 AI_BOOST_SNIPPET_COOCCUR = _getf('AI_BOOST_SNIPPET_COOCCUR', 0.8)
+SNIPPET_CACHE_TTL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_TTL_HOURS', '24'))
+KEYWORD_IDF_MIN = float(os.getenv('KEYWORD_IDF_MIN', '1.25'))
+CACHE_CLEANUP_INTERVAL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_SWEEP_INTERVAL_HOURS', '24'))
 
 def _now() -> float:
     return time.time()
@@ -196,6 +202,145 @@ def _sha256(s: str) -> str:
         return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
     except Exception:
         return hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
+
+def _query_fingerprint(query: str, payload: dict | None = None) -> str:
+    payload = payload or {}
+    serialized = {
+        'query': query.strip(),
+        'top_k': payload.get('top_k'),
+        'deep_search': bool(payload.get('deep_search')),
+        'full_text': bool(payload.get('full_text')),
+        'llm_snippets': bool(payload.get('llm_snippets')),
+        'sources': payload.get('sources'),
+        'filters': {
+            'collection_ids': payload.get('collection_ids') or payload.get('collection_id'),
+            'material_types': payload.get('material_types'),
+            'year_from': payload.get('year_from'),
+            'year_to': payload.get('year_to'),
+            'tag_filters': payload.get('tag_filters'),
+        }
+    }
+    try:
+        data = json.dumps(serialized, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        data = str(serialized)
+    return _sha256(data)
+
+def _get_cached_snippet(file_id: int, query_hash: str, llm_variant: bool):
+    if not file_id or not query_hash:
+        return None
+    try:
+        entry = AiSearchSnippetCache.query.filter_by(file_id=file_id, query_hash=query_hash, llm_variant=llm_variant).first()
+    except Exception:
+        entry = None
+    if not entry:
+        return None
+    if entry.expires_at and entry.expires_at < datetime.utcnow():
+        try:
+            db.session.delete(entry)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        return None
+    return entry
+
+
+def _store_snippet_cache(file_id: int, query_hash: str, llm_variant: bool, snippet: str, meta: dict | None = None, ttl_hours: int | None = None):
+    if not file_id or not query_hash or not snippet:
+        return
+    ttl = ttl_hours if ttl_hours is not None else SNIPPET_CACHE_TTL_HOURS
+    expires_at = datetime.utcnow() + timedelta(hours=max(1, ttl)) if ttl else None
+    try:
+        entry = AiSearchSnippetCache.query.filter_by(file_id=file_id, query_hash=query_hash, llm_variant=llm_variant).first()
+        meta_json = json.dumps(meta, ensure_ascii=False) if meta else None
+        if entry:
+            entry.snippet = snippet
+            entry.meta = meta_json
+            entry.expires_at = expires_at
+        else:
+            entry = AiSearchSnippetCache(
+                file_id=file_id,
+                query_hash=query_hash,
+                llm_variant=llm_variant,
+                snippet=snippet,
+                meta=meta_json,
+                expires_at=expires_at,
+            )
+            db.session.add(entry)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def _prune_expired_snippet_cache() -> int:
+    cutoff = datetime.utcnow()
+    try:
+        q = AiSearchSnippetCache.query.filter(
+            AiSearchSnippetCache.expires_at.isnot(None),
+            AiSearchSnippetCache.expires_at < cutoff
+        )
+        deleted = q.delete(synchronize_session=False)
+        if deleted:
+            db.session.commit()
+            app.logger.info(f"[ai-search] snippet cache cleanup removed {deleted} rows")
+        else:
+            db.session.commit()
+        return deleted or 0
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.warning(f"[ai-search] snippet cache cleanup failed: {exc}")
+        return 0
+
+
+_CLEANUP_THREAD_STARTED = False
+
+
+def _start_cache_cleanup_scheduler() -> None:
+    global _CLEANUP_THREAD_STARTED
+    if _CLEANUP_THREAD_STARTED or CACHE_CLEANUP_INTERVAL_HOURS <= 0:
+        return
+
+    interval = max(1, CACHE_CLEANUP_INTERVAL_HOURS) * 3600
+
+    def loop():
+        while True:
+            try:
+                with app.app_context():
+                    _prune_expired_snippet_cache()
+            except Exception:
+                app.logger.exception("[ai-search] cache cleanup loop error")
+            time.sleep(interval)
+
+    threading.Thread(target=loop, name='ai-snippet-cache-cleaner', daemon=True).start()
+    _CLEANUP_THREAD_STARTED = True
+
+def _record_search_metric(query_hash: str, durations: dict[str, float], user: User | None, meta_extra: dict | None = None):
+    try:
+        known_fields = {'total', 'keywords', 'candidates', 'deep', 'llm_answer', 'llm_snippets'}
+        extra_meta = {}
+        for key, value in durations.items():
+            if key not in known_fields and value is not None:
+                extra_meta[key] = value
+        if meta_extra:
+            for key, value in meta_extra.items():
+                if value is None:
+                    continue
+                extra_meta[key] = value
+        metric = AiSearchMetric(
+            query_hash=query_hash,
+            user_id=getattr(user, 'id', None),
+            total_ms=int(durations.get('total', 0) * 1000),
+            keywords_ms=int(durations.get('keywords', 0) * 1000) if 'keywords' in durations else None,
+            candidate_ms=int(durations.get('candidates', 0) * 1000) if 'candidates' in durations else None,
+            deep_ms=int(durations.get('deep', 0) * 1000) if 'deep' in durations else None,
+            llm_answer_ms=int(durations.get('llm_answer', 0) * 1000) if 'llm_answer' in durations else None,
+            llm_snippet_ms=int(durations.get('llm_snippets', 0) * 1000) if 'llm_snippets' in durations else None,
+            meta=json.dumps(extra_meta, ensure_ascii=False) if extra_meta else None,
+        )
+        db.session.add(metric)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 # ------------------- Конфигурация -------------------
 
@@ -4317,7 +4462,53 @@ def diag_transcribe():
         return jsonify(res)
     except Exception as e:
         res["warnings"].append(f"unexpected:{e}")
-        return jsonify(res), 500
+    return jsonify(res), 500
+
+@app.route('/api/admin/ai-search/metrics', methods=['GET', 'DELETE'])
+@require_admin
+def api_admin_ai_metrics():
+    if request.method == 'DELETE':
+        try:
+            deleted = AiSearchMetric.query.delete(synchronize_session=False)
+            db.session.commit()
+            return jsonify({'ok': True, 'deleted': deleted or 0})
+        except Exception as exc:
+            db.session.rollback()
+            app.logger.warning(f"[ai-metrics] cleanup failed: {exc}")
+            return jsonify({'ok': False, 'error': 'Не удалось очистить метрики'}), 500
+
+    try:
+        limit = int(request.args.get('limit', '100'))
+    except Exception:
+        limit = 100
+    limit = max(1, min(limit, 500))
+    rows = AiSearchMetric.query.order_by(AiSearchMetric.created_at.desc()).limit(limit).all()
+    payload = []
+    for row in rows:
+        user_obj = row.user
+        payload.append({
+            'id': row.id,
+            'query_hash': row.query_hash,
+            'user_id': row.user_id,
+             'user_username': getattr(user_obj, 'username', None),
+             'user_full_name': getattr(user_obj, 'full_name', None),
+            'total_ms': row.total_ms,
+            'keywords_ms': row.keywords_ms,
+            'candidate_ms': row.candidate_ms,
+            'deep_ms': row.deep_ms,
+            'llm_answer_ms': row.llm_answer_ms,
+            'llm_snippet_ms': row.llm_snippet_ms,
+            'created_at': row.created_at.isoformat() if row.created_at else None,
+            'meta': row.meta,
+        })
+    summary = {}
+    if rows:
+        fields = ['total_ms', 'keywords_ms', 'candidate_ms', 'deep_ms', 'llm_answer_ms', 'llm_snippet_ms']
+        for field in fields:
+            vals = [getattr(r, field) for r in rows if getattr(r, field) is not None]
+            if vals:
+                summary[field] = sum(vals) / len(vals)
+    return jsonify({'ok': True, 'items': payload, 'summary': summary})
 
 # ------------------- Statistics & Visualization -------------------
 from collections import Counter, defaultdict
@@ -6228,12 +6419,17 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     original_top_k = top_k
     top_k = max(1, min(5, top_k))
     deep_search = bool(data.get('deep_search'))
+    user = getattr(g, 'current_user', None)
+    t_total_start = time.monotonic()
+    stage_start = t_total_start
+    durations: dict[str, float] = {}
     try:
-        max_candidates = int(data.get('max_candidates') or 60)
+        max_candidates = int(data.get('max_candidates') or 15)
     except Exception:
-        max_candidates = 60
+        max_candidates = 15
     max_candidates = max(5, min(max_candidates, 400))
     full_text = bool(data.get('full_text'))
+    llm_snippets = bool(data.get('llm_snippets'))
     try:
         chunk_chars = int(data.get('chunk_chars') or 5000)
     except Exception:
@@ -6250,7 +6446,9 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         max_snippets = 3
     max_snippets = max(1, min(max_snippets, 10))
     progress = _ProgressLogger(progress_cb)
+    query_hash = _query_fingerprint(query, data)
     progress.add(f"Запрос: {query}")
+    progress.add(f"Отпечаток запроса: {query_hash[:12]}…")
     if top_k != original_top_k:
         progress.add(f"Запрошено Top K = {original_top_k}, ограничиваем до {top_k}")
     else:
@@ -6262,6 +6460,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     progress.add(f"Источники: теги {'вкл' if use_tags else 'выкл'}, метаданные {'вкл' if use_text else 'выкл'}")
     progress.add(f"Параметры: кандидатов ≤ {max_candidates}, сниппетов ≤ {max_snippets}")
     progress.add(f"Контент: чанк {chunk_chars} симв., чанков ≤ {max_chunks}, full-text {'вкл' if full_text else 'выкл'}")
+    progress.add(f"LLM сниппеты: {'вкл' if llm_snippets else 'выкл'}")
     # Необязательный фильтр по коллекциям (список id)
     if 'collection_id' in data and 'collection_ids' not in data:
         data['collection_ids'] = [data['collection_id']]
@@ -6304,6 +6503,8 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         if w and w not in seen:
             seen.add(w)
             terms.append(w)
+    original_terms = list(terms)
+    filtered_out_terms: list[str] = []
     if not terms and query:
         # запасной вариант: используем исходный запрос как термин
         terms = _tokenize_query(query) or [query.lower()]
@@ -6317,6 +6518,38 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
 
     # Предварительно считаем IDF по каждому термину
     idf = _idf_for_terms(terms)
+    filtered_terms = [w for w in terms if idf.get(w, 1.0) >= KEYWORD_IDF_MIN]
+    if filtered_terms:
+        if len(filtered_terms) < len(terms):
+            removed = [w for w in terms if w not in filtered_terms]
+            filtered_out_terms.extend(removed)
+            progress.add(f"Фильтр ключевых слов: убрано {len(removed)} общеупотребительных терминов")
+        terms = filtered_terms
+    elif terms:
+        fallback_terms = [w for w in terms if len(w) >= 4]
+        if fallback_terms:
+            removed = [w for w in terms if w not in fallback_terms]
+            if removed:
+                filtered_out_terms.extend(removed)
+            progress.add("Фильтр ключевых слов: оставляем только более длинные термины")
+            terms = fallback_terms
+    try:
+        feedback_rows = AiSearchKeywordFeedback.query.filter_by(query_hash=query_hash).all()
+    except Exception:
+        feedback_rows = []
+
+    if terms:
+        banned_terms = {str(row.keyword).lower() for row in feedback_rows if getattr(row, 'keyword', None) and row.action == 'irrelevant'}
+        if banned_terms:
+            before_len = len(terms)
+            terms = [w for w in terms if w not in banned_terms]
+            removed = [w for w in original_terms if w in banned_terms]
+            if removed:
+                filtered_out_terms.extend([w for w in removed if w not in filtered_out_terms])
+            if len(terms) < before_len:
+                progress.add(f"Фильтр обратной связи: игнорируем {before_len - len(terms)} термина по отзывам")
+    durations['keywords'] = time.monotonic() - stage_start
+    stage_start = time.monotonic()
 
     # Накапливаем кандидатов с оценками и попаданиями
     scores: dict[int, float] = {}
@@ -6400,6 +6633,8 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         progress.add(f"Метаданные: найдено кандидатов {len(scores)}")
     else:
         progress.add("Метаданные: пропущено (источник отключён)")
+    durations['candidates'] = time.monotonic() - stage_start
+    stage_start = time.monotonic()
 
     # Формируем результаты
     file_ids = list(scores.keys())
@@ -6501,6 +6736,14 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         if total_ranked > max_candidates:
             progress.add(f"Ограничиваем до {max_candidates} лучших по баллу")
             results = results[:max_candidates]
+        dismissed_file_ids = {int(row.file_id) for row in feedback_rows if getattr(row, 'file_id', None) and row.action == 'irrelevant'}
+        if dismissed_file_ids:
+            before_len = len(results)
+            results = [res for res in results if int(res.get('file_id') or 0) not in dismissed_file_ids]
+            after_len = len(results)
+            if after_len < before_len:
+                progress.add(f"Обратная связь: исключено {before_len - after_len} источников, помеченных как нерелевантные")
+
         for idx, res in enumerate(results, start=1):
             cand_title = (res.get('title') or res.get('rel_path') or f"file-{res.get('file_id')}").strip()
             progress.add(f"Кандидат [{idx}]: {cand_title}")
@@ -6547,6 +6790,8 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                     status += f"; источники: {srcs}"
                 progress.add(f"{scan_step} [{idx}/{scan_limit}]: {title} — {status}")
             results.sort(key=lambda x: (x.get('score') or 0.0, id2file.get(x['file_id']).mtime or 0.0), reverse=True)
+        durations['deep'] = time.monotonic() - stage_start
+        stage_start = time.monotonic()
         results = results[:top_k]
         progress.add(f"Отобрано документов: {len(results)}")
         for idx, res in enumerate(results, start=1):
@@ -6557,12 +6802,54 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
             else:
                 summary = ', '.join(sources)
             progress.add(f"Снипеты [{idx}] {title}: {summary}")
+        if llm_snippets and results:
+            total_targets = len(results)
+            progress.add(f"LLM сниппеты: формируем для {total_targets} документов")
+            for idx, res in enumerate(results, start=1):
+                title = (res.get('title') or res.get('rel_path') or f"file-{res.get('file_id')}").strip()
+                base_snippets = res.get('snippets') or []
+                context = " ".join(base_snippets).strip()
+                if not context:
+                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — пропущено (нет контекста)")
+                    continue
+                cache_entry = _get_cached_snippet(res.get('file_id'), query_hash, True)
+                if cache_entry and cache_entry.snippet:
+                    res['llm_snippet'] = cache_entry.snippet
+                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — cache hit")
+                    _store_snippet_cache(res.get('file_id'), query_hash, True, cache_entry.snippet, meta={'len': len(cache_entry.snippet)}, ttl_hours=SNIPPET_CACHE_TTL_HOURS)
+                    continue
+                ctx = context[:1200]
+                system = (
+                    "Ты создаёшь короткий сниппет (до двух предложений) для поисковой выдачи. "
+                    "Используй только предоставленный текст, не добавляй новых фактов."
+                )
+                user_msg = (
+                    f"Запрос: {query}\n"
+                    f"Фрагменты документа:\n{ctx}\n"
+                    "Сформулируй 1-2 предложения с ключевыми фактами и сохрани смысл."
+                )
+                snippet_text = ""
+                error_logged = False
+                try:
+                    snippet_text = (call_lmstudio_compose(system, user_msg, temperature=0.0, max_tokens=180) or '').strip()
+                except Exception as exc:
+                    error_logged = True
+                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — ошибка: {exc}")
+                if snippet_text:
+                    res['llm_snippet'] = snippet_text
+                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — готово ({len(snippet_text)} символов)")
+                    _store_snippet_cache(res.get('file_id'), query_hash, True, snippet_text, meta={'len': len(snippet_text)})
+                elif not error_logged:
+                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — пустой ответ")
+            durations['llm_snippets'] = time.monotonic() - stage_start
+            stage_start = time.monotonic()
     else:
         progress.add("Совпадения не найдены")
 
     # Необязательный короткий ответ, используя сниппеты как контекст (поисковый промпт)
     answer = ""
     if results:
+        stage_start = time.monotonic()
         try:
             topn = results[:10]
             lines = []
@@ -6584,9 +6871,13 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 progress.add(f"LLM ответ готов ({len(answer)} символов)")
             else:
                 progress.add("LLM ответ пуст")
+            durations['llm_answer'] = time.monotonic() - stage_start
+            stage_start = time.monotonic()
         except Exception:
             answer = ""
             progress.add("LLM ответ: ошибка генерации")
+            durations['llm_answer'] = time.monotonic() - stage_start
+            stage_start = time.monotonic()
 
     # Необязательно: лёгкое реранжирование топ-15 через LLM с контекстом сниппетов
     if AI_RERANK_LLM and results:
@@ -6643,9 +6934,21 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         except Exception:
             pass
 
+    filtered_keywords = sorted({w for w in filtered_out_terms if w})
+    durations['total'] = time.monotonic() - t_total_start
+    extra_meta = {
+        'query_preview': query[:200],
+        'answer_preview': (answer or '')[:400],
+        'keyword_count': len(terms),
+        'filtered_keywords': filtered_keywords,
+    }
+    _record_search_metric(query_hash, durations, user, extra_meta)
+
     return {
         "query": query,
+        "query_hash": query_hash,
         "keywords": terms,
+        "filtered_keywords": filtered_keywords,
         "answer": answer,
         "items": results,
         "progress": progress.lines,
@@ -6769,6 +7072,61 @@ def api_ai_search_stream():
     except Exception:
         pass
     return resp
+
+
+@app.route('/api/ai-search/feedback', methods=['POST'])
+def api_ai_search_feedback():
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    data = request.get_json(silent=True) or {}
+    query_hash = str(data.get('query_hash') or '').strip()
+    action = str(data.get('action') or '').strip().lower()
+    if not query_hash or action not in {'click', 'relevant', 'irrelevant', 'ignored'}:
+        return jsonify({'ok': False, 'error': 'Некорректные параметры'}), 400
+    keyword = (data.get('keyword') or '').strip() or None
+    detail = data.get('detail')
+    file_id = data.get('file_id')
+    try:
+        file_id_int = int(file_id) if file_id is not None else None
+    except Exception:
+        file_id_int = None
+    score = data.get('score')
+    try:
+        score_val = float(score) if score is not None else None
+    except Exception:
+        score_val = None
+    entry = AiSearchKeywordFeedback(
+        user_id=user.id,
+        file_id=file_id_int,
+        query_hash=query_hash,
+        keyword=keyword,
+        action=action,
+        score=score_val,
+        detail=json.dumps(detail, ensure_ascii=False) if isinstance(detail, (dict, list)) else (detail or None),
+    )
+    try:
+        db.session.add(entry)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.warning(f"[ai-feedback] failed to store feedback: {exc}")
+        return jsonify({'ok': False, 'error': 'Не удалось сохранить отклик'}), 500
+    return jsonify({'ok': True})
+
+
+def _initialize_background_jobs():
+    _start_cache_cleanup_scheduler()
+
+
+if hasattr(app, "before_serving"):
+    app.before_serving(_initialize_background_jobs)
+
+
+@app.before_request
+def _ensure_background_jobs_started():
+    if not _CLEANUP_THREAD_STARTED:
+        _initialize_background_jobs()
 
 
 if __name__ == "__main__":

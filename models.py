@@ -156,6 +156,57 @@ class AiWordAccess(db.Model):
     granted_by_user = db.relationship("User", foreign_keys=[granted_by], lazy=True)
 
 
+class AiSearchSnippetCache(db.Model):
+    __tablename__ = "ai_search_snippet_cache"
+    id = db.Column(db.Integer, primary_key=True)
+    file_id = db.Column(db.Integer, db.ForeignKey("files.id", ondelete="CASCADE"), index=True, nullable=False)
+    query_hash = db.Column(db.String(64), index=True, nullable=False)
+    llm_variant = db.Column(db.Boolean, nullable=False, default=False)
+    snippet = db.Column(db.Text, nullable=False)
+    meta = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=True, index=True)
+
+    file = db.relationship("File", backref="snippet_cache_entries", lazy=True)
+    __table_args__ = (
+        db.UniqueConstraint('file_id', 'query_hash', 'llm_variant', name='uq_ai_snippet_key'),
+    )
+
+
+class AiSearchKeywordFeedback(db.Model):
+    __tablename__ = "ai_search_keyword_feedback"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True)
+    file_id = db.Column(db.Integer, db.ForeignKey("files.id", ondelete="SET NULL"), index=True, nullable=True)
+    query_hash = db.Column(db.String(64), index=True, nullable=False)
+    keyword = db.Column(db.String(120), nullable=True)
+    action = db.Column(db.String(32), nullable=False)  # clicked, relevant, irrelevant, ignored
+    score = db.Column(db.Float, nullable=True)
+    detail = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship("User", backref="ai_keyword_feedback", lazy=True)
+    file = db.relationship("File", backref="ai_keyword_feedback", lazy=True)
+
+
+class AiSearchMetric(db.Model):
+    __tablename__ = "ai_search_metrics"
+    id = db.Column(db.Integer, primary_key=True)
+    query_hash = db.Column(db.String(64), index=True, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True)
+    total_ms = db.Column(db.Integer, nullable=False)
+    keywords_ms = db.Column(db.Integer, nullable=True)
+    candidate_ms = db.Column(db.Integer, nullable=True)
+    deep_ms = db.Column(db.Integer, nullable=True)
+    llm_answer_ms = db.Column(db.Integer, nullable=True)
+    llm_snippet_ms = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    meta = db.Column(db.Text, nullable=True)
+
+    user = db.relationship("User", lazy=True)
+
+
 def upsert_tag(file_obj: File, key: str, value: str):
     key = (key or "").strip()
     value = (value or "").strip()

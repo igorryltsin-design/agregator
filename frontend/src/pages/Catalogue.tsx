@@ -85,11 +85,12 @@ export default function Catalogue() {
   const [aiDeepSearch, setAiDeepSearch] = useState<boolean>(true)
   const [aiUseTags, setAiUseTags] = useState<boolean>(true)
   const [aiUseText, setAiUseText] = useState<boolean>(true)
-  const [aiMaxCandidates, setAiMaxCandidates] = useState<number>(60)
+  const [aiMaxCandidates, setAiMaxCandidates] = useState<number>(15)
   const [aiChunkChars, setAiChunkChars] = useState<number>(5000)
   const [aiMaxChunks, setAiMaxChunks] = useState<number>(40)
   const [aiMaxSnippets, setAiMaxSnippets] = useState<number>(3)
   const [aiFullText, setAiFullText] = useState<boolean>(false)
+  const [aiUseLlmSnippets, setAiUseLlmSnippets] = useState<boolean>(false)
   const [showAiSettings, setShowAiSettings] = useState<boolean>(false)
   const [facets, setFacets] = useState<{ types: [string|null, number][], tag_facets: Record<string,[string,number][]> } | null>(null)
   const [previewRel, setPreviewRel] = useState<string| null>(null)
@@ -97,6 +98,9 @@ export default function Catalogue() {
   const [aiAnswer, setAiAnswer] = useState<string>('')
   const [aiKeywords, setAiKeywords] = useState<string[]>([])
   const [aiSources, setAiSources] = useState<any[]>([])
+  const [aiFilteredKeywords, setAiFilteredKeywords] = useState<string[]>([])
+  const [aiQueryHash, setAiQueryHash] = useState<string>('')
+  const [feedbackStatus, setFeedbackStatus] = useState<Record<string, string>>({})
   const sentinelRef = useRef<HTMLDivElement|null>(null)
   const [localPage, setLocalPage] = useState(page)
   const [editItem, setEditItem] = useState<FileItem | null>(null)
@@ -112,6 +116,57 @@ export default function Catalogue() {
       console.debug(prefixed)
     }
   }, [])
+
+  const progressIconFor = useCallback((line: string): string => {
+    const lower = line.toLowerCase()
+    if (lower.startsWith('запрос')) return '📝'
+    if (lower.includes('ключевые термины')) return '🔑'
+    if (lower.includes('фильтр')) return '🧹'
+    if (lower.includes('кандидат')) return '📄'
+    if (lower.includes('глубок')) return '🔎'
+    if (lower.includes('ранжирование')) return '🏁'
+    if (lower.includes('llm ответ')) return '💬'
+    if (lower.includes('llm сниппеты')) return '🧠'
+    if (lower.includes('полнотекст')) return '📚'
+    return '•'
+  }, [])
+
+  const progressItems = useMemo(() => aiProgress.map((line, idx) => ({
+    id: `${idx}-${line}`,
+    line,
+    icon: progressIconFor(line),
+  })), [aiProgress, progressIconFor])
+
+  const sendFeedback = useCallback(async (payload: { action: string; file_id?: number; keyword?: string; score?: number }) => {
+    if (!aiQueryHash) return
+    const ident = payload.file_id !== undefined && payload.file_id !== null ? `file-${payload.file_id}` : `kw-${payload.keyword}`
+    const key = `${payload.action}:${ident}`
+    setFeedbackStatus(prev => ({ ...prev, [key]: 'loading' }))
+    try {
+      const resp = await fetch('/api/ai-search/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, query_hash: aiQueryHash }),
+      })
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`)
+      }
+      setFeedbackStatus(prev => ({ ...prev, [key]: 'done' }))
+    } catch (error) {
+      console.error('feedback error', error)
+      setFeedbackStatus(prev => ({ ...prev, [key]: 'error' }))
+    }
+  }, [aiQueryHash])
+
+  const handleSourceFeedback = useCallback((fileId: number, action: 'relevant' | 'irrelevant') => {
+    if (!aiQueryHash) return
+    sendFeedback({ file_id: fileId, action })
+  }, [aiQueryHash, sendFeedback])
+
+  const handleKeywordFeedback = useCallback((keyword: string, action: 'relevant' | 'irrelevant') => {
+    if (!aiQueryHash) return
+    sendFeedback({ keyword, action })
+  }, [aiQueryHash, sendFeedback])
 
   const openEdit = (f: FileItem) => {
     setEditItem(f)
@@ -209,6 +264,7 @@ export default function Catalogue() {
       }
       const data = await resp.json();
       if (cancelled) return;
+      setAiQueryHash(String(data.query_hash || ''))
       const items = Array.isArray(data.items) ? data.items : [];
       const progressLines = Array.isArray(data.progress) && data.progress.length ? data.progress : ['Поиск завершён'];
       setAiProgress(prev => (prev.length ? [...prev, ...progressLines] : progressLines));
@@ -216,18 +272,21 @@ export default function Catalogue() {
       setAiSources(items);
       setAiAnswer(data.answer || '');
       setAiKeywords(Array.isArray(data.keywords) ? data.keywords : []);
+      setAiFilteredKeywords(Array.isArray(data.filtered_keywords) ? data.filtered_keywords : []);
       await hydrateItems(items);
     };
-
     const load = async () => {
       setLoading(true);
       try {
         if (aiMode && dq && commit) {
+          setFeedbackStatus({})
           setAiLoading(true);
           setAiProgress(['Формируем запрос…']);
           setAiAnswer('');
           setAiKeywords([]);
           setAiSources([]);
+          setAiFilteredKeywords([])
+          setAiQueryHash('')
           const payload: any = { query: dq, top_k: aiTopK, deep_search: aiDeepSearch };
           payload.sources = { tags: aiUseTags, text: aiUseText };
           payload.max_candidates = aiMaxCandidates;
@@ -235,6 +294,7 @@ export default function Catalogue() {
           payload.max_chunks = aiMaxChunks;
           payload.max_snippets = aiMaxSnippets;
           payload.full_text = aiFullText;
+          payload.llm_snippets = aiUseLlmSnippets;
           if (collectionId) payload.collection_id = Number(collectionId);
           if (type) payload.material_types = [type];
           if (year_from) payload.year_from = year_from;
@@ -251,12 +311,15 @@ export default function Catalogue() {
             setAiAnswer('');
             setAiKeywords([]);
             setAiSources([]);
+            setAiFilteredKeywords([])
+            setAiQueryHash('')
             setLocalPage(page);
             return;
           }
           setAiAnswer('');
           setAiKeywords([]);
           setAiSources([]);
+          setAiFilteredKeywords([])
           const p = new URLSearchParams(params);
           p.set('limit', String(perPage));
           p.set('offset', String(offset));
@@ -292,7 +355,7 @@ export default function Catalogue() {
       cancelled = true;
       abortCurrent();
     };
-  }, [params, offset, selectedTags, aiMode, commit, aiTopK, aiDeepSearch, aiUseTags, aiUseText, aiMaxCandidates, aiChunkChars, aiMaxChunks, aiMaxSnippets, aiFullText, dq, collectionId, type, year_from, year_to, page]);
+  }, [params, offset, selectedTags, aiMode, commit, aiTopK, aiDeepSearch, aiUseTags, aiUseText, aiMaxCandidates, aiChunkChars, aiMaxChunks, aiMaxSnippets, aiFullText, aiUseLlmSnippets, dq, collectionId, type, year_from, year_to, page]);
 
   useEffect(() => {
     const load = async () => {
@@ -554,12 +617,18 @@ export default function Catalogue() {
         )}
         {aiMode && (aiProgress.length > 0 || aiLoading) && (
           <div className="card p-3 mb-2" aria-live="polite">
-            <div className="fw-semibold mb-1">Прогресс поиска</div>
-            <ul className="mb-0" style={{paddingLeft: '1.1rem'}}>
-              {(aiProgress.length ? aiProgress : ['Поиск выполняется…']).map((line, idx) => (
-                <li key={idx} className={idx === aiProgress.length - 1 && aiLoading ? 'fw-semibold' : ''}>{line}</li>
+            <div className="fw-semibold mb-1 d-flex justify-content-between align-items-center">
+              <span>Прогресс поиска</span>
+              {aiQueryHash && <span className="text-muted" style={{fontSize: '0.85rem'}}>hash {aiQueryHash.slice(0, 8)}</span>}
+            </div>
+            <div className="d-grid gap-1">
+              {(progressItems.length ? progressItems : [{ id: 'pending', line: 'Поиск выполняется…', icon: '⏳' }]).map((item, idx) => (
+                <div key={item.id} className={`d-flex align-items-start gap-2 ${idx === progressItems.length - 1 && aiLoading ? 'fw-semibold' : ''}`}>
+                  <span style={{width: 20}}>{item.icon}</span>
+                  <span>{item.line}</span>
+                </div>
               ))}
-            </ul>
+            </div>
           </div>
         )}
         {!!aiAnswer && (
@@ -584,7 +653,48 @@ export default function Catalogue() {
               toRemove.forEach(el=> el.replaceWith(document.createTextNode(el.textContent||'')))
               return tmp.innerHTML
             })() }} />
-            {!!aiKeywords?.length && <div className="mt-2">{aiKeywords.map((k,i)=>(<span className="tag" key={i}>{k}</span>))}</div>}
+            {!!aiKeywords?.length && (
+              <div className="mt-3">
+                <div className="text-muted" style={{fontSize:'0.85rem'}}>Ключевые термины</div>
+                <div className="d-flex flex-wrap gap-2 mt-1">
+                  {aiKeywords.map((k,i)=>{
+                    const positiveKey = `relevant:kw-${k}`
+                    const negativeKey = `irrelevant:kw-${k}`
+                    const posState = feedbackStatus[positiveKey]
+                    const negState = feedbackStatus[negativeKey]
+                    const statusGlyph = posState === 'done' ? '✓' : negState === 'done' ? '✗' : (posState === 'loading' || negState === 'loading') ? '…' : ''
+                    return (
+                      <div key={i} className="d-flex align-items-center gap-1 border rounded px-2 py-1" style={{background:'var(--surface-variant, rgba(0,0,0,0.03))'}}>
+                        <span className="tag mb-0" style={{margin:0}}>{k}</span>
+                        <button
+                          className="btn btn-sm btn-outline-success"
+                          disabled={!aiQueryHash || posState === 'loading'}
+                          title="Помогает"
+                          onClick={()=>handleKeywordFeedback(k, 'relevant')}
+                        >👍</button>
+                        <button
+                          className="btn btn-sm btn-outline-danger"
+                          disabled={!aiQueryHash || negState === 'loading'}
+                          title="Не подходит"
+                          onClick={()=>handleKeywordFeedback(k, 'irrelevant')}
+                        >👎</button>
+                        {statusGlyph && <span className="text-muted" style={{fontSize:'0.75rem'}}>{statusGlyph}</span>}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+            {!!aiFilteredKeywords?.length && (
+              <div className="mt-2">
+                <div className="text-muted" style={{fontSize:'0.85rem'}}>Исключённые термины</div>
+                <div className="d-flex flex-wrap gap-2 mt-1">
+                  {aiFilteredKeywords.map((k,i)=> (
+                    <span key={i} className="badge bg-light text-secondary" style={{textDecoration:'line-through'}}>{k}</span>
+                  ))}
+                </div>
+              </div>
+            )}
             {aiSources && aiSources.length>0 && (
               <div className="mt-2">
                 <div className="fw-semibold mb-1">Источники</div>
@@ -596,25 +706,46 @@ export default function Catalogue() {
                     // попытаться выбрать термы, которые встречаются в первом сниппете
                     const primary = snips[0] ? baseTerms.filter(k => String(snips[0]).toLowerCase().includes(String(k).toLowerCase())) : []
                     const terms = (primary.length? primary : baseTerms).slice(0,5)
-                    const mark = encodeURIComponent(terms.join('|'))
-                    const href = rel? `/preview/${encodeURIComponent(rel)}?embedded=1&mark=${mark}` : '#'
-                    const title = s.title || rel || `file-${s.file_id}`
-                    const esc=(x:string)=>x.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]||c))
-                    const hi = (txt:string)=>{
-                      if(!txt) return ''
-                      const arr = terms.length? terms : baseTerms.slice(0,5)
-                      if(!arr.length) return esc(txt)
-                      const re=new RegExp('('+arr.map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|')+')','gi')
-                      return esc(txt).replace(re,'<mark>$1</mark>')
-                    }
-                    return (
-                      <li key={i}>
-                        <a href={href} target="_blank" rel="noopener">[{i+1}] {title}</a>
+                  const mark = encodeURIComponent(terms.join('|'))
+                  const href = rel? `/preview/${encodeURIComponent(rel)}?embedded=1&mark=${mark}` : '#'
+                  const title = s.title || rel || `file-${s.file_id}`
+                  const esc=(x:string)=>x.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]||c))
+                  const hi = (txt:string)=>{
+                    if(!txt) return ''
+                    const arr = terms.length? terms : baseTerms.slice(0,5)
+                    if(!arr.length) return esc(txt)
+                    const re=new RegExp('('+arr.map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|')+')','gi')
+                    return esc(txt).replace(re,'<mark>$1</mark>')
+                  }
+                  const irrelevantKey = `irrelevant:file-${s.file_id}`
+                  const relevantKey = `relevant:file-${s.file_id}`
+                  const isIrrelevant = feedbackStatus[irrelevantKey] === 'done'
+                  const isRelevant = feedbackStatus[relevantKey] === 'done'
+                  return (
+                      <li key={i} className={isIrrelevant ? 'text-muted text-decoration-line-through' : ''}>
+                        <a href={href} target="_blank" rel="noopener" className={isIrrelevant ? 'text-muted text-decoration-line-through' : ''}>[{i+1}] {title}</a>
                         {snips.length>0 && (
                           <div className="muted" style={{fontSize:13}}>
                             {snips.map((sn,si)=>(
                               <div key={si} dangerouslySetInnerHTML={{__html: ' — '+hi(String(sn))}} />
                             ))}
+                          </div>
+                        )}
+                        <div className="mt-1 d-flex align-items-center gap-2">
+                          <button className="btn btn-sm btn-outline-success" disabled={!aiQueryHash || feedbackStatus[`relevant:file-${s.file_id}`]==='loading'} onClick={()=>handleSourceFeedback(Number(s.file_id), 'relevant')}>Подходит</button>
+                          <button className="btn btn-sm btn-outline-danger" disabled={!aiQueryHash || feedbackStatus[`irrelevant:file-${s.file_id}`]==='loading'} onClick={()=>handleSourceFeedback(Number(s.file_id), 'irrelevant')}>Не подходит</button>
+                          {(feedbackStatus[`relevant:file-${s.file_id}`]==='done' || feedbackStatus[`irrelevant:file-${s.file_id}`]==='done') && (
+                            <span className="text-success" style={{fontSize:'0.8rem'}}>Спасибо!</span>
+                          )}
+                          {feedbackStatus[`relevant:file-${s.file_id}`]==='error' || feedbackStatus[`irrelevant:file-${s.file_id}`]==='error' ? (
+                            <span className="text-danger" style={{fontSize:'0.8rem'}}>Ошибка</span>
+                          ) : null}
+                          {isIrrelevant && <span className="badge bg-danger-subtle text-danger" style={{fontSize:'0.7rem'}}>Помечено как нерелевантное</span>}
+                          {isRelevant && <span className="badge bg-success-subtle text-success" style={{fontSize:'0.7rem'}}>Помечено как релевантное</span>}
+                        </div>
+                        {s.llm_snippet && (
+                          <div className="mt-1" style={{fontSize:13}}>
+                            <strong>LLM:</strong> {s.llm_snippet}
                           </div>
                         )}
                       </li>
