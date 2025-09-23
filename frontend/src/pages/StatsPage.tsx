@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { materialTypeRu, tagKeyRu } from '../utils/locale'
 import { Chart, BarController, BarElement, CategoryScale, LinearScale, LogarithmicScale, LineController, LineElement, PointElement, ArcElement, Tooltip, Legend, DoughnutController } from 'chart.js'
 Chart.register(BarController, BarElement, CategoryScale, LinearScale, LogarithmicScale, LineController, LineElement, PointElement, ArcElement, DoughnutController, Tooltip, Legend)
 
@@ -116,10 +117,10 @@ export default function StatsPage(){
       chartTypes.current?.destroy()
       chartTypes.current = new Chart(refTypes.current, {
         type: 'bar',
-        data: { labels: types.map((x:any)=>x[0]), datasets:[{ label:'По типам', data: types.map((x:any)=>x[1]), backgroundColor: palette.primary }] },
+        data: { labels: types.map((x:any)=>materialTypeRu(x[0])), datasets:[{ label:'По типам', data: types.map((x:any)=>x[1]), backgroundColor: palette.primary }] },
         options: {
           ...commonOptions,
-          onClick: (_evt: any, els: any[]) => { if(!els?.length) return; const i=els[0].index; const label = (chartTypes.current as any)?.data?.labels?.[i]; if (label) nav(`/?type=${encodeURIComponent(String(label))}`) }
+          onClick: (_evt: any, els: any[]) => { if(!els?.length) return; const i=els[0].index; const raw = types?.[i]?.[0]; if (raw) nav(`/?type=${encodeURIComponent(String(raw))}`) }
         }
       })
     }
@@ -254,8 +255,8 @@ export default function StatsPage(){
     if (refTagKeys.current) {
       chartTagKeys.current?.destroy()
       chartTagKeys.current = new Chart(refTagKeys.current, {
-        type:'bar', data:{ labels: tagKeys.map((x:any)=>x[0]), datasets:[{ label:'Ключи тегов', data: tagKeys.map((x:any)=>x[1]), backgroundColor: palette.gray }] },
-        options:{ ...hbarOptions, indexAxis:'y', onClick: (_evt:any, els:any[])=>{ if(!els?.length) return; const i=els[0].index; const label = (chartTagKeys.current as any)?.data?.labels?.[i]; if (label) setSelectedKey(String(label)) } }
+        type:'bar', data:{ labels: tagKeys.map((x:any)=>tagKeyRu(String(x[0]||''))), datasets:[{ label:'Ключи тегов', data: tagKeys.map((x:any)=>x[1]), backgroundColor: palette.gray }] },
+        options:{ ...hbarOptions, indexAxis:'y', onClick: (_evt:any, els:any[])=>{ if(!els?.length) return; const i=els[0].index; const raw = tagKeys?.[i]?.[0]; if (raw) setSelectedKey(String(raw)) } }
       })
     }
     // Top authors bar (horizontal)
@@ -306,7 +307,7 @@ export default function StatsPage(){
     if (!refTagVals.current) return
     chartTagVals.current?.destroy()
     chartTagVals.current = new Chart(refTagVals.current, {
-      type:'bar', data:{ labels: tagVals.map(x=>x[0]), datasets:[{ label:`Значения тега: ${selectedKey||''}`, data: tagVals.map(x=>x[1]), backgroundColor: '#4e79a7' }] },
+      type:'bar', data:{ labels: tagVals.map(x=>x[0]), datasets:[{ label:`Значения тега: ${tagKeyRu(selectedKey || '')}`, data: tagVals.map(x=>x[1]), backgroundColor: '#4e79a7' }] },
       options:{ responsive:true, maintainAspectRatio:false, indexAxis:'y', scales:{ x:{ type: logScale? 'logarithmic':'linear' } } }
     })
   }, [tagVals, selectedKey, logScale])
@@ -510,10 +511,10 @@ export default function StatsPage(){
             <div className="col-12 col-xl-6">
               <div className="card p-2 chart-card">
                 <div className="d-flex align-items-center justify-content-between">
-                  <div className="fw-semibold chart-title">Значения тега</div>
+                  <div className="fw-semibold chart-title">Значения тега ({tagKeyRu(selectedKey || '')})</div>
                   <div className="d-flex align-items-center gap-2">
                     <select className="form-select form-select-sm" style={{width:180}} value={selectedKey} onChange={e=>setSelectedKey(e.target.value)}>
-                      {(data?.tag_keys||[]).map((x:any,i:number)=> <option key={i} value={String(x[0]||'')}>{x[0]}</option>)}
+                      {(data?.tag_keys||[]).map((x:any,i:number)=> <option key={i} value={String(x[0]||'')}>{tagKeyRu(String(x[0]||''))}</option>)}
                     </select>
                     <button className="btn btn-sm btn-outline-secondary" onClick={()=> exportCSV(`tag_values_${selectedKey}`, tagVals || [])}>CSV</button>
                   </div>

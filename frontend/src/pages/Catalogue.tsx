@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { materialTypeRu, tagKeyRu } from '../utils/locale'
 
 type Tag = { key: string; value: string }
 type FileItem = {
@@ -20,44 +21,6 @@ function useDebounced<T>(v: T, delay = 400) {
   const [val, setVal] = useState(v)
   useEffect(() => { const id = setTimeout(() => setVal(v), delay); return () => clearTimeout(id) }, [v, delay])
   return val
-}
-
-const typeRu = (t: string | null) => {
-  const m: Record<string, string> = {
-    dissertation: 'Диссертация',
-    dissertation_abstract: 'Автореферат',
-    article: 'Статья',
-    textbook: 'Учебник',
-    monograph: 'Монография',
-    report: 'Отчёт',
-    patent: 'Патент',
-    presentation: 'Презентация',
-    proceedings: 'Труды',
-    standard: 'Стандарт',
-    note: 'Заметка',
-    document: 'Документ',
-    audio: 'Аудио',
-    image: 'Изображение',
-    other: 'Другое',
-  }
-  return m[(t || '').toLowerCase()] || (t || '')
-}
-
-const keyRu = (k: string) => {
-  const m: Record<string, string> = {
-    lang: 'Язык',
-    ext: 'Расширение',
-    pages: 'Страниц',
-    doi: 'DOI',
-    isbn: 'ISBN',
-    journal: 'Журнал',
-    volume_issue: 'Том/номер',
-    number: 'Номер',
-    pages_range: 'Страницы',
-    organization: 'Организация',
-    conference: 'Конференция',
-  }
-  return m[k] || k
 }
 
 export default function Catalogue() {
@@ -415,7 +378,7 @@ export default function Catalogue() {
             <select className="form-select" value={type} onChange={e => { const v=e.target.value; v?sp.set('type',v):sp.delete('type'); sp.set('page','1'); setSp(sp) }}>
               <option value="">Все типы</option>
               {(facets?.types||[]).map(([k],i)=> (
-                <option key={i} value={String(k||'')}>{k||'other'}</option>
+                <option key={i} value={String(k||'')}>{materialTypeRu(k, 'Другое')}</option>
               ))}
             </select>
             <div className="d-flex gap-2">
@@ -437,7 +400,7 @@ export default function Catalogue() {
               <div className="mb-3">
                 {facets.types.map(([k, c], i) => (
                   <div key={i} className="d-flex justify-content-between">
-                    <button className="btn btn-sm btn-outline-secondary" onClick={()=>{ if(k){ sp.set('type', String(k)); sp.set('page','1'); setSp(sp) } }}>{k || 'other'}</button>
+                    <button className="btn btn-sm btn-outline-secondary" onClick={()=>{ if(k){ sp.set('type', String(k)); sp.set('page','1'); setSp(sp) } }}>{materialTypeRu(k, 'Другое')}</button>
                     <span className="text-secondary">{c}</span>
                   </div>
                 ))}
@@ -446,7 +409,7 @@ export default function Catalogue() {
               <div>
                 {Object.entries(facets.tag_facets).map(([key, values]) => (
                   <div key={key} className="mb-2">
-                    <div className="text-secondary">{key}</div>
+                    <div className="text-secondary">{tagKeyRu(key)}</div>
                     <div className="d-flex flex-wrap gap-2">
                       {values.slice(0, 12).map(([val, cnt], i) => (
                         <button key={i} className="btn btn-sm btn-outline-secondary" onClick={()=>{ const next=[...selectedTags, `${key}=${val}`]; setSelectedTags(next); sp.delete('tag'); next.forEach(x=>sp.append('tag',x)); sp.set('page','1'); setSp(sp) }}>{val} <span className="text-secondary">({cnt})</span></button>
@@ -482,7 +445,7 @@ export default function Catalogue() {
                 {showAiSettings ? 'Скрыть настройки' : 'Настройки ИИ'}
               </button>
               <span className="muted" style={{fontSize: '0.9rem'}}>
-                Top {aiTopK} · кандидатов {aiMaxCandidates} · {aiDeepSearch ? 'глубокий' : 'быстрый'}{aiFullText ? ' · full-text' : ''}
+                Топ {aiTopK} · кандидатов {aiMaxCandidates} · {aiDeepSearch ? 'глубокий' : 'быстрый'}{aiFullText ? ' · полный текст' : ''}{aiUseLlmSnippets ? ' · сниппеты LLM' : ''}
               </span>
             </>
           )}
@@ -491,7 +454,7 @@ export default function Catalogue() {
           <div className="card p-3 mb-2 bg-light">
             <div className="row g-3">
               <div className="col-12 col-lg-3">
-                <label className="form-label">Top K (1–5)</label>
+                <label className="form-label">Топ K (1–5)</label>
                 <input
                   type="number"
                   className="form-control"
@@ -596,9 +559,17 @@ export default function Catalogue() {
         )}
         <div className="floating-search mb-2 d-flex align-items-center justify-content-between" role="toolbar" aria-label="Выбранные фильтры">
           <div className="d-flex flex-wrap align-items-center" style={{gap:8}}>
-            {selectedTags.map((t, i) => (
-              <span key={i} className="tag" aria-label={`Фильтр ${t}`}>{t} <button className="btn btn-sm btn-outline-secondary ms-1" onClick={()=>removeTag(i)} aria-label="Снять фильтр">×</button></span>
-            ))}
+            {selectedTags.map((t, i) => {
+              const [rawKey, ...rest] = t.split('=')
+              const value = rest.join('=')
+              const keyLabel = tagKeyRu(rawKey || t)
+              const label = value ? `${keyLabel}: ${value}` : keyLabel
+              return (
+                <span key={i} className="tag" aria-label={`Фильтр ${label}`}>
+                  {label} <button className="btn btn-sm btn-outline-secondary ms-1" onClick={()=>removeTag(i)} aria-label="Снять фильтр">×</button>
+                </span>
+              )
+            })}
             <span className="muted ms-2">Найдено: {total}</span>
           </div>
           {pages > 1 && (
@@ -627,7 +598,7 @@ export default function Catalogue() {
           <div className="card p-3 mb-2" aria-live="polite">
             <div className="fw-semibold mb-1 d-flex justify-content-between align-items-center">
               <span>Прогресс поиска</span>
-              {aiQueryHash && <span className="text-muted" style={{fontSize: '0.85rem'}}>hash {aiQueryHash.slice(0, 8)}</span>}
+              {aiQueryHash && <span className="text-muted" style={{fontSize: '0.85rem'}}>Хэш {aiQueryHash.slice(0, 8)}</span>}
             </div>
             <div className="d-grid gap-1">
               {(progressItems.length ? progressItems : [{ id: 'pending', line: 'Поиск выполняется…', icon: '⏳' }]).map((item, idx) => (
@@ -768,7 +739,7 @@ export default function Catalogue() {
                         </div>
                         {s.llm_snippet && (
                           <div className="mt-1" style={{fontSize:13}}>
-                            <strong>LLM:</strong> {s.llm_snippet}
+                            <strong>Ответ LLM:</strong> {s.llm_snippet}
                           </div>
                         )}
                       </li>
@@ -785,7 +756,7 @@ export default function Catalogue() {
               <div className={`card p-2 card-type-${(f.material_type||'document').toLowerCase()}`} style={{display:'flex', flexDirection:'column'}}>
                 <div className="d-flex align-items-start justify-content-between">
                   <div className="fw-semibold" style={{whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{f.title || (f.rel_path?.split('/').pop() || '—')}</div>
-                  {f.material_type && <span className="badge bg-secondary ms-2">{typeRu(f.material_type)}</span>}
+                  {f.material_type && <span className="badge bg-secondary ms-2">{materialTypeRu(f.material_type)}</span>}
                 </div>
                 <div className="text-secondary" style={{whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{[f.author, f.year].filter(Boolean).join(', ') || '—'}</div>
                 {((f.keywords||'').trim()) && (
@@ -816,10 +787,10 @@ export default function Catalogue() {
                 )}
                 <div className="mt-2" style={{maxHeight: 68, overflow:'auto'}}>
                   {(f.tags||[]).map((t,i)=> (
-                    <span key={i} className="tag" title={`${t.key}=${t.value}`}>{keyRu(t.key)}:{t.value}</span>
+                    <span key={i} className="tag" title={`${t.key}=${t.value}`}>{tagKeyRu(t.key)}:{t.value}</span>
                   ))}
                   <form className="d-inline" onSubmit={async(e:any)=>{ e.preventDefault(); const input = e.currentTarget.querySelector('input'); const v=(input?.value||'').trim(); if(!v) return; const idx=v.indexOf('='); if(idx===-1) return; const key=v.slice(0,idx).trim(); const value=v.slice(idx+1).trim(); const next=[...(f.tags||[]), {key, value}]; await updateTagsInline(f, next); if(input) input.value=''; }}>
-                    <input placeholder="key=value" style={{background:'var(--bg)', color:'var(--text)', border:'1px dashed var(--border)', borderRadius:8, padding:'2px 6px', marginLeft:6, width:120}} />
+                    <input placeholder="ключ=значение" style={{background:'var(--bg)', color:'var(--text)', border:'1px dashed var(--border)', borderRadius:8, padding:'2px 6px', marginLeft:6, width:120}} />
                   </form>
                 </div>
                 {f.rel_path && (
@@ -917,10 +888,10 @@ export default function Catalogue() {
                   })}
                 </div>
                 <div className="d-flex gap-2 mb-2">
-                  <input className="form-control" placeholder="key" onKeyDown={e=>{ if(e.key==='Enter'){ const key=(e.currentTarget as HTMLInputElement).value.trim(); const val=(e.currentTarget.parentElement?.querySelector('[data-newtag=value]') as HTMLInputElement)?.value.trim(); if(key&&val){ const nt=`${key}=${val}`; const txt=(editForm.tagsText||''); setEditForm({...editForm, tagsText: (txt? txt+'\n':'') + nt}); (e.currentTarget as HTMLInputElement).value=''; if((e.currentTarget.parentElement?.querySelector('[data-newtag=value]') as HTMLInputElement)) (e.currentTarget.parentElement?.querySelector('[data-newtag=value]') as HTMLInputElement).value='' } } }} />
-                  <input className="form-control" placeholder="value" data-newtag="value" onKeyDown={e=>{ if(e.key==='Enter'){ const val=(e.currentTarget as HTMLInputElement).value.trim(); const key=(e.currentTarget.parentElement?.querySelector('input:not([data-newtag])') as HTMLInputElement)?.value.trim(); if(key&&val){ const nt=`${key}=${val}`; const txt=(editForm.tagsText||''); setEditForm({...editForm, tagsText: (txt? txt+'\n':'') + nt}); (e.currentTarget as HTMLInputElement).value=''; if((e.currentTarget.parentElement?.querySelector('input:not([data-newtag])') as HTMLInputElement)) (e.currentTarget.parentElement?.querySelector('input:not([data-newtag])') as HTMLInputElement).value='' } } }} />
+                  <input className="form-control" placeholder="ключ" onKeyDown={e=>{ if(e.key==='Enter'){ const key=(e.currentTarget as HTMLInputElement).value.trim(); const val=(e.currentTarget.parentElement?.querySelector('[data-newtag=value]') as HTMLInputElement)?.value.trim(); if(key&&val){ const nt=`${key}=${val}`; const txt=(editForm.tagsText||''); setEditForm({...editForm, tagsText: (txt? txt+'\n':'') + nt}); (e.currentTarget as HTMLInputElement).value=''; if((e.currentTarget.parentElement?.querySelector('[data-newtag=value]') as HTMLInputElement)) (e.currentTarget.parentElement?.querySelector('[data-newtag=value]') as HTMLInputElement).value='' } } }} />
+                  <input className="form-control" placeholder="значение" data-newtag="value" onKeyDown={e=>{ if(e.key==='Enter'){ const val=(e.currentTarget as HTMLInputElement).value.trim(); const key=(e.currentTarget.parentElement?.querySelector('input:not([data-newtag])') as HTMLInputElement)?.value.trim(); if(key&&val){ const nt=`${key}=${val}`; const txt=(editForm.tagsText||''); setEditForm({...editForm, tagsText: (txt? txt+'\n':'') + nt}); (e.currentTarget as HTMLInputElement).value=''; if((e.currentTarget.parentElement?.querySelector('input:not([data-newtag])') as HTMLInputElement)) (e.currentTarget.parentElement?.querySelector('input:not([data-newtag])') as HTMLInputElement).value='' } } }} />
                 </div>
-                <textarea className="form-control" rows={4} placeholder="key=value, по строке" value={editForm.tagsText} onChange={e=>setEditForm({...editForm, tagsText:e.target.value})} />
+                <textarea className="form-control" rows={4} placeholder="ключ=значение, по строке" value={editForm.tagsText} onChange={e=>setEditForm({...editForm, tagsText:e.target.value})} />
                 <div className="d-flex gap-2">
                   <button className="btn btn-primary" onClick={saveEdit}>Сохранить</button>
                   <button className="btn btn-outline-secondary" onClick={()=>setEditItem(null)}>Отмена</button>

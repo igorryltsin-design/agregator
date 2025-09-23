@@ -151,15 +151,15 @@ export default function AdminAiMetricsPage() {
         <table className="table table-sm align-middle">
           <thead>
             <tr>
-              <th>Hash</th>
+              <th>Хэш</th>
               <th>Запрос</th>
               <th>Ответ</th>
-              <th>Исключено</th>
+              <th>Отсеяно</th>
               <th>Всего</th>
-              <th>Ключи</th>
+              <th>Ключевые слова</th>
               <th>Кандидаты</th>
-              <th>Глубокий</th>
-              <th>Ответ</th>
+              <th>Глубокий этап</th>
+              <th>Ответ LLM</th>
               <th>Пользователь</th>
               <th>Время</th>
             </tr>

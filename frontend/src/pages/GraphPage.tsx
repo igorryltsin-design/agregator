@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Network, DataSet } from 'vis-network/standalone'
+import { materialTypeRu, tagKeyRu } from '../utils/locale'
 
 type Node = { id: string; label: string; type: string }
 type Edge = { from: string; to: string; label?: string }
@@ -23,6 +24,14 @@ export default function GraphPage() {
   const [smartSearch, setSmartSearch] = useState(true)
   const [yearFrom, setYearFrom] = useState('')
   const [yearTo, setYearTo] = useState('')
+  const selectedKeyLabels = useMemo(() => keys.map(tagKeyRu), [keys])
+  const selectionTypeLabel = useMemo(() => {
+    if (!selection) return ''
+    if (selection.type?.startsWith('tag:')) {
+      return `Тег · ${tagKeyRu(selection.type.slice(4))}`
+    }
+    return materialTypeRu(selection.type, selection.type || '—')
+  }, [selection])
 
   useEffect(() => {
     const run = async () => {
@@ -136,9 +145,16 @@ export default function GraphPage() {
           <div className="fw-semibold mb-2">Ключи тегов</div>
           <div className="d-flex flex-wrap gap-2">
             {availableKeys.map(k => (
-              <button key={k} className={`btn btn-sm ${keys.includes(k)?'btn-secondary':'btn-outline-secondary'}`} onClick={()=>{
-                setKeys(prev => prev.includes(k) ? prev.filter(x=>x!==k) : [...prev.slice(0,3), k])
-              }}>{k}</button>
+              <button
+                key={k}
+                className={`btn btn-sm ${keys.includes(k)?'btn-secondary':'btn-outline-secondary'}`}
+                title={k}
+                onClick={()=>{
+                  setKeys(prev => prev.includes(k) ? prev.filter(x=>x!==k) : [...prev.slice(0,3), k])
+                }}
+              >
+                {tagKeyRu(k)}
+              </button>
             ))}
           </div>
           <hr/>
@@ -178,7 +194,7 @@ export default function GraphPage() {
       <div className="col-12 col-lg-9">
         {view === 'graph' && (
           <div className="card p-3">
-            <div className="fw-semibold mb-2">Граф (файл → теги: {keys.join(', ') || '—'})</div>
+            <div className="fw-semibold mb-2">Граф (файл → теги: {selectedKeyLabels.join(', ') || '—'})</div>
             {loading && <div>Загрузка…</div>}
             {error && <div className="text-danger">{error}</div>}
             <div ref={containerRef} style={{ height: '80vh', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 6 }} />
@@ -188,14 +204,14 @@ export default function GraphPage() {
           <div className="card p-3 mt-3" aria-live="polite">
             <div className="fw-semibold mb-2">Выделено</div>
             <div><strong>Метка:</strong> {selection.label}</div>
-            <div><strong>Тип:</strong> {selection.type}</div>
+            <div><strong>Тип:</strong> {selectionTypeLabel || selection.type}</div>
             <div><strong>Степень:</strong> {selection.degree}</div>
             <div className="mt-2"><button className="btn btn-sm btn-outline-secondary" onClick={clearHighlight}>Сбросить</button></div>
           </div>
         )}
         {view === 'cloud' && cloud && (
           <div className="card p-3">
-            <div className="fw-semibold mb-2">Облако тегов: {cloud.key}</div>
+            <div className="fw-semibold mb-2">Облако тегов: {tagKeyRu(cloud.key)}</div>
             <div style={{minHeight: '50vh'}}>
               {cloud.list.map(([val, cnt], i) => (
                 <span key={i} className="me-2" style={{ fontSize: cloud.scale(cnt), lineHeight: '2.2rem' }} title={`${val} (${cnt})`}>{val}</span>

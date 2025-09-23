@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
+import { taskStatusRu } from '../utils/locale'
 
 type Task = {
   id: number
@@ -152,7 +153,7 @@ export default function AdminTasksPage() {
                       <td>{task.id}</td>
                       <td>{task.name}</td>
                       <td>
-                        <span className={`badge ${statusBadge[task.status] || 'bg-secondary'}`}>{task.status}</span>
+                        <span className={`badge ${statusBadge[task.status] || 'bg-secondary'}`}>{taskStatusRu(task.status)}</span>
                         {task.error && <div className="text-danger" style={{ fontSize: 12 }}>{task.error}</div>}
                       </td>
                       <td style={{ minWidth: 160 }}>
@@ -205,7 +206,7 @@ export default function AdminTasksPage() {
                               </div>
                             )}
                             <div className="mt-3">
-                              <div className="text-muted" style={{ fontSize: 12 }}>Payload</div>
+                              <div className="text-muted" style={{ fontSize: 12 }}>Данные задачи</div>
                               <pre className="bg-dark-subtle p-2 rounded" style={{ maxHeight: 240, overflow: 'auto', fontSize: 12 }}>{formatPayload(task.payload)}</pre>
                             </div>
                           </div>

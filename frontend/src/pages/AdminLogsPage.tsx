@@ -77,13 +77,14 @@ export default function AdminLogsPage() {
 
   const flattenDetail = useCallback((value: any, prefix = '', acc: string[] = []) => {
     if (value === null || value === undefined) {
-      acc.push(`${prefix}: null`)
+      const label = prefix || 'значение'
+      acc.push(`${label}: нет данных`)
       return acc
     }
     if (typeof value === 'object') {
       if (Array.isArray(value)) {
         if (!value.length) {
-          const label = prefix || 'value'
+          const label = prefix || 'значение'
           acc.push(`${label}: []`)
         } else {
           value.forEach((item, idx) => {
@@ -94,7 +95,7 @@ export default function AdminLogsPage() {
       } else {
         const entries = Object.entries(value)
         if (!entries.length) {
-          const label = prefix || 'value'
+          const label = prefix || 'значение'
           acc.push(`${label}: {}`)
         } else {
           entries.forEach(([k, v]) => {
@@ -105,9 +106,35 @@ export default function AdminLogsPage() {
       }
       return acc
     }
-    const label = prefix || 'value'
+    const label = prefix || 'значение'
     acc.push(`${label}: ${String(value)}`)
     return acc
+  }, [])
+
+  const formatActionName = useCallback((action: string | null | undefined) => {
+    if (!action) return '—'
+    const dictionary: Record<string, string> = {
+      user: 'пользователь',
+      create: 'создание',
+      update: 'обновление',
+      delete: 'удаление',
+      login: 'вход',
+      logout: 'выход',
+      file: 'файл',
+      upload: 'загрузка',
+      collection: 'коллекция',
+      assign: 'назначение',
+      revoke: 'отмена',
+      ai: 'ИИ',
+      search: 'поиск',
+      settings: 'настройки',
+      role: 'роль',
+    }
+    const parts = action.replace(/[:]/g, '_').split('_').filter(Boolean)
+    if (!parts.length) return action
+    const translated = parts.map(part => dictionary[part.toLowerCase()] || part)
+    const label = translated.join(' ')
+    return label.charAt(0).toUpperCase() + label.slice(1)
   }, [])
 
   const formatDetail = useCallback((detail: string | null) => {
@@ -178,7 +205,7 @@ export default function AdminLogsPage() {
                     <span>{log.username}{log.full_name ? ` (${log.full_name})` : ''}</span>
                   ) : (log.user_id ?? '—')}
                 </td>
-                <td><span className="badge bg-secondary">{log.action}</span></td>
+                <td><span className="badge bg-secondary" title={log.action}>{formatActionName(log.action)}</span></td>
                 <td>{log.entity ? `${log.entity}${log.entity_id ? `#${log.entity_id}` : ''}` : '—'}</td>
                 <td>
                   <pre style={{ fontSize: 12, margin: 0, whiteSpace: 'pre-wrap' }}>{formatDetail(log.detail)}</pre>
