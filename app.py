@@ -3497,12 +3497,19 @@ def api_settings():
             'default_prune': bool(DEFAULT_PRUNE),
         })
     data = request.json or {}
+    prev_base = (LMSTUDIO_API_BASE or '').strip()
+    prev_model = (LMSTUDIO_MODEL or '').strip()
+    prev_key = (LMSTUDIO_API_KEY or '').strip()
     SCAN_ROOT = Path(data.get('scan_root') or SCAN_ROOT)
     app.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
     EXTRACT_TEXT = bool(data.get('extract_text', EXTRACT_TEXT))
-    LMSTUDIO_API_BASE = data.get('lm_base') or LMSTUDIO_API_BASE
-    LMSTUDIO_MODEL = data.get('lm_model') or LMSTUDIO_MODEL
-    LMSTUDIO_API_KEY = data.get('lm_key') or LMSTUDIO_API_KEY
+    LMSTUDIO_API_BASE = (data.get('lm_base') or LMSTUDIO_API_BASE or '').strip()
+    LMSTUDIO_MODEL = (data.get('lm_model') or LMSTUDIO_MODEL or '').strip()
+    LMSTUDIO_API_KEY = (data.get('lm_key') or LMSTUDIO_API_KEY or '').strip()
+    if ((LMSTUDIO_API_BASE or '').strip() != prev_base or
+        (LMSTUDIO_MODEL or '').strip() != prev_model or
+        (LMSTUDIO_API_KEY or '').strip() != prev_key):
+        _invalidate_llm_cache()
     TRANSCRIBE_ENABLED = bool(data.get('transcribe_enabled', TRANSCRIBE_ENABLED))
     TRANSCRIBE_BACKEND = data.get('transcribe_backend') or TRANSCRIBE_BACKEND
     TRANSCRIBE_MODEL_PATH = data.get('transcribe_model') or TRANSCRIBE_MODEL_PATH
@@ -6221,6 +6228,27 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     original_top_k = top_k
     top_k = max(1, min(5, top_k))
     deep_search = bool(data.get('deep_search'))
+    try:
+        max_candidates = int(data.get('max_candidates') or 60)
+    except Exception:
+        max_candidates = 60
+    max_candidates = max(5, min(max_candidates, 400))
+    full_text = bool(data.get('full_text'))
+    try:
+        chunk_chars = int(data.get('chunk_chars') or 5000)
+    except Exception:
+        chunk_chars = 5000
+    chunk_chars = max(500, min(chunk_chars, 20000))
+    try:
+        max_chunks = int(data.get('max_chunks') or 40)
+    except Exception:
+        max_chunks = 40
+    max_chunks = max(1, min(max_chunks, 200))
+    try:
+        max_snippets = int(data.get('max_snippets') or 3)
+    except Exception:
+        max_snippets = 3
+    max_snippets = max(1, min(max_snippets, 10))
     progress = _ProgressLogger(progress_cb)
     progress.add(f"Запрос: {query}")
     if top_k != original_top_k:
@@ -6232,6 +6260,8 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     use_tags = sources.get('tags', True) if isinstance(sources, dict) else True
     use_text = sources.get('text', True) if isinstance(sources, dict) else True
     progress.add(f"Источники: теги {'вкл' if use_tags else 'выкл'}, метаданные {'вкл' if use_text else 'выкл'}")
+    progress.add(f"Параметры: кандидатов ≤ {max_candidates}, сниппетов ≤ {max_snippets}")
+    progress.add(f"Контент: чанк {chunk_chars} симв., чанков ≤ {max_chunks}, full-text {'вкл' if full_text else 'выкл'}")
     # Необязательный фильтр по коллекциям (список id)
     if 'collection_id' in data and 'collection_ids' not in data:
         data['collection_ids'] = [data['collection_id']]
@@ -6426,14 +6456,15 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
             snippet_sources: list[str] = []
             try:
                 text_cache = _read_cached_excerpt_for_file(f)
-                snips = _collect_snippets(text_cache, terms, max_snips=2) if text_cache else []
+                snips = _collect_snippets(text_cache, terms, max_snips=max_snippets) if text_cache else []
                 if snips:
                     snippet_sources.append('excerpt-cache')
             except Exception:
                 snips = []
-            if (not snips or len(snips) < 2) and getattr(f, 'abstract', None):
+            if (not snips or len(snips) < max_snippets) and getattr(f, 'abstract', None):
                 try:
-                    extra = _collect_snippets(getattr(f, 'abstract'), terms, max_snips=1)
+                    extra_count = max(1, max_snippets - len(snips))
+                    extra = _collect_snippets(getattr(f, 'abstract'), terms, max_snips=extra_count)
                     added = False
                     for item in extra:
                         if item and item not in snips:
@@ -6465,18 +6496,31 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
             })
         # сортируем по убыванию балла, затем по дате изменения
         results.sort(key=lambda x: (x.get('score') or 0.0, id2file.get(x['file_id']).mtime or 0.0), reverse=True)
-        progress.add(f"Ранжирование: {len(results)} кандидатов")
+        total_ranked = len(results)
+        progress.add(f"Ранжирование: {total_ranked} кандидатов")
+        if total_ranked > max_candidates:
+            progress.add(f"Ограничиваем до {max_candidates} лучших по баллу")
+            results = results[:max_candidates]
         for idx, res in enumerate(results, start=1):
             cand_title = (res.get('title') or res.get('rel_path') or f"file-{res.get('file_id')}").strip()
             progress.add(f"Кандидат [{idx}]: {cand_title}")
-        if deep_search and results:
-            deep_limit = min(len(results), max(top_k * 2, 5))
-            progress.add(f"Глубокий поиск по контенту: проверяем {deep_limit} файлов")
-            for idx, res in enumerate(results[:deep_limit], start=1):
+        if (deep_search or full_text) and results:
+            if deep_search and full_text:
+                scan_label = "Глубокий поиск + full-text"
+                scan_step = "Глубокий поиск"
+            elif deep_search:
+                scan_label = "Глубокий поиск по контенту"
+                scan_step = "Глубокий поиск"
+            else:
+                scan_label = "Полнотекстовый поиск"
+                scan_step = "Full-text"
+            scan_limit = len(results) if full_text else min(len(results), max(top_k * 2, 5))
+            progress.add(f"{scan_label}: проверяем {scan_limit} файлов (чанк {chunk_chars}, чанков ≤ {max_chunks})")
+            for idx, res in enumerate(results[:scan_limit], start=1):
                 f = id2file.get(res['file_id'])
                 if not f:
                     continue
-                scan = _deep_scan_file(f, terms, query, chunk_chars=5000, max_chunks=40, max_snippets=3)
+                scan = _deep_scan_file(f, terms, query, chunk_chars=chunk_chars, max_chunks=max_chunks, max_snippets=max_snippets)
                 boost = float(scan.get('boost') or 0.0)
                 if boost:
                     res['score'] = round((res.get('score') or 0.0) + boost, 3)
@@ -6488,7 +6532,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                     if new_snips:
                         base_snips = res.get('snippets') or []
                         combined = base_snips + [sn for sn in new_snips if sn not in base_snips]
-                        res['snippets'] = combined[:3]
+                        res['snippets'] = combined[:max_snippets]
                     sources = scan.get('sources') or []
                     if sources:
                         current_sources = set(res.get('snippet_sources') or [])
@@ -6501,7 +6545,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 status = 'совпадения' if scan.get('hit') else 'нет'
                 if srcs:
                     status += f"; источники: {srcs}"
-                progress.add(f"Глубокий поиск [{idx}/{deep_limit}]: {title} — {status}")
+                progress.add(f"{scan_step} [{idx}/{scan_limit}]: {title} — {status}")
             results.sort(key=lambda x: (x.get('score') or 0.0, id2file.get(x['file_id']).mtime or 0.0), reverse=True)
         results = results[:top_k]
         progress.add(f"Отобрано документов: {len(results)}")
@@ -6526,7 +6570,9 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 sn = " ".join((r.get('snippets') or []))[:400]
                 title = r.get('title') or r.get('rel_path') or f"file-{r.get('file_id')}"
                 lines.append(f"[{i+1}] {title}: {sn}")
-            progress.add(f"LLM ответ: используем {len(topn)} фрагментов, top_k={top_k}, deep_search={'on' if deep_search else 'off'}")
+            progress.add(
+                f"LLM ответ: используем {len(topn)} фрагментов, top_k={top_k}, deep_search={'on' if deep_search else 'off'}, full_text={'on' if full_text else 'off'}"
+            )
             system = (
                 "Ты помощник поиска. Сформулируй краткий, фактический ответ на вопрос пользователя, "
                 "используя ТОЛЬКО предоставленные фрагменты. Не выдумывай и не обобщай сверх текста. "
@@ -6696,6 +6742,7 @@ def api_ai_search_stream():
     threading.Thread(target=worker_wrapped, daemon=True).start()
 
     def event_stream():
+        yield ': init\n\n'
         while True:
             event = queue.get()
             typ = event.get('type')
@@ -6714,7 +6761,14 @@ def api_ai_search_stream():
                 yield 'data: [DONE]\n\n'
                 break
 
-    return Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+    resp = Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+    try:
+        resp.headers['Cache-Control'] = 'no-cache'
+        resp.headers['X-Accel-Buffering'] = 'no'
+        resp.headers['Connection'] = 'keep-alive'
+    except Exception:
+        pass
+    return resp
 
 
 if __name__ == "__main__":
