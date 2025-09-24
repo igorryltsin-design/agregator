@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { materialTypeRu, tagKeyRu } from '../utils/locale'
+import { materialTypeRu, tagKeyRu, materialTypeOptions, materialTypeSlug } from '../utils/locale'
 
 type Tag = { key: string; value: string }
 type FileItem = {
@@ -142,7 +142,7 @@ export default function Catalogue() {
   const openEdit = (f: FileItem) => {
     setEditItem(f)
     setEditForm({
-      title: f.title || '', author: f.author || '', year: f.year || '', material_type: f.material_type || '', filename: '', keywords: '',
+      title: f.title || '', author: f.author || '', year: f.year || '', material_type: materialTypeRu(f.material_type, f.material_type || ''), filename: '', keywords: '',
       tagsText: (f.tags||[]).map(t=>`${t.key}=${t.value}`).join('\n')
     })
   }
@@ -157,7 +157,8 @@ export default function Catalogue() {
     if (!editItem || !editForm) return
     const arr = (editForm.tagsText||'').split(/\n|;/).map((s:string)=>s.trim()).filter(Boolean)
     const tags = arr.map((s:string)=>{ const i=s.indexOf('='); if(i===-1) return null; return {key:s.slice(0,i).trim(), value:s.slice(i+1).trim()} }).filter(Boolean) as any
-    const payload: any = { title: editForm.title||null, author: editForm.author||null, year: editForm.year||null, material_type: editForm.material_type||null, keywords: editForm.keywords||null, tags }
+    const normalizedMaterialType = materialTypeSlug(editForm.material_type)
+    const payload: any = { title: editForm.title||null, author: editForm.author||null, year: editForm.year||null, material_type: normalizedMaterialType, keywords: editForm.keywords||null, tags }
     if ((editForm.filename||'').trim()) payload.filename = editForm.filename.trim()
     const r = await fetch(`/api/files/${editItem.id}`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) })
     if (r.ok) { const upd = await r.json(); setItems(list=>list.map(x=>x.id===upd.id? upd : x)); setEditItem(null) } else { alert('Не удалось сохранить') }
@@ -875,9 +876,14 @@ export default function Catalogue() {
                   <input className="form-control" placeholder="Год" value={editForm.year} onChange={e=>setEditForm({...editForm, year:e.target.value})} />
                 </div>
                 <div className="d-flex gap-2">
-                  <input className="form-control" placeholder="Тип" value={editForm.material_type} onChange={e=>setEditForm({...editForm, material_type:e.target.value})} />
+                  <input className="form-control" placeholder="Тип" list="material-type-options" value={editForm.material_type} onChange={e=>setEditForm({...editForm, material_type:e.target.value})} />
                   <input className="form-control" placeholder="Имя файла (без расширения)" value={editForm.filename} onChange={e=>setEditForm({...editForm, filename:e.target.value})} />
                 </div>
+                <datalist id="material-type-options">
+                  {materialTypeOptions.map(opt => (
+                    <option key={opt.value} value={opt.label} label={opt.value} />
+                  ))}
+                </datalist>
                 <input className="form-control" placeholder="Ключевые слова" value={editForm.keywords} onChange={e=>setEditForm({...editForm, keywords:e.target.value})} />
                 <label className="form-label">Теги</label>
                 <div className="mb-2" style={{maxHeight:100, overflow:'auto'}}>

@@ -837,6 +837,9 @@ def extract_richer_tags(material_type: str, text: str, filename: str = "") -> di
     m = re.search(r"\bISBN[:\s]*([0-9\- ]{10,20})", t, flags=re.I)
     if m:
         tags.setdefault('isbn', m.group(1).strip())
+    m = re.search(r"\bISSN[:\s]*([0-9\- ]{8,15})\b", t, flags=re.I)
+    if m:
+        tags.setdefault('issn', m.group(1).strip())
     m = re.search(r"\bУДК[:\s]*([\d\.:\-]+)\b", t, flags=re.I)
     if m:
         tags.setdefault('udk', m.group(1))
@@ -860,6 +863,33 @@ def extract_richer_tags(material_type: str, text: str, filename: str = "") -> di
         if m:
             tags.setdefault('volume_issue', f"{m.group(1)}/{m.group(2)}")
             tags.setdefault('pages', f"{m.group(3)}–{m.group(4)}")
+    elif mt == 'journal':
+        m = re.search(r"(journal|transactions|вестник|журнал)[:\s\-]+([^\n\r]{3,80})", tl, flags=re.I)
+        if m:
+            tags.setdefault('journal', m.group(2).strip().title())
+        m = re.search(r"\b(\d+)\b.*?№\s*(\d+)\b", t)
+        if m:
+            tags.setdefault('volume_issue', f"{m.group(1)}/{m.group(2)}")
+        m = re.search(r"№\s*(\d+)\b", t)
+        if m:
+            tags.setdefault('number', m.group(1))
+        toc_entries = _extract_journal_toc_entries(t)
+        if toc_entries:
+            formatted: list[str] = []
+            for entry in toc_entries[:25]:
+                title = entry.get('title', '').strip()
+                if not title:
+                    continue
+                piece = title
+                authors = entry.get('authors')
+                page = entry.get('page')
+                if authors:
+                    piece = f"{authors}: {piece}"
+                if page:
+                    piece = f"{piece} (стр. {page})"
+                formatted.append(piece)
+            if formatted:
+                tags.setdefault('toc', formatted)
     elif mt == 'textbook':
         m = re.search(r"учебн(?:ое|ик|ое\s+пособие)\s*[:\-]?\s*([^\n\r]{3,80})", tl)
         if m:
@@ -3002,6 +3032,7 @@ def normalize_material_type(s: str) -> str:
         'автореферат': 'dissertation_abstract',
         'автореферат диссертации': 'dissertation_abstract',
         'статья': 'article', 'article': 'article', 'paper': 'article',
+        'журнал': 'journal', 'journal': 'journal', 'magazine': 'journal', 'вестник': 'journal',
         'учебник': 'textbook', 'пособие': 'textbook', 'учебное пособие': 'textbook',
         'монография': 'monograph',
         'отчет': 'report', 'отчёт': 'report', 'report': 'report',
@@ -3022,10 +3053,104 @@ def normalize_material_type(s: str) -> str:
             return v
     return s or 'document'
 
+
+def _looks_like_author_line(line: str) -> bool:
+    line = (line or '').strip()
+    if not line or len(line.split()) > 16:
+        return False
+    if re.search(r"\d{2,}|стр\.|с\.\s*\d", line, flags=re.I):
+        return False
+    # Классические форматы: Иванов И.И.; Иванов Иван Иванович; Ivanov I.I.; John Smith
+    patterns = [
+        r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.",
+        r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+",
+        r"[A-Z][a-z]+\s+[A-Z]\.[A-Z]\.",
+        r"[A-Z][a-z]+\s+[A-Z][a-z]+",
+    ]
+    return any(re.search(pat, line) for pat in patterns)
+
+
+def _extract_journal_toc_entries(text: str, limit: int = 30) -> list[dict[str, str]]:
+    """Извлекает записи оглавления журнала: авторы, название, страница."""
+    if not text:
+        return []
+    lower = text.lower()
+    markers = ["оглавлен", "содержани", "contents", "table of contents"]
+    positions = [lower.find(m) for m in markers if lower.find(m) != -1]
+    if not positions:
+        return []
+    start = min(positions)
+    slice_end = min(len(text), start + 15000)
+    lines = text[start:slice_end].splitlines()
+    entries: list[dict[str, str]] = []
+    pending_authors: str | None = None
+    blank_streak = 0
+    for raw in lines[1:]:
+        if len(entries) >= limit:
+            break
+        line = raw.strip()
+        if not line:
+            blank_streak += 1
+            if blank_streak >= 3 and entries:
+                break
+            continue
+        blank_streak = 0
+        cleaned = re.sub(r"^[\dIVXLCM\s\.\-–·•]+", "", line, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("…", " ")
+        cleaned = re.sub(r"[·•]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\.{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        if len(cleaned) < 4:
+            continue
+        page_match = re.search(r"(\d{1,4})(?:\s*(?:стр\.|с\.)?)?$", cleaned, flags=re.IGNORECASE)
+        if not page_match:
+            if _looks_like_author_line(cleaned):
+                pending_authors = cleaned
+            continue
+        page = page_match.group(1)
+        body = cleaned[:page_match.start()].strip(" .•—-–\t")
+        if not body:
+            continue
+        authors = None
+        title = body
+        # Попытки отделить авторов
+        separators = [" — ", " - ", " – ", " —", ": ", "; "]
+        for sep in separators:
+            if sep in body:
+                left, right = body.split(sep, 1)
+                if _looks_like_author_line(left):
+                    authors = left.strip()
+                    title = right.strip()
+                    break
+        if authors is None:
+            m = re.match(r"^((?:[A-ZА-ЯЁ][A-Za-zА-Яа-яё\-']+(?:\s+[A-ZА-ЯЁ]\.[A-ZА-ЯЁ]\.)?(?:,\s*)?)+)\s+(.+)$", body)
+            if m and _looks_like_author_line(m.group(1)):
+                authors = m.group(1).strip()
+                title = m.group(2).strip()
+            elif pending_authors and not _looks_like_author_line(body):
+                authors = pending_authors.strip()
+                title = body.strip()
+                pending_authors = None
+        entry = {
+            'title': title.strip(),
+            'page': page.strip(),
+        }
+        if authors:
+            entry['authors'] = authors
+        entries.append(entry)
+        pending_authors = None
+    return entries
+
 def guess_material_type(ext: str, text_excerpt: str, filename: str = "") -> str:
     """Расширенная эвристика типа материала на основе текста/имени файла."""
     tl = (text_excerpt or "").lower()
     fn = (filename or "").lower()
+    journal_toc = _extract_journal_toc_entries(text_excerpt or "")
+    if journal_toc and (len(journal_toc) >= 3) and (
+        'журнал' in tl or 'вестник' in tl or 'issn' in tl or re.search(r"№\s*\d", tl) or
+        any(tok in fn for tok in ["journal", "журнал", "vestnik", "issue"])
+    ):
+        return "journal"
     # Диссертация / автореферат
     if any(k in tl for k in ["диссертац", "на соискание степени", "автореферат диссертац"]):
         return "dissertation_abstract" if "автореферат" in tl else "dissertation"
@@ -3074,6 +3199,8 @@ def _detect_type_pre_llm(ext: str, text_excerpt: str, filename: str) -> str | No
             return 'dissertation_abstract'
         if any(tok in fl for tok in ["диссер", "dissert", "thesis"]):
             return 'dissertation'
+        if any(tok in fl for tok in ["журнал", "journal", "magazine", "issue", "vestnik", "выпуск"]):
+            return 'journal'
         if any(tok in fl for tok in ["монограф", "monograph"]):
             return 'monograph'
         if any(tok in fl for tok in ["презентац", "slides", "ppt", "pptx", "keynote"]):
@@ -4913,7 +5040,11 @@ def api_file_refresh(file_id):
             if ttags:
                 db.session.flush()
                 for k, v in ttags.items():
-                    upsert_tag(f, k, v)
+                    values = v if isinstance(v, (list, tuple, set)) else [v]
+                    for single in values:
+                        if single is None:
+                            continue
+                        upsert_tag(f, k, single)
             _log(f"type-tags: {len(ttags or {})}")
         except Exception:
             _log("type-tags: error")
@@ -4934,7 +5065,11 @@ def api_file_refresh(file_id):
             if rtags:
                 db.session.flush()
                 for k, v in rtags.items():
-                    upsert_tag(f, k, v)
+                    values = v if isinstance(v, (list, tuple, set)) else [v]
+                    for single in values:
+                        if single is None:
+                            continue
+                        upsert_tag(f, k, single)
             _log(f"richer-tags: {len(rtags or {})}")
         except Exception:
             _log("richer-tags: error")
@@ -5668,7 +5803,11 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                         if ttags:
                             db.session.flush()
                             for k, v in ttags.items():
-                                upsert_tag(file_obj, k, v)
+                                values = v if isinstance(v, (list, tuple, set)) else [v]
+                                for single in values:
+                                    if single is None:
+                                        continue
+                                    upsert_tag(file_obj, k, single)
                     except Exception as e:
                         _scan_log(f"type tags error: {e}", level="warn")
                     # Дополнительные расширенные теги
@@ -5677,7 +5816,11 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                         if rtags:
                             db.session.flush()
                             for k, v in rtags.items():
-                                upsert_tag(file_obj, k, v)
+                                values = v if isinstance(v, (list, tuple, set)) else [v]
+                                for single in values:
+                                    if single is None:
+                                        continue
+                                    upsert_tag(file_obj, k, single)
                     except Exception as e:
                         _scan_log(f"richer tags error: {e}", level="warn")
 
@@ -5766,7 +5909,11 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                         if ttags:
                             db.session.flush()
                             for k, v in ttags.items():
-                                upsert_tag(file_obj, k, v)
+                                values = v if isinstance(v, (list, tuple, set)) else [v]
+                                for single in values:
+                                    if single is None:
+                                        continue
+                                    upsert_tag(file_obj, k, single)
                     except Exception as e:
                         _scan_log(f"type tags error(2): {e}", level="warn")
                     # Добавочные расширенные теги после LLM
@@ -5775,7 +5922,11 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                         if rtags:
                             db.session.flush()
                             for k, v in rtags.items():
-                                upsert_tag(file_obj, k, v)
+                                values = v if isinstance(v, (list, tuple, set)) else [v]
+                                for single in values:
+                                    if single is None:
+                                        continue
+                                    upsert_tag(file_obj, k, single)
                     except Exception as e:
                         _scan_log(f"richer tags error(2): {e}", level="warn")
 

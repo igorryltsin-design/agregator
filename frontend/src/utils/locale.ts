@@ -1,26 +1,42 @@
+const MATERIAL_TYPE_MAP: Record<string, string> = {
+  dissertation: 'Диссертация',
+  dissertation_abstract: 'Автореферат',
+  article: 'Статья',
+  journal: 'Журнал',
+  textbook: 'Учебник',
+  monograph: 'Монография',
+  report: 'Отчёт',
+  patent: 'Патент',
+  presentation: 'Презентация',
+  proceedings: 'Труды',
+  standard: 'Стандарт',
+  note: 'Заметка',
+  document: 'Документ',
+  file: 'Файл',
+  audio: 'Аудио',
+  image: 'Изображение',
+  video: 'Видео',
+  other: 'Другое',
+}
+
+export const materialTypeOptions = Object.entries(MATERIAL_TYPE_MAP).map(([value, label]) => ({ value, label }))
+
 export function materialTypeRu(type: string | null | undefined, fallback: string = 'Другое'): string {
   if (!type) return fallback
-  const map: Record<string, string> = {
-    dissertation: 'Диссертация',
-    dissertation_abstract: 'Автореферат',
-    article: 'Статья',
-    textbook: 'Учебник',
-    monograph: 'Монография',
-    report: 'Отчёт',
-    patent: 'Патент',
-    presentation: 'Презентация',
-    proceedings: 'Труды',
-    standard: 'Стандарт',
-    note: 'Заметка',
-    document: 'Документ',
-    file: 'Файл',
-    audio: 'Аудио',
-    image: 'Изображение',
-    video: 'Видео',
-    other: 'Другое',
-  }
   const key = String(type).toLowerCase()
-  return map[key] || String(type)
+  return MATERIAL_TYPE_MAP[key] || String(type)
+}
+
+export function materialTypeSlug(input: string | null | undefined): string | null {
+  if (!input) return null
+  const trimmed = input.trim()
+  if (!trimmed) return null
+  const lower = trimmed.toLowerCase()
+  const optionByValue = materialTypeOptions.find(opt => opt.value === lower)
+  if (optionByValue) return optionByValue.value
+  const optionByLabel = materialTypeOptions.find(opt => opt.label.toLowerCase() === lower)
+  if (optionByLabel) return optionByLabel.value
+  return trimmed
 }
 
 export function tagKeyRu(key: string | null | undefined): string {
@@ -31,6 +47,7 @@ export function tagKeyRu(key: string | null | undefined): string {
     pages: 'Страниц',
     doi: 'DOI',
     isbn: 'ISBN',
+    issn: 'ISSN',
     journal: 'Журнал',
     volume_issue: 'Том/номер',
     number: 'Номер',
@@ -43,6 +60,7 @@ export function tagKeyRu(key: string | null | undefined): string {
     topic: 'Тема',
     category: 'Категория',
     classification: 'Классификация',
+    toc: 'Оглавление',
     specialty: 'Специальность',
     speciality: 'Специальность',
     speciality_code: 'Код специальности',
