@@ -72,6 +72,10 @@ try:
 except ImportError:
     pytesseract = None
 try:
+    import mammoth
+except ImportError:
+    mammoth = None
+try:
     from PIL import Image as PILImage
 except Exception:
     PILImage = None
@@ -83,7 +87,7 @@ try:
     from huggingface_hub import snapshot_download as hf_snapshot_download
 except Exception:
     hf_snapshot_download = None
-import subprocess, shutil, wave
+import subprocess, shutil, wave, tempfile
 import time
 from html import escape
 
@@ -646,6 +650,10 @@ _PREVIEW_HEAD = """
   mark { background:#bb8009; color:inherit; padding:0 2px; border-radius:3px; }
   embed, iframe { border:none; border-radius:10px; background:#0d1117; }
   audio { width:100%; }
+  .docx-preview { background:#0d1117; border:1px solid #30363d; border-radius:10px; max-height:70vh; overflow:auto; padding:16px; line-height:1.55; }
+  .docx-preview p { margin:0 0 0.9em; }
+  .docx-preview h1, .docx-preview h2, .docx-preview h3, .docx-preview h4 { margin-top:1.2em; margin-bottom:0.6em; }
+  .docx-preview ul, .docx-preview ol { padding-left:1.3em; }
   @media (prefers-color-scheme: light) {
     body { background:#f5f6f8; color:#101828; }
     .preview-header { background:#ffffff; border-color:rgba(15,23,42,0.09); }
@@ -655,6 +663,7 @@ _PREVIEW_HEAD = """
     .btn.secondary { background:#fff; color:#0f172a; border-color:rgba(15,23,42,0.14); }
     .muted { color:#64748b; }
     .badge, .tag { background:rgba(15,23,42,0.08); color:#0f172a; }
+    .docx-preview { background:#f8fafc; border-color:rgba(15,23,42,0.08); }
   }
 </style>
 <script>
@@ -667,7 +676,7 @@ _PREVIEW_HEAD = """
     if (!terms.length) return;
     const esc = s => s.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
     const re = new RegExp('(' + terms.map(esc).join('|') + ')', 'gi');
-    document.querySelectorAll('.preview-text').forEach(el => {
+    document.querySelectorAll('.preview-text, .docx-preview').forEach(el => {
       try { el.innerHTML = el.innerHTML.replace(re, '<mark>$1</mark>'); } catch (_) {}
     });
   } catch (err) {
@@ -678,6 +687,33 @@ _PREVIEW_HEAD = """
 """.strip()
 
 
+def _sanitize_html_fragment(html_fragment: str) -> str:
+    if not html_fragment:
+        return ''
+    cleaned = re.sub(r'(?is)<script.*?>.*?</script>', '', html_fragment)
+    cleaned = re.sub(r'(?is)<style.*?>.*?</style>', '', cleaned)
+    cleaned = re.sub(r'(?i) on[a-z]+="[^"]*"', '', cleaned)
+    cleaned = re.sub(r"(?i) on[a-z]+='[^']*'", '', cleaned)
+    cleaned = re.sub(r'(?i)javascript:', '', cleaned)
+    return cleaned
+
+
+def _docx_to_html(path: Path, limit_chars: int = 60000) -> str | None:
+    if mammoth is None:
+        return None
+    try:
+        with path.open('rb') as docx_file:
+            result = mammoth.convert_to_html(docx_file)
+        html_fragment = result.value or ''
+        sanitized = _sanitize_html_fragment(html_fragment)
+        if limit_chars:
+            return sanitized[:limit_chars]
+        return sanitized
+    except Exception as exc:
+        app.logger.warning(f"DOCX preview conversion failed for {path}: {exc}")
+        return None
+
+
 def _render_preview(
     rel_url: str,
     *,
@@ -685,6 +721,7 @@ def _render_preview(
     is_text: bool,
     is_audio: bool,
     is_image: bool,
+    is_docx: bool,
     content: str,
     thumbnail_url: str | None,
     abstract: str,
@@ -692,7 +729,8 @@ def _render_preview(
     duration: str | None,
     image_url: str | None,
     keywords: str | None,
-    embedded: bool
+    embedded: bool,
+    docx_html: str | None
 ) -> Response:
     safe_rel = escape(rel_url)
     download_url = escape(url_for('download_file', rel_path=rel_url))
@@ -731,6 +769,13 @@ def _render_preview(
             chips = ''.join(f'<span class="tag">{escape(k.strip())}</span>' for k in keywords.split(',') if k.strip())
             if chips:
                 section('Ключевые слова', chips)
+    elif is_docx:
+        if docx_html:
+            section('Документ', f'<div class="docx-preview">{docx_html}</div>')
+        elif content:
+            section('Текст', f'<div class="preview-text">{escape(content)}</div>')
+        else:
+            sections.append('<div class="muted">Не удалось построить предпросмотр DOCX.</div>')
     elif is_text:
         section('Текст', f'<div class="preview-text">{escape(content)}</div>')
     elif thumbnail_url:
@@ -2261,12 +2306,14 @@ def preview_file(rel_path):
     is_text = ext in {'.txt', '.md'}
     is_image = ext in IMAGE_EXTS
     is_audio = ext in AUDIO_EXTS
+    is_docx = ext == '.docx'
     content = ''
     thumbnail_url = None
     abstract = ''
     audio_url = None
     duration = None
     image_url = None
+    docx_html = None
 
     try:
         # Кэш‑каталог для текстовых фрагментов
@@ -2282,7 +2329,8 @@ def preview_file(rel_path):
         except Exception:
             sha = None
 
-        cache_file = cache_dir / ((sha or rel_path.replace('/', '_')) + '.txt')
+        cache_key = (sha or rel_path.replace('/', '_'))
+        cache_file = cache_dir / (cache_key + '.txt')
         if cache_file.exists():
             content = cache_file.read_text(encoding='utf-8', errors='ignore')
         else:
@@ -2303,6 +2351,23 @@ def preview_file(rel_path):
                 cache_file.write_text(content, encoding='utf-8')
             except Exception:
                 pass
+        if is_docx and mammoth is not None:
+            html_cache_dir = Path(app.static_folder) / 'cache' / 'docx_html'
+            html_cache_dir.mkdir(parents=True, exist_ok=True)
+            html_cache_file = html_cache_dir / (cache_key + '.html')
+            if html_cache_file.exists():
+                try:
+                    docx_html = html_cache_file.read_text(encoding='utf-8', errors='ignore')
+                except Exception:
+                    docx_html = None
+            if docx_html is None:
+                generated_html = _docx_to_html(abs_path)
+                if generated_html:
+                    docx_html = generated_html
+                    try:
+                        html_cache_file.write_text(docx_html, encoding='utf-8')
+                    except Exception:
+                        pass
     except Exception:
         content = ''
 
@@ -2357,6 +2422,7 @@ def preview_file(rel_path):
         is_text=is_text,
         is_audio=is_audio,
         is_image=is_image,
+        is_docx=is_docx,
         content=content,
         thumbnail_url=thumbnail_url,
         abstract=abstract,
@@ -2365,6 +2431,7 @@ def preview_file(rel_path):
         image_url=image_url,
         keywords=keywords_str,
         embedded=embedded,
+        docx_html=docx_html,
     )
 
 FILENAME_PATTERNS = [
@@ -3070,6 +3137,10 @@ def _looks_like_author_line(line: str) -> bool:
     return any(re.search(pat, line) for pat in patterns)
 
 
+MIN_JOURNAL_TOC_ENTRIES = 5
+MIN_JOURNAL_PAGES = 20
+
+
 def _extract_journal_toc_entries(text: str, limit: int = 30) -> list[dict[str, str]]:
     """Извлекает записи оглавления журнала: авторы, название, страница."""
     if not text:
@@ -3141,12 +3212,24 @@ def _extract_journal_toc_entries(text: str, limit: int = 30) -> list[dict[str, s
         pending_authors = None
     return entries
 
+
+def _journal_safety_check(material_type: str | None, text: str | None, page_count: int | None, entries: list[dict[str, str]] | None = None) -> str | None:
+    mt = (material_type or '').strip().lower()
+    if mt != 'journal':
+        return material_type
+    entries = entries if entries is not None else (_extract_journal_toc_entries(text or '') if text else [])
+    if len(entries) < MIN_JOURNAL_TOC_ENTRIES:
+        return 'article'
+    if page_count is not None and page_count < MIN_JOURNAL_PAGES:
+        return 'article'
+    return material_type
+
 def guess_material_type(ext: str, text_excerpt: str, filename: str = "") -> str:
     """Расширенная эвристика типа материала на основе текста/имени файла."""
     tl = (text_excerpt or "").lower()
     fn = (filename or "").lower()
     journal_toc = _extract_journal_toc_entries(text_excerpt or "")
-    if journal_toc and (len(journal_toc) >= 3) and (
+    if journal_toc and (len(journal_toc) >= MIN_JOURNAL_TOC_ENTRIES) and (
         'журнал' in tl or 'вестник' in tl or 'issn' in tl or re.search(r"№\s*\d", tl) or
         any(tok in fn for tok in ["journal", "журнал", "vestnik", "issue"])
     ):
@@ -3679,6 +3762,66 @@ def api_search_v2():
         "tags": [{"key": t.key, "value": t.value} for t in r.tags]
     } for r in rows]
     return jsonify({"items": items, "total": total})
+
+
+@app.route('/api/voice-search', methods=['POST'])
+def api_voice_search():
+    """Принимает короткий аудиофрагмент, распознаёт его и возвращает текст."""
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    if not TRANSCRIBE_ENABLED:
+        return jsonify({'ok': False, 'error': 'Распознавание аудио отключено'}), 503
+    if request.content_length and request.content_length > 15 * 1024 * 1024:
+        return jsonify({'ok': False, 'error': 'Аудио слишком большое'}), 413
+
+    audio = request.files.get('audio')
+    if not audio or audio.filename is None:
+        return jsonify({'ok': False, 'error': 'Не удалось получить аудио'}), 400
+
+    filename = secure_filename(audio.filename) or 'voice-input.webm'
+    suffix = Path(filename).suffix or '.webm'
+    src_path: Path | None = None
+    wav_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            audio.save(tmp)
+            src_path = Path(tmp.name)
+
+        transcript = ''
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as wav_tmp:
+                wav_path = Path(wav_tmp.name)
+            _convert_to_wav_pcm16(src_path, wav_path)
+            transcript = transcribe_audio(wav_path, limit_chars=5000)
+        except Exception as conv_exc:
+            app.logger.info(f'[voice-search] wav convert failed, fallback to raw: {conv_exc}')
+            transcript = transcribe_audio(src_path, limit_chars=5000)
+
+        transcript = (transcript or '').strip()
+        if not transcript:
+            return jsonify({'ok': True, 'text': '', 'warning': 'Речь не распознана'})
+
+        try:
+            _log_user_action(user, 'voice_search', detail=json.dumps({'length': len(transcript)}))
+        except Exception:
+            pass
+
+        return jsonify({'ok': True, 'text': transcript})
+    except Exception as exc:
+        app.logger.warning(f'[voice-search] failed: {exc}')
+        return jsonify({'ok': False, 'error': 'Не удалось распознать аудио'}), 500
+    finally:
+        if src_path:
+            try:
+                src_path.unlink()
+            except FileNotFoundError:
+                pass
+        if wav_path:
+            try:
+                wav_path.unlink()
+            except FileNotFoundError:
+                pass
 
 @app.route('/api/settings', methods=['GET', 'POST'])
 def api_settings():
@@ -4988,9 +5131,11 @@ def api_file_refresh(file_id):
             upsert_tag(f, 'ext', ext.lstrip('.'))
         except Exception:
             pass
+        page_count = None
         if ext == '.pdf':
             try:
                 with fitz.open(str(p)) as _doc:
+                    page_count = len(_doc)
                     upsert_tag(f, 'pages', str(len(_doc)))
             except Exception:
                 pass
@@ -5033,6 +5178,9 @@ def api_file_refresh(file_id):
             f.material_type = 'audio'
         if ext in IMAGE_EXTS and (f.material_type or '') == 'document':
             f.material_type = 'image'
+
+        journal_entries = _extract_journal_toc_entries(text_excerpt or '') if text_excerpt else []
+        f.material_type = _journal_safety_check(f.material_type, text_excerpt, page_count, journal_entries)
 
         # Теги, зависящие от типа
         try:
@@ -5675,6 +5823,7 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 size = path.stat().st_size
                 mtime = path.stat().st_mtime
                 filename = path.stem
+                page_count: int | None = None
 
                 file_obj = File.query.filter_by(path=str(path)).first()
                 if not file_obj:
@@ -5720,6 +5869,7 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                     if ext == '.pdf':
                         try:
                             with fitz.open(str(path)) as _doc:
+                                page_count = len(_doc)
                                 upsert_tag(file_obj, 'pages', str(len(_doc)))
                         except Exception:
                             pass
@@ -5797,32 +5947,35 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 if ext in IMAGE_EXTS and (file_obj.material_type or '') == 'document':
                     file_obj.material_type = 'image'
 
+                journal_entries = _extract_journal_toc_entries(text_excerpt or '') if text_excerpt else []
+                file_obj.material_type = _journal_safety_check(file_obj.material_type, text_excerpt, page_count, journal_entries)
+
                 # Типо-зависимые теги (до LLM)
-                    try:
-                        ttags = extract_tags_for_type(file_obj.material_type or '', text_excerpt or '', filename)
-                        if ttags:
-                            db.session.flush()
-                            for k, v in ttags.items():
-                                values = v if isinstance(v, (list, tuple, set)) else [v]
-                                for single in values:
-                                    if single is None:
-                                        continue
-                                    upsert_tag(file_obj, k, single)
-                    except Exception as e:
-                        _scan_log(f"type tags error: {e}", level="warn")
-                    # Дополнительные расширенные теги
-                    try:
-                        rtags = extract_richer_tags(file_obj.material_type or '', text_excerpt or '', filename)
-                        if rtags:
-                            db.session.flush()
-                            for k, v in rtags.items():
-                                values = v if isinstance(v, (list, tuple, set)) else [v]
-                                for single in values:
-                                    if single is None:
-                                        continue
-                                    upsert_tag(file_obj, k, single)
-                    except Exception as e:
-                        _scan_log(f"richer tags error: {e}", level="warn")
+                try:
+                    ttags = extract_tags_for_type(file_obj.material_type or '', text_excerpt or '', filename)
+                    if ttags:
+                        db.session.flush()
+                        for k, v in ttags.items():
+                            values = v if isinstance(v, (list, tuple, set)) else [v]
+                            for single in values:
+                                if single is None:
+                                    continue
+                                upsert_tag(file_obj, k, single)
+                except Exception as e:
+                    _scan_log(f"type tags error: {e}", level="warn")
+                # Дополнительные расширенные теги
+                try:
+                    rtags = extract_richer_tags(file_obj.material_type or '', text_excerpt or '', filename)
+                    if rtags:
+                        db.session.flush()
+                        for k, v in rtags.items():
+                            values = v if isinstance(v, (list, tuple, set)) else [v]
+                            for single in values:
+                                if single is None:
+                                    continue
+                                upsert_tag(file_obj, k, single)
+                except Exception as e:
+                    _scan_log(f"richer tags error: {e}", level="warn")
 
                 # Обогащение через LLM (может быть медленным)
                 if use_llm and (text_excerpt or ext in {'.txt', '.md'} or ext in IMAGE_EXTS or ext in {'.pdf','.docx','.rtf','.epub','.djvu'}):
@@ -5880,11 +6033,12 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                         if meta.get("novelty"):
                             db.session.flush()
                             upsert_tag(file_obj, "научная новизна", str(meta.get("novelty")))
-                    for key in ("literature", "organizations", "classification"):
-                        val = meta.get(key)
-                        if isinstance(val, list) and val:
-                            db.session.flush()
-                            upsert_tag(file_obj, key, "; ".join([str(x) for x in val]))
+                        for key in ("literature", "organizations", "classification"):
+                            val = meta.get(key)
+                            if isinstance(val, list) and val:
+                                db.session.flush()
+                                upsert_tag(file_obj, key, "; ".join([str(x) for x in val]))
+                        file_obj.material_type = _journal_safety_check(file_obj.material_type, llm_text or text_excerpt, page_count)
                     # Резюме для аудио
                     if ext in AUDIO_EXTS and SUMMARIZE_AUDIO and (file_obj.text_excerpt or ''):
                         summ = call_lmstudio_summarize(file_obj.text_excerpt, path.name)

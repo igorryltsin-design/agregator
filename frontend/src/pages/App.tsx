@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, Outlet, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { useToasts } from '../ui/Toasts'
 import { useAuth } from '../ui/Auth'
+import VoiceSearchButton from '../ui/VoiceSearchButton'
 
 export default function App() {
   const [sp, setSp] = useSearchParams()
@@ -130,6 +131,24 @@ export default function App() {
     }
   }
 
+  const handleVoiceSearch = useCallback((text: string) => {
+    const normalized = text.trim()
+    if (!normalized) {
+      return
+    }
+    if (searchRef.current) {
+      searchRef.current.value = normalized
+    }
+    sp.set('q', normalized)
+    sp.set('commit', String(Date.now()))
+    setSp(sp, { replace: true })
+  }, [sp, setSp])
+
+  const handleVoiceError = useCallback((message: string) => {
+    if (!message) return
+    toasts.push(message, 'error')
+  }, [toasts])
+
   const handleLogout = async () => {
     setAdminMenuOpen(false)
     await logout()
@@ -177,6 +196,7 @@ export default function App() {
             onChange={e => { sp.set('q', e.target.value); sp.delete('commit'); setSp(sp, { replace: true }) }}
             onKeyDown={e => { if (e.key === 'Enter') { sp.set('commit', String(Date.now())); setSp(sp, { replace: true }) } }}
           />
+          <VoiceSearchButton onTranscribed={handleVoiceSearch} onError={handleVoiceError} />
           <div className="ms-auto d-flex align-items-center gap-2 flex-wrap justify-content-end" style={{ rowGap: '0.3rem' }}>
             <button className="btn btn-outline-secondary" onClick={()=> setTheme(t => t==='dark'?'light':'dark')} aria-label="Переключить тему">{theme==='dark'?'🌙':'☀️'}</button>
             <Link className="btn btn-outline-secondary" to="graph">Граф</Link>

@@ -16,3 +16,4 @@ faster-whisper
 pytesseract
 natasha==1.6.0
 pymorphy2==0.9.1
+mammoth

@@ -64,7 +64,19 @@ export default function Catalogue() {
   const [aiFilteredKeywords, setAiFilteredKeywords] = useState<string[]>([])
   const [aiQueryHash, setAiQueryHash] = useState<string>('')
   const [feedbackStatus, setFeedbackStatus] = useState<Record<string, string>>({})
+  const [speechSupported, setSpeechSupported] = useState<boolean>(() => typeof window !== 'undefined' && 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined')
+  const [autoSpeakAnswer, setAutoSpeakAnswer] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    try {
+      return localStorage.getItem('catalogue.autoSpeakAnswer') === '1'
+    } catch {
+      return false
+    }
+  })
+  const [speechState, setSpeechState] = useState<'idle' | 'speaking'>('idle')
+  const [speechError, setSpeechError] = useState<string | null>(null)
   const sentinelRef = useRef<HTMLDivElement|null>(null)
+  const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const [localPage, setLocalPage] = useState(page)
   const [editItem, setEditItem] = useState<FileItem | null>(null)
   const [editForm, setEditForm] = useState<any>(null)
@@ -99,6 +111,18 @@ export default function Catalogue() {
     line,
     icon: progressIconFor(line),
   })), [aiProgress, progressIconFor])
+
+  const aiAnswerPlain = useMemo(() => {
+    if (!aiAnswer) return ''
+    const raw = String(aiAnswer)
+    if (typeof window === 'undefined') {
+      return raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+    }
+    const tmp = document.createElement('div')
+    tmp.innerHTML = raw
+    const text = tmp.textContent || tmp.innerText || ''
+    return text.replace(/\s+/g, ' ').trim()
+  }, [aiAnswer])
 
   const sendFeedback = useCallback(async (payload: { action: string; file_id?: number; keyword?: string; score?: number }, onSuccess?: () => void) => {
     if (!aiQueryHash) return
@@ -138,6 +162,78 @@ export default function Catalogue() {
       setAiFilteredKeywords(prev => prev.filter(k => k !== keyword))
     })
   }, [aiQueryHash, sendFeedback])
+
+  const stopSpeakingAnswer = useCallback(() => {
+    if (!speechSupported) {
+      setSpeechState('idle')
+      setSpeechError(null)
+      return
+    }
+    try {
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel()
+      }
+    } catch (error) {
+      console.debug('speechSynthesis cancel failed', error)
+    }
+    speechUtteranceRef.current = null
+    setSpeechState('idle')
+    setSpeechError(null)
+  }, [speechSupported])
+
+  const speakAnswer = useCallback(() => {
+    if (!speechSupported) return
+    const text = aiAnswerPlain.trim()
+    if (!text) return
+    stopSpeakingAnswer()
+    try {
+      const utterance = new SpeechSynthesisUtterance(text)
+      const cyrCount = (text.match(/[А-Яа-яЁё]/g) || []).length
+      const latCount = (text.match(/[A-Za-z]/g) || []).length
+      utterance.lang = cyrCount >= latCount ? 'ru-RU' : 'en-US'
+      utterance.rate = 1
+      utterance.onend = () => {
+        speechUtteranceRef.current = null
+        setSpeechState('idle')
+      }
+      utterance.onerror = () => {
+        speechUtteranceRef.current = null
+        setSpeechState('idle')
+        setSpeechError('Не удалось озвучить ответ')
+      }
+      speechUtteranceRef.current = utterance
+      setSpeechError(null)
+      setSpeechState('speaking')
+      window.speechSynthesis.speak(utterance)
+    } catch (error) {
+      speechUtteranceRef.current = null
+      setSpeechState('idle')
+      setSpeechError('Ошибка синтеза речи')
+      console.error('speechSynthesis speak failed', error)
+    }
+  }, [aiAnswerPlain, speechSupported, stopSpeakingAnswer])
+
+  const canSpeakAnswer = useMemo(() => speechSupported && aiAnswerPlain.length > 0, [speechSupported, aiAnswerPlain])
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem('catalogue.autoSpeakAnswer', autoSpeakAnswer ? '1' : '0')
+      } catch {
+        // ignore storage errors
+      }
+    }
+    if (!autoSpeakAnswer) {
+      stopSpeakingAnswer()
+    }
+  }, [autoSpeakAnswer, stopSpeakingAnswer])
+
+  useEffect(() => {
+    if (!autoSpeakAnswer) return
+    if (!speechSupported) return
+    if (!aiAnswerPlain) return
+    speakAnswer()
+  }, [autoSpeakAnswer, aiAnswerPlain, speechSupported, speakAnswer])
 
   const openEdit = (f: FileItem) => {
     setEditItem(f)
@@ -202,6 +298,47 @@ export default function Catalogue() {
       setAiProgress([])
     }
   }, [aiMode])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      setSpeechSupported(false)
+      setAutoSpeakAnswer(false)
+      return
+    }
+    const supported = 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined'
+    setSpeechSupported(supported)
+    if (!supported) {
+      setAutoSpeakAnswer(false)
+    }
+    return () => {
+      if ('speechSynthesis' in window) {
+        try {
+          window.speechSynthesis.cancel()
+        } catch (error) {
+          console.debug('speechSynthesis cancel failed', error)
+        }
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!speechSupported) {
+      setSpeechError(null)
+      return
+    }
+    if (!speechUtteranceRef.current) {
+      setSpeechError(null)
+      return
+    }
+    try {
+      window.speechSynthesis.cancel()
+    } catch (error) {
+      console.debug('speechSynthesis cancel on answer change failed', error)
+    }
+    speechUtteranceRef.current = null
+    setSpeechState('idle')
+    setSpeechError(null)
+  }, [aiAnswer, speechSupported])
 
   useEffect(() => {
     let cancelled = false;
@@ -555,6 +692,24 @@ export default function Catalogue() {
                 </div>
                 <small className="text-muted">Выключите, если нужна чистая работа только по одному источнику.</small>
               </div>
+              <div className="col-12 col-lg-3 d-flex flex-column justify-content-center">
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="aiAutoSpeak"
+                    checked={autoSpeakAnswer}
+                    disabled={!speechSupported}
+                    onChange={e => setAutoSpeakAnswer(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="aiAutoSpeak">Автоматически озвучивать ответ</label>
+                </div>
+                {speechSupported ? (
+                  <small className="text-muted">Старт озвучки при появлении нового ответа.</small>
+                ) : (
+                  <small className="text-muted">Синтез речи недоступен в этом браузере.</small>
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -613,7 +768,23 @@ export default function Catalogue() {
         )}
         {!!aiAnswer && (
           <div className="card p-3 mb-2" aria-live="polite">
-            <div className="fw-semibold mb-1">Ответ ИИ</div>
+            <div className="d-flex align-items-center justify-content-between mb-1 gap-2">
+              <div className="fw-semibold">Ответ ИИ</div>
+              {canSpeakAnswer && (
+                <button
+                  type="button"
+                  className={`btn btn-sm btn-outline-${speechState === 'speaking' ? 'danger' : 'secondary'}`}
+                  onClick={speechState === 'speaking' ? stopSpeakingAnswer : speakAnswer}
+                  aria-label={speechState === 'speaking' ? 'Остановить озвучивание' : 'Озвучить ответ'}
+                  title={speechState === 'speaking' ? 'Остановить озвучивание' : 'Озвучить ответ'}
+                >
+                  {speechState === 'speaking' ? '⏹ Стоп' : '🔊 Озвучить'}
+                </button>
+              )}
+            </div>
+            {speechError && (
+              <div className="text-danger" style={{ fontSize: '0.85rem' }}>{speechError}</div>
+            )}
             <div style={{whiteSpace:'pre-wrap'}} dangerouslySetInnerHTML={{__html: (function(){
               const raw = String(aiAnswer||'')
               const tmp = document.createElement('div'); tmp.innerHTML = raw
