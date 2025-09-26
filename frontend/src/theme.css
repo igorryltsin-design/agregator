@@ -1,39 +1,424 @@
-:root{
-  --bg: #0d1117;
-  --surface: #161b22;
-  --text: #c9d1d9;
-  --muted: #8b949e;
-  --border: #30363d;
-  --primary: #238636;
-  --primary-2: #2ea043;
-  --accent: #58a6ff;
-  --card-shadow: 0 6px 18px rgba(0,0,0,.25);
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  accent-color: #5ea0ff;
+  --bg: #071121;
+  --bg-soft: #0d1830;
+  --surface: #111f35;
+  --surface-raised: #172947;
+  --surface-hover: #1f3252;
+  --text: #e4ecfa;
+  --text-strong: #f8fbff;
+  --muted: #91a3c4;
+  --muted-strong: #c8d4f1;
+  --border: #253657;
+  --border-strong: #34507a;
+  --primary: #3b82f6;
+  --primary-2: #2563eb;
+  --accent: #5ea0ff;
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --card-shadow: 0 28px 60px rgba(6, 12, 28, 0.55);
+  --frosted-surface: rgba(17, 31, 61, 0.78);
+  --tag-bg: color-mix(in srgb, var(--surface-hover) 70%, var(--accent) 30%);
+  --tag-text: color-mix(in srgb, var(--text) 92%, #ffffff 8%);
+  --tag-border: color-mix(in srgb, var(--accent) 32%, transparent);
+  --bs-body-bg: var(--bg);
+  --bs-body-color: var(--text);
+  --bs-border-color: var(--border);
 }
 
-[data-theme="light"]{
-  --bg: #f6f8fa;
+[data-theme="light"] {
+  color-scheme: light;
+  accent-color: #2563eb;
+  --bg: #f6f8fc;
+  --bg-soft: #eef2ff;
   --surface: #ffffff;
-  --text: #0d1117;
-  --muted: #57606a;
-  --border: #d0d7de;
-  --primary: #0969da;
-  --primary-2: #1f6feb;
-  --accent: #0969da;
-  --card-shadow: 0 6px 18px rgba(27,31,36,.08);
+  --surface-raised: #f8faff;
+  --surface-hover: #eff3ff;
+  --text: #13203a;
+  --text-strong: #020617;
+  --muted: #667085;
+  --muted-strong: #475569;
+  --border: #d7deec;
+  --border-strong: #b8c5dd;
+  --primary: #2563eb;
+  --primary-2: #1d4ed8;
+  --accent: #2563eb;
+  --success: #16a34a;
+  --warning: #f59e0b;
+  --danger: #dc2626;
+  --card-shadow: 0 20px 40px rgba(15, 23, 42, 0.1);
+  --frosted-surface: rgba(255, 255, 255, 0.92);
+  --tag-bg: color-mix(in srgb, var(--surface-hover) 92%, var(--accent) 8%);
+  --tag-text: color-mix(in srgb, var(--accent) 52%, var(--text) 48%);
+  --tag-border: color-mix(in srgb, var(--accent) 22%, transparent);
+  --bs-body-bg: var(--bg);
+  --bs-body-color: var(--text);
+  --bs-border-color: var(--border);
 }
 
-html, body { background: var(--bg); color: var(--text); }
-.navbar { background: var(--surface) !important; position: sticky; top: 0; z-index: 1200; }
-.form-control, .form-select { background: var(--surface); color: var(--text); border-color: var(--border); }
-.form-control::placeholder { color: color-mix(in srgb, var(--muted) 80%, transparent); }
-.form-control:focus, .form-select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
-.btn-primary { background: var(--primary); border-color: var(--primary-2); }
-.btn-outline-secondary { color: var(--text); border-color: var(--border); }
-.card { background: var(--surface); border-color: var(--border); box-shadow: var(--card-shadow); border-radius: 14px; }
-.media-frame { border: 1px solid var(--border); border-radius: 8px; padding: 6px; background: var(--surface); }
-.media-frame audio { display:block; width:100%; }
-.tag { display:inline-block; padding:2px 8px; border-radius:999px; background: var(--border); color: var(--text); font-size:12px; margin:2px; }
-.muted { color: var(--muted); }
+html, body {
+  min-height: 100%;
+  background: radial-gradient(140% 120% at 12% 10%, rgba(62, 130, 247, 0.14), transparent 58%),
+              radial-gradient(120% 140% at 82% 6%, rgba(14, 165, 233, 0.1), transparent 52%),
+              linear-gradient(180deg, color-mix(in srgb, var(--bg) 94%, transparent) 0%, var(--bg) 100%);
+  color: var(--text);
+  transition: background 0.3s ease, color 0.3s ease;
+}
+
+html[data-theme="light"],
+html[data-theme="light"] body {
+  background: var(--bg);
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: var(--accent); }
+a:hover, a:focus { color: var(--primary); }
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 60%, transparent);
+  color: var(--text-strong);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--border-strong) 70%, var(--surface));
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+}
+
+.navbar {
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent) !important;
+  backdrop-filter: blur(18px);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  position: sticky;
+  top: 0;
+  z-index: 1200;
+  transition: background 0.3s ease, border-color 0.3s ease;
+}
+
+.bg-body-secondary,
+.bg-body-tertiary,
+.offcanvas,
+.accordion-body,
+.dropdown-menu,
+.toast,
+.modal-content,
+.list-group-item {
+  background: color-mix(in srgb, var(--surface) 94%, transparent) !important;
+  color: color-mix(in srgb, var(--text) 96%, var(--text-strong) 4%) !important;
+}
+
+.bg-body-secondary {
+  border-color: color-mix(in srgb, var(--border) 70%, transparent) !important;
+}
+
+.bg-body-tertiary {
+  background: color-mix(in srgb, var(--surface-hover) 92%, transparent) !important;
+  border-color: color-mix(in srgb, var(--border) 60%, transparent) !important;
+}
+
+pre,
+code,
+.code-block {
+  color: color-mix(in srgb, var(--text) 96%, var(--text-strong) 4%);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+}
+
+.form-control,
+.form-select,
+.form-check-input,
+.form-control-plaintext,
+.input-group-text {
+  background: color-mix(in srgb, var(--surface-raised) 90%, transparent);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--border) 80%, transparent);
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+
+input[type="file"] {
+  color: var(--text);
+}
+
+input[type="file"]::file-selector-button,
+input[type="file"]::-webkit-file-upload-button {
+  background: color-mix(in srgb, var(--surface-hover) 90%, transparent);
+  color: color-mix(in srgb, var(--text) 85%, var(--text-strong) 15%);
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border-radius: 10px;
+  padding: 5px 14px;
+  margin-right: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+input[type="file"]::file-selector-button:hover,
+input[type="file"]::file-selector-button:focus,
+input[type="file"]::-webkit-file-upload-button:hover,
+input[type="file"]::-webkit-file-upload-button:focus {
+  background: color-mix(in srgb, var(--surface-hover) 82%, var(--accent) 18%);
+  color: var(--text-strong);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow: 0 10px 22px rgba(37, 99, 235, 0.18);
+  transform: translateY(-1px);
+}
+
+input[type="file"]:disabled::file-selector-button,
+input[type="file"]:disabled::-webkit-file-upload-button {
+  cursor: not-allowed;
+  opacity: 0.6;
+  transform: none;
+  box-shadow: none;
+}
+
+.form-control::placeholder {
+  color: color-mix(in srgb, var(--muted) 80%, transparent);
+}
+
+.form-control:focus,
+.form-select:focus,
+.form-check-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.form-control:disabled,
+.form-select:disabled,
+.input-group-text:has(.form-control:disabled) {
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  color: color-mix(in srgb, var(--muted) 72%, transparent);
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, color-mix(in srgb, var(--primary) 88%, white 12%), var(--primary-2));
+  border-color: var(--primary-2);
+  color: #fff;
+  box-shadow: 0 12px 25px rgba(37, 99, 235, 0.25);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.btn-primary:hover,
+.btn-primary:focus {
+  background: linear-gradient(135deg, var(--primary-2), color-mix(in srgb, var(--primary-2) 85%, black 15%));
+  border-color: var(--primary-2);
+  box-shadow: 0 18px 38px rgba(37, 99, 235, 0.32);
+  transform: translateY(-1px);
+}
+
+.btn-outline-secondary,
+.btn-outline-secondary:focus-visible {
+  color: color-mix(in srgb, var(--text) 88%, var(--text-strong) 12%);
+  border-color: color-mix(in srgb, var(--border-strong) 65%, transparent);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.btn-outline-secondary:hover,
+.btn-outline-secondary:focus {
+  background: color-mix(in srgb, var(--surface-hover) 92%, transparent);
+  color: var(--text-strong);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong) 55%);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.16);
+}
+
+.btn-outline-secondary:active {
+  transform: translateY(0);
+  background: color-mix(in srgb, var(--accent) 22%, var(--surface));
+}
+
+.badge.bg-secondary {
+  background: color-mix(in srgb, var(--surface-hover) 40%, var(--accent) 60%) !important;
+  color: var(--text-strong);
+}
+
+.btn-outline-primary,
+.btn-outline-success,
+.btn-outline-info,
+.btn-outline-warning,
+.btn-outline-danger {
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  color: currentColor;
+}
+
+.btn-outline-primary {
+  color: color-mix(in srgb, var(--accent) 82%, var(--text) 18%);
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.btn-outline-primary:hover,
+.btn-outline-primary:focus {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  color: color-mix(in srgb, var(--text-strong) 80%, white 20%);
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.18);
+}
+
+.btn-outline-success {
+  color: color-mix(in srgb, var(--success) 78%, var(--text) 22%);
+  border-color: color-mix(in srgb, var(--success) 55%, transparent);
+}
+
+.btn-outline-success:hover,
+.btn-outline-success:focus {
+  background: color-mix(in srgb, var(--success) 20%, var(--surface));
+  color: color-mix(in srgb, var(--text-strong) 85%, white 15%);
+  border-color: color-mix(in srgb, var(--success) 70%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(34, 197, 94, 0.16);
+}
+
+.btn-outline-info {
+  color: color-mix(in srgb, var(--accent) 75%, var(--text) 25%);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.btn-outline-info:hover,
+.btn-outline-info:focus {
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+  color: color-mix(in srgb, var(--text-strong) 80%, white 20%);
+  border-color: color-mix(in srgb, var(--accent) 68%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(14, 165, 233, 0.16);
+}
+
+.btn-outline-warning {
+  color: color-mix(in srgb, var(--warning) 78%, var(--text) 22%);
+  border-color: color-mix(in srgb, var(--warning) 52%, transparent);
+}
+
+.btn-outline-warning:hover,
+.btn-outline-warning:focus {
+  background: color-mix(in srgb, var(--warning) 20%, var(--surface));
+  color: color-mix(in srgb, var(--text-strong) 85%, white 15%);
+  border-color: color-mix(in srgb, var(--warning) 68%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(245, 158, 11, 0.2);
+}
+
+.btn-outline-danger {
+  color: color-mix(in srgb, var(--danger) 78%, var(--text) 22%);
+  border-color: color-mix(in srgb, var(--danger) 58%, transparent);
+}
+
+.btn-outline-danger:hover,
+.btn-outline-danger:focus {
+  background: color-mix(in srgb, var(--danger) 18%, var(--surface));
+  color: color-mix(in srgb, var(--text-strong) 90%, white 10%);
+  border-color: color-mix(in srgb, var(--danger) 70%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(248, 113, 113, 0.2);
+}
+
+.card {
+  background: color-mix(in srgb, var(--surface-raised) 94%, transparent);
+  border-color: color-mix(in srgb, var(--border) 78%, transparent);
+  box-shadow: var(--card-shadow);
+  border-radius: 16px;
+  transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.card-header,
+.card-footer {
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  border-color: var(--border);
+}
+
+.media-frame {
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 12px;
+  padding: 6px;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+}
+
+.media-frame audio {
+  display: block;
+  width: 100%;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--tag-bg);
+  color: var(--tag-text);
+  border: 1px solid var(--tag-border);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  margin: 2px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.table {
+  color: var(--text);
+  border-color: var(--border);
+  --bs-table-bg: var(--surface);
+  --bs-table-striped-bg: color-mix(in srgb, var(--surface) 85%, transparent);
+  --bs-table-hover-bg: color-mix(in srgb, var(--surface) 78%, transparent);
+  --bs-table-striped-color: var(--text);
+  --bs-table-hover-color: var(--text);
+}
+
+.dropdown-menu,
+.list-group-item,
+.modal-content,
+.toast {
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.modal-header,
+.modal-footer {
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.list-group-item {
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.list-group-item:hover {
+  background: color-mix(in srgb, var(--surface-hover) 90%, transparent);
+  color: var(--text-strong);
+}
+
+.form-check-input:checked {
+  background-color: var(--primary);
+  border-color: var(--primary-2);
+}
+
+.form-switch .form-check-input {
+  background-color: color-mix(in srgb, var(--surface) 65%, transparent);
+}
+
+.form-switch .form-check-input:checked {
+  background-color: var(--primary);
+}
 
 /* KPI widgets */
 .kpi .label { text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }

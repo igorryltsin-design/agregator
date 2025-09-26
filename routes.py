@@ -7,6 +7,7 @@ import json
 from models import (File, Tag, db, upsert_tag, file_to_dict, ChangeLog,
                     Collection, CollectionMember, User, UserActionLog)
 from flask import current_app
+from sqlalchemy import func
 import re
 
 # --- Natasha/pymorphy2 helpers for RU morphology and synonyms ---
@@ -554,14 +555,41 @@ def api_collection_members(collection_id: int):
     if request.method == 'GET':
         return jsonify({'ok': True, 'members': _collection_to_dict(col, include_members=True)['members']})
     data = request.get_json(silent=True) or {}
-    user_id = data.get('user_id')
     role = str(data.get('role') or 'viewer').strip().lower()
     if role not in ('viewer', 'editor', 'owner'):
         role = 'viewer'
+    raw_identifier = data.get('user_id')
+    username_hint = data.get('username')
+    user_obj: User | None = None
+    user_id: int | None = None
+
+    def _lookup_by_username(value: str | None) -> User | None:
+        if not value:
+            return None
+        login = str(value).strip()
+        if not login:
+            return None
+        return User.query.filter(func.lower(User.username) == login.lower()).first()
+
     try:
-        user_id = int(user_id)
+        if raw_identifier is not None:
+            if isinstance(raw_identifier, int):
+                user_obj = User.query.get(raw_identifier)
+            else:
+                raw_str = str(raw_identifier).strip()
+                if raw_str.isdigit():
+                    user_obj = User.query.get(int(raw_str))
+                if not user_obj:
+                    user_obj = _lookup_by_username(raw_str)
+        if not user_obj:
+            user_obj = _lookup_by_username(username_hint)
     except Exception:
-        return jsonify({'ok': False, 'error': 'user_id обязателен'}), 400
+        user_obj = None
+
+    if not user_obj:
+        return jsonify({'ok': False, 'error': 'Пользователь не найден'}), 404
+
+    user_id = user_obj.id
     if role == 'owner' and getattr(actor, 'role', '') != 'admin':
         role = 'editor'
     member = CollectionMember.query.filter_by(collection_id=collection_id, user_id=user_id).first()
@@ -571,7 +599,8 @@ def api_collection_members(collection_id: int):
         member = CollectionMember(collection_id=collection_id, user_id=user_id, role=role)
         db.session.add(member)
     db.session.commit()
-    _log_user_action('collection_member_add', 'collection', collection_id, detail=json.dumps({'user_id': user_id, 'role': role}))
+    detail = json.dumps({'user_id': user_id, 'username': user_obj.username, 'role': role})
+    _log_user_action('collection_member_add', 'collection', collection_id, detail=detail)
     col = Collection.query.get(collection_id)
     return jsonify({'ok': True, 'members': _collection_to_dict(col, include_members=True)['members']})
 
@@ -584,11 +613,13 @@ def api_collection_member_detail(collection_id: int, user_id: int):
     if not member:
         abort(404)
     if request.method == 'DELETE':
+        username = member.user.username if member.user else None
         if user_id == col.owner_id and getattr(actor, 'role', '') != 'admin':
             return jsonify({'ok': False, 'error': 'Нельзя удалить владельца коллекции'}), 400
         db.session.delete(member)
         db.session.commit()
-        _log_user_action('collection_member_remove', 'collection', collection_id, detail=json.dumps({'user_id': user_id}))
+        detail = json.dumps({'user_id': user_id, 'username': username})
+        _log_user_action('collection_member_remove', 'collection', collection_id, detail=detail)
         return jsonify({'ok': True})
     data = request.get_json(silent=True) or {}
     role = str(data.get('role') or '').strip().lower()
@@ -599,7 +630,9 @@ def api_collection_member_detail(collection_id: int, user_id: int):
             return jsonify({'ok': False, 'error': 'Нельзя менять роль владельца'}), 400
         member.role = role
         db.session.commit()
-        _log_user_action('collection_member_update', 'collection', collection_id, detail=json.dumps({'user_id': user_id, 'role': role}))
+        username = member.user.username if member.user else None
+        detail = json.dumps({'user_id': user_id, 'username': username, 'role': role})
+        _log_user_action('collection_member_update', 'collection', collection_id, detail=detail)
         return jsonify({'ok': True})
     return jsonify({'ok': False, 'error': 'Некорректная роль'}), 400
 

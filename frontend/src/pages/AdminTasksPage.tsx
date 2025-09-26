@@ -25,6 +25,8 @@ const statusBadge: Record<string, string> = {
   error: 'bg-danger',
 }
 
+const FINAL_STATUSES = new Set(['completed', 'error', 'cancelled'])
+
 function formatDate(value?: string | null): string {
   if (!value) return '—'
   try {
@@ -40,6 +42,8 @@ export default function AdminTasksPage() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [loading, setLoading] = useState(false)
   const [expandedTaskId, setExpandedTaskId] = useState<number | null>(null)
+  const [deletingTaskId, setDeletingTaskId] = useState<number | null>(null)
+  const [clearingCompleted, setClearingCompleted] = useState(false)
   const isAdmin = user?.role === 'admin'
 
   const load = useCallback(async () => {
@@ -102,6 +106,53 @@ export default function AdminTasksPage() {
     }
   }
 
+  const remove = async (task: Task) => {
+    if (!FINAL_STATUSES.has(task.status)) {
+      toasts.push('Удалять можно только завершённые, отменённые или с ошибкой задачи', 'info')
+      return
+    }
+    if (!confirm('Удалить запись о задаче? Действие необратимо.')) return
+    setDeletingTaskId(task.id)
+    try {
+      const r = await fetch(`/api/admin/tasks/${task.id}`, { method: 'DELETE' })
+      if (r.ok) {
+        setTasks(prev => prev.filter(t => t.id !== task.id))
+        toasts.push('Задача удалена из журнала', 'success')
+      } else {
+        const data = await r.json().catch(() => ({}))
+        toasts.push(data?.error || 'Не удалось удалить задачу', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка соединения при удалении задачи', 'error')
+    } finally {
+      setDeletingTaskId(prev => (prev === task.id ? null : prev))
+    }
+  }
+
+  const clearCompleted = async () => {
+    if (!tasks.some(t => t.status === 'completed')) {
+      toasts.push('Нет задач со статусом "выполнено"', 'info')
+      return
+    }
+    if (!confirm('Удалить все завершённые задачи из списка?')) return
+    setClearingCompleted(true)
+    try {
+      const r = await fetch('/api/admin/tasks?status=completed', { method: 'DELETE' })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        const removed = Number(data.deleted || 0)
+        setTasks(prev => prev.filter(t => t.status !== 'completed'))
+        toasts.push(`Удалено завершённых задач: ${removed}`, removed ? 'success' : 'info')
+      } else {
+        toasts.push(data?.error || 'Не удалось очистить список', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка соединения при очистке списка', 'error')
+    } finally {
+      setClearingCompleted(false)
+    }
+  }
+
   const toggleDetails = (id: number) => {
     setExpandedTaskId(prev => (prev === id ? null : id))
   }
@@ -126,6 +177,13 @@ export default function AdminTasksPage() {
         <div className="d-flex justify-content-between align-items-center mb-3">
           <div className="fw-semibold fs-5">Очередь задач</div>
           <div className="d-flex gap-2">
+            <button
+              className="btn btn-outline-danger btn-sm"
+              onClick={clearCompleted}
+              disabled={clearingCompleted || loading}
+            >
+              {clearingCompleted ? 'Очистка…' : 'Очистить завершённые'}
+            </button>
             <button className="btn btn-outline-secondary btn-sm" onClick={load} disabled={loading}>{loading ? 'Обновление…' : 'Обновить'}</button>
           </div>
         </div>
@@ -147,6 +205,7 @@ export default function AdminTasksPage() {
               {tasks.map(task => {
                 const expanded = expandedTaskId === task.id
                 const pct = Number.isFinite(task.progress) ? Math.min(100, Math.max(0, Math.round(task.progress * 100))) : 0
+                const isFinal = FINAL_STATUSES.has(task.status)
                 return (
                   <React.Fragment key={task.id}>
                     <tr>
@@ -173,9 +232,16 @@ export default function AdminTasksPage() {
                           <button
                             className="btn btn-outline-danger"
                             onClick={() => cancel(task)}
-                            disabled={task.status === 'completed' || task.status === 'error' || task.status === 'cancelled'}
+                            disabled={isFinal || deletingTaskId === task.id}
                           >
                             Остановить
+                          </button>
+                          <button
+                            className="btn btn-danger"
+                            onClick={() => remove(task)}
+                            disabled={!isFinal || deletingTaskId === task.id}
+                          >
+                            {deletingTaskId === task.id ? 'Удаление…' : 'Удалить'}
                           </button>
                         </div>
                       </td>

@@ -14,6 +14,13 @@ type ActionLog = {
   created_at?: string | null
 }
 
+type SystemLogFile = {
+  name: string
+  size?: number
+  modified_at?: string
+  rotated?: boolean
+}
+
 export default function AdminLogsPage() {
   const { user } = useAuth()
   const toasts = useToasts()
@@ -24,6 +31,13 @@ export default function AdminLogsPage() {
   const [actionFilter, setActionFilter] = useState('')
   const [deleteBefore, setDeleteBefore] = useState('')
   const [deleting, setDeleting] = useState(false)
+  const [systemLogFiles, setSystemLogFiles] = useState<SystemLogFile[]>([])
+  const [systemLogName, setSystemLogName] = useState('agregator.log')
+  const [systemLogLimit, setSystemLogLimit] = useState(200)
+  const [systemLogLines, setSystemLogLines] = useState<string[]>([])
+  const [systemLogFile, setSystemLogFile] = useState<SystemLogFile | null>(null)
+  const [systemLogLoading, setSystemLogLoading] = useState(false)
+  const [systemLogAction, setSystemLogAction] = useState<'clear' | 'rotate' | null>(null)
 
   const load = useCallback(async () => {
     if (!isAdmin) return
@@ -74,6 +88,128 @@ export default function AdminLogsPage() {
   }, [deleteBefore, isAdmin, load, toasts])
 
   useEffect(() => { load() }, [load])
+
+  const loadSystemLog = useCallback(async (name: string, limit: number) => {
+    if (!isAdmin) return
+    setSystemLogLoading(true)
+    try {
+      const params = new URLSearchParams()
+      if (name) params.set('name', name)
+      params.set('limit', String(limit))
+      const r = await fetch(`/api/admin/system-logs?${params.toString()}`)
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        const files = (Array.isArray(data.available) ? data.available : []) as SystemLogFile[]
+        setSystemLogFiles(files)
+        if (typeof data.limit === 'number' && data.limit !== limit) {
+          setSystemLogLimit(data.limit)
+        }
+        let resolvedName = typeof data?.file?.name === 'string' && data.file.name ? data.file.name : name
+        if (!files.some(f => f.name === resolvedName) && files.length) {
+          resolvedName = files[0].name
+        }
+        if (resolvedName !== name) {
+          setSystemLogName(resolvedName)
+        }
+        const selectedMeta = data?.file ? data.file as SystemLogFile : files.find(f => f.name === resolvedName) || null
+        setSystemLogFile(selectedMeta)
+        setSystemLogLines(Array.isArray(data.lines) ? data.lines : [])
+      } else {
+        toasts.push(data?.error || 'Не удалось получить системный лог', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка соединения при чтении системного лога', 'error')
+    } finally {
+      setSystemLogLoading(false)
+    }
+  }, [isAdmin, toasts])
+
+  useEffect(() => {
+    if (!isAdmin) return
+    loadSystemLog(systemLogName, systemLogLimit)
+  }, [isAdmin, loadSystemLog, systemLogLimit, systemLogName])
+
+  const refreshSystemLog = useCallback(() => {
+    loadSystemLog(systemLogName, systemLogLimit)
+  }, [loadSystemLog, systemLogLimit, systemLogName])
+
+  const clearSystemLog = useCallback(async () => {
+    if (!isAdmin) return
+    if (!confirm('Очистить текущий лог-файл? Записи будут удалены.')) return
+    setSystemLogAction('clear')
+    try {
+      const r = await fetch(`/api/admin/system-logs?name=${encodeURIComponent(systemLogName)}`, { method: 'DELETE' })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        const files = Array.isArray(data.files) ? data.files : []
+        setSystemLogFiles(files as SystemLogFile[])
+        setSystemLogLines([])
+        toasts.push('Лог очищен', 'success')
+      } else {
+        toasts.push(data?.error || 'Не удалось очистить лог', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка соединения при очистке лога', 'error')
+    } finally {
+      setSystemLogAction(null)
+      loadSystemLog(systemLogName, systemLogLimit)
+    }
+  }, [isAdmin, loadSystemLog, systemLogLimit, systemLogName, toasts])
+
+  const rotateSystemLog = useCallback(async () => {
+    if (!isAdmin) return
+    setSystemLogAction('rotate')
+    try {
+      const r = await fetch('/api/admin/system-logs/rotate', { method: 'POST' })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        const files = Array.isArray(data.files) ? data.files : []
+        setSystemLogFiles(files as SystemLogFile[])
+        toasts.push('Создан новый лог-файл', 'success')
+        loadSystemLog(systemLogName, systemLogLimit)
+      } else {
+        toasts.push(data?.error || 'Не удалось выполнить ротацию', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка соединения при ротации логов', 'error')
+    } finally {
+      setSystemLogAction(null)
+    }
+  }, [isAdmin, loadSystemLog, systemLogLimit, systemLogName, toasts])
+
+  const downloadSystemLog = useCallback(() => {
+    const url = `/api/admin/system-logs/download?name=${encodeURIComponent(systemLogName)}`
+    window.open(url, '_blank')
+  }, [systemLogName])
+
+  const formatBytes = useCallback((value?: number) => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+    if (value < 1024) return `${value} Б`
+    const kb = value / 1024
+    if (kb < 1024) return `${kb.toFixed(1)} КБ`
+    const mb = kb / 1024
+    if (mb < 1024) return `${mb.toFixed(1)} МБ`
+    const gb = mb / 1024
+    return `${gb.toFixed(2)} ГБ`
+  }, [])
+
+  const formatLogTime = useCallback((value?: string | null) => {
+    if (!value) return '—'
+    try {
+      return new Date(value).toLocaleString()
+    } catch {
+      return value
+    }
+  }, [])
+
+  const systemLogOptions = systemLogFiles.length ? systemLogFiles : [{ name: systemLogName }]
+
+  useEffect(() => {
+    const match = systemLogFiles.find(f => f.name === systemLogName)
+    if (match) {
+      setSystemLogFile(match)
+    }
+  }, [systemLogFiles, systemLogName])
 
   const flattenDetail = useCallback((value: any, prefix = '', acc: string[] = []) => {
     if (value === null || value === undefined) {
@@ -151,13 +287,71 @@ export default function AdminLogsPage() {
   if (!isAdmin) return <div className="card p-3">Недостаточно прав.</div>
 
   return (
-    <div className="card p-3">
-      <div className="d-flex flex-wrap gap-2 align-items-end mb-3">
-        <div className="flex-grow-1" style={{ maxWidth: 200 }}>
-          <label className="form-label">Пользователь ID</label>
-          <input className="form-control form-control-sm" value={userFilter} onChange={e=>setUserFilter(e.target.value)} placeholder="пример: 2" />
+    <div className="d-grid gap-3">
+      <div className="card p-3">
+        <div className="d-flex flex-wrap align-items-center gap-2 mb-3">
+          <div className="fw-semibold fs-5 me-auto">Системный лог</div>
+          <button className="btn btn-outline-secondary btn-sm" onClick={refreshSystemLog} disabled={systemLogLoading}>{systemLogLoading ? 'Загрузка…' : 'Обновить'}</button>
+          <button className="btn btn-outline-secondary btn-sm" onClick={rotateSystemLog} disabled={systemLogAction === 'rotate' || systemLogLoading}>
+            {systemLogAction === 'rotate' ? 'Ротация…' : 'Ротация'}
+          </button>
+          <button className="btn btn-outline-danger btn-sm" onClick={clearSystemLog} disabled={systemLogAction === 'clear' || systemLogLoading}>
+            {systemLogAction === 'clear' ? 'Очистка…' : 'Очистить'}
+          </button>
+          <button className="btn btn-outline-primary btn-sm" onClick={downloadSystemLog} disabled={systemLogLoading || !systemLogFile}>
+            Скачать
+          </button>
         </div>
-        <div className="flex-grow-1" style={{ maxWidth: 220 }}>
+        <div className="row g-3 align-items-end mb-3">
+          <div className="col-md-5">
+            <label className="form-label">Файл</label>
+            <select
+              className="form-select form-select-sm"
+              value={systemLogName}
+              onChange={e => setSystemLogName(e.target.value)}
+            >
+              {systemLogOptions.map(file => {
+                const label = file.rotated ? `${file.name} (архив)` : file.name
+                return <option key={file.name} value={file.name}>{label}</option>
+              })}
+            </select>
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Строк</label>
+            <select
+              className="form-select form-select-sm"
+              value={systemLogLimit}
+              onChange={e => setSystemLogLimit(Number(e.target.value) || 200)}
+            >
+              {[100, 200, 500, 1000].map(option => (
+                <option key={option} value={option}>{option}</option>
+              ))}
+            </select>
+          </div>
+          <div className="col-md-5">
+            <div className="form-text">
+              Размер: {formatBytes(systemLogFile?.size)} · Обновлено: {formatLogTime(systemLogFile?.modified_at)}
+            </div>
+          </div>
+        </div>
+        <div className="border rounded bg-body-secondary" style={{ maxHeight: 320, overflow: 'auto' }}>
+          {systemLogLoading ? (
+            <div className="text-center text-muted py-4" style={{ fontSize: 13 }}>Загрузка…</div>
+          ) : systemLogLines.length ? (
+            <pre className="m-0 p-2" style={{ fontSize: 12, whiteSpace: 'pre-wrap' }}>{systemLogLines.join('\n')}</pre>
+          ) : (
+            <div className="text-center text-muted py-4" style={{ fontSize: 13 }}>Лог пуст</div>
+          )}
+        </div>
+      </div>
+
+      <div className="card p-3">
+        <div className="d-flex flex-wrap gap-2 align-items-end mb-3">
+          <div className="flex-grow-1" style={{ maxWidth: 200 }}>
+            <label className="form-label">Пользователь ID</label>
+            <input className="form-control form-control-sm" value={userFilter} onChange={e=>setUserFilter(e.target.value)} placeholder="пример: 2" />
+          </div>
+          <div className="flex-grow-1" style={{ maxWidth: 220 }}>
           <label className="form-label">Действие</label>
           <input className="form-control form-control-sm" value={actionFilter} onChange={e=>setActionFilter(e.target.value)} placeholder="например user_update" />
         </div>
@@ -219,6 +413,7 @@ export default function AdminLogsPage() {
           </tbody>
         </table>
       </div>
+    </div>
     </div>
   )
 }
