@@ -48,6 +48,7 @@ type Settings = {
   pdf_ocr_pages: number
   ocr_first_page_dissertation?: boolean
   prompts?: Record<string, string>
+  prompt_defaults?: Record<string, string>
   ai_rerank_llm?: boolean
   collections?: Collection[]
   llm_endpoints?: LlmEndpointInfo[]
@@ -58,17 +59,29 @@ type Settings = {
   type_dirs?: Record<string, string>
 }
 
-const defaultPrompts: Record<string, string> = {
+const fallbackPromptDefaults: Record<string, string> = {
   metadata_system: '',
   summarize_audio_system: '',
   keywords_system: '',
+  ai_search_keywords_system: '',
   vision_system: '',
 }
+
+const promptLabels: Record<string, string> = {
+  metadata_system: 'Промпт metadata_system',
+  summarize_audio_system: 'Промпт summarize_audio_system',
+  keywords_system: 'Промпт keywords_system',
+  ai_search_keywords_system: 'Промпт ai_search_keywords_system',
+  vision_system: 'Промпт vision_system',
+}
+
+const promptOrder = ['metadata_system', 'summarize_audio_system', 'keywords_system', 'ai_search_keywords_system', 'vision_system']
 
 const boolVal = (value: any, fallback: boolean) => (value === undefined ? fallback : !!value)
 
 const normalizeSettings = (raw: any): Settings => {
-  const prompts = { ...defaultPrompts, ...(raw?.prompts || {}) }
+  const promptDefaults = { ...fallbackPromptDefaults, ...(raw?.prompt_defaults || {}) }
+  const prompts = { ...promptDefaults, ...(raw?.prompts || {}) }
   const collectionsInDirs = boolVal(raw?.collections_in_dirs, false)
   const collections = Array.isArray(raw?.collections)
     ? raw.collections.map((col: any) => ({
@@ -106,6 +119,7 @@ const normalizeSettings = (raw: any): Settings => {
     pdf_ocr_pages: Number.isFinite(raw?.pdf_ocr_pages) ? Number(raw.pdf_ocr_pages) : 5,
     ocr_first_page_dissertation: boolVal(raw?.ocr_first_page_dissertation, true),
     prompts,
+    prompt_defaults: promptDefaults,
     ai_rerank_llm: boolVal(raw?.ai_rerank_llm, false),
     collections,
     llm_endpoints: Array.isArray(raw?.llm_endpoints) ? raw.llm_endpoints : [],
@@ -185,6 +199,29 @@ export default function SettingsPage() {
     llmPurposes.forEach(p => map.set(p.id, p.label))
     return map
   }, [llmPurposes])
+  const promptDefaults = useMemo(() => ({ ...fallbackPromptDefaults, ...(s?.prompt_defaults || {}) }), [s?.prompt_defaults])
+  const promptKeys = useMemo(() => {
+    const known = new Set(promptOrder)
+    const extras = [...new Set([...Object.keys(promptDefaults), ...Object.keys(s?.prompts || {})])]
+      .filter(key => !known.has(key))
+      .sort()
+    return [...promptOrder, ...extras]
+  }, [promptDefaults, s?.prompts])
+  const updatePrompt = useCallback((key: string, value: string) => {
+    setS(prev => {
+      if (!prev) return prev
+      return { ...prev, prompts: { ...(prev.prompts || {}), [key]: value } }
+    })
+  }, [])
+  const resetPrompt = useCallback((key: string) => {
+    const defaultValue = promptDefaults[key] ?? ''
+    setS(prev => {
+      if (!prev) return prev
+      const nextPrompts = { ...(prev.prompts || {}) }
+      nextPrompts[key] = defaultValue
+      return { ...prev, prompts: nextPrompts }
+    })
+  }, [promptDefaults])
   const transcribeBackendOptions = useMemo(() => {
     const options = ['faster-whisper']
     const current = (s?.transcribe_backend || '').trim()
@@ -330,9 +367,10 @@ export default function SettingsPage() {
     if (!s) return
     setSaving(true)
     try {
-      const { llm_endpoints, llm_purposes, aiword_users, ...rest } = s
+      const { llm_endpoints, llm_purposes, aiword_users, prompt_defaults: _promptDefaults, ...rest } = s
+      void _promptDefaults
       const payload: any = { ...rest, aiword_users: (aiword_users || []).map(u => u.user_id) }
-      payload.prompts = { ...defaultPrompts, ...(payload.prompts || {}) }
+      payload.prompts = { ...promptDefaults, ...(payload.prompts || {}) }
       payload.collections_in_dirs = !!payload.collections_in_dirs
       payload.collection_type_subdirs = !!payload.collection_type_subdirs
       payload.default_use_llm = reindexUseLLM
@@ -832,22 +870,33 @@ export default function SettingsPage() {
         <details>
           <summary className="fw-semibold">Промпты LLM</summary>
           <div className="row g-2 mt-2">
-            <div className="col-md-6">
-              <label className="form-label">Промпт metadata_system</label>
-              <textarea className="form-control" rows={4} value={s.prompts?.metadata_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, metadata_system: e.target.value } })} />
-            </div>
-            <div className="col-md-6">
-              <label className="form-label">Промпт summarize_audio_system</label>
-              <textarea className="form-control" rows={4} value={s.prompts?.summarize_audio_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, summarize_audio_system: e.target.value } })} />
-            </div>
-            <div className="col-md-6">
-              <label className="form-label">Промпт keywords_system</label>
-              <textarea className="form-control" rows={4} value={s.prompts?.keywords_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, keywords_system: e.target.value } })} />
-            </div>
-            <div className="col-md-6">
-              <label className="form-label">Промпт vision_system</label>
-              <textarea className="form-control" rows={4} value={s.prompts?.vision_system || ''} onChange={e => setS({ ...s, prompts: { ...s.prompts, vision_system: e.target.value } })} />
-            </div>
+            {promptKeys.map(key => {
+              const label = promptLabels[key] || `Промпт ${key}`
+              const current = s.prompts?.[key] ?? ''
+              const defaultValue = promptDefaults[key] ?? ''
+              const isDefault = current === defaultValue
+              return (
+                <div className="col-md-6" key={key}>
+                  <label className="form-label d-flex flex-wrap align-items-center justify-content-between gap-2">
+                    <span>{label}</span>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-outline-secondary"
+                      onClick={() => resetPrompt(key)}
+                      disabled={isDefault}
+                    >
+                      По умолчанию
+                    </button>
+                  </label>
+                  <textarea
+                    className="form-control"
+                    rows={4}
+                    value={current}
+                    onChange={e => updatePrompt(key, e.target.value)}
+                  />
+                </div>
+              )
+            })}
           </div>
         </details>
       </div>

@@ -423,7 +423,7 @@ TYPE_DIRS = {
 }
 
 # Промпты LLM (можно переопределить в настройках)
-PROMPTS = {
+DEFAULT_PROMPTS = {
     'metadata_system': (
         "Ты помощник по каталогизации научных материалов. "
         "Твоя задача: определить тип материала из набора: dissertation, dissertation_abstract, article, textbook, "
@@ -440,11 +440,18 @@ PROMPTS = {
         "Ты извлекаешь ключевые слова из стенограммы аудио. Верни только JSON-массив строк на русском: "
         "[\"ключ1\", \"ключ2\", ...]. Без пояснений, не более 12 слов/фраз."
     ),
+    'ai_search_keywords_system': (
+        "Ты помощник ИИ-поиска. По заданному запросу подбери 3-8 релевантных тегов (фраз) на русском "
+        "или английском. Теги должны отражать суть запроса, быть краткими (1-3 слова) и без служебных слов. "
+        "Если в запросе есть выражения в кавычках, включи их без изменений (без кавычек). Верни строго JSON-массив строк."
+    ),
     'vision_system': (
         "Ты помощник по анализу изображений. Опиши изображение 2–4 предложениями на русском и верни 5–12 ключевых слов. "
         "Верни строго JSON: {\"description\":\"...\",\"keywords\":[\"...\"]}."
-    )
+    ),
 }
+
+PROMPTS = dict(DEFAULT_PROMPTS)
 SUMMARIZE_AUDIO = getenv_bool("SUMMARIZE_AUDIO", False)
 # Упрощённое извлечение ключевых слов из аудиостенограмм через LLM (лёгкий промпт)
 AUDIO_KEYWORDS_LLM = getenv_bool("AUDIO_KEYWORDS_LLM", True)
@@ -2711,10 +2718,7 @@ def call_lmstudio_summarize(text: str, filename: str) -> str:
     text = (text or "")[: int(os.getenv("SUMMARY_TEXT_LIMIT", "12000"))]
     if not text:
         return ""
-    system = PROMPTS.get('summarize_audio_system') or (
-        "Ты помощник. Суммаризируй стенограмму аудио в 3–6 предложениях на русском, "
-        "выделив тему, основные тезисы и вывод."
-    )
+    system = PROMPTS.get('summarize_audio_system') or DEFAULT_PROMPTS.get('summarize_audio_system', '')
     user = f"Файл: {filename}\nСтенограмма:\n{text}"
     last_error: Exception | None = None
     for choice in _llm_iter_choices('summary'):
@@ -2787,16 +2791,22 @@ def call_lmstudio_compose(system: str, user: str, *, temperature: float = 0.2, m
         app.logger.warning(f"LM Studio compose failed: {last_error}")
     return ""
 def call_lmstudio_keywords(text: str, filename: str):
-    """Извлечь короткий список ключевых слов из стенограммы через LM Studio."""
+    """Извлечь короткий список ключевых слов из текста или поискового запроса через LM Studio."""
     text = (text or "").strip()
     if not text:
         return []
     text = text[:int(os.getenv("KWS_TEXT_LIMIT", "8000"))]
-    system = PROMPTS.get('keywords_system') or (
-        "Ты извлекаешь ключевые слова из стенограммы аудио. Верни только JSON-массив строк на русском: "
-        "[\"ключ1\", \"ключ2\", ...]. Без пояснений, не более 12 слов/фраз."
-    )
-    user = f"Файл: {filename}\nСтенограмма:\n{text}"
+    is_query = str(filename or '').strip().lower() == 'ai-search'
+    if is_query:
+        system = PROMPTS.get('ai_search_keywords_system') or DEFAULT_PROMPTS.get('ai_search_keywords_system', '')
+        user = (
+            "Поисковый запрос пользователя:\n"
+            f"{text}\n\n"
+            "Верни JSON-массив вида [\"тег1\", \"тег2\", ...] без пояснений."
+        )
+    else:
+        system = PROMPTS.get('keywords_system') or DEFAULT_PROMPTS.get('keywords_system', '')
+        user = f"Файл: {filename}\nСтенограмма:\n{text}"
     last_error: Exception | None = None
     for choice in _llm_iter_choices('keywords'):
         label = _llm_choice_label(choice)
@@ -2873,10 +2883,7 @@ def call_lmstudio_vision(image_path: Path, filename: str):
         return {}
     data_url = f"data:{mime};base64," + base64.b64encode(raw).decode('ascii')
 
-    system = PROMPTS.get('vision_system') or (
-        "Ты помощник по анализу изображений. Опиши изображение 2–4 предложениями на русском и верни 5–12 ключевых слов. "
-        "Верни строго JSON: {\\\"description\\\":\\\"...\\\", \\\"keywords\\\":[\\\"...\\\"]}."
-    )
+    system = PROMPTS.get('vision_system') or DEFAULT_PROMPTS.get('vision_system', '')
     user_content = [
         {"type": "text", "text": f"Файл: {filename}. Опиши и укажи ключевые слова."},
         {"type": "image_url", "image_url": {"url": data_url}},
@@ -2969,12 +2976,7 @@ def call_lmstudio_for_metadata(text: str, filename: str):
     """
     text = (text or "")[: int(os.getenv("LLM_TEXT_LIMIT", "15000"))]
 
-    system = PROMPTS.get('metadata_system') or (
-        "Ты помощник по каталогизации научных материалов. "
-        "Верни ТОЛЬКО валидный JSON без пояснений. "
-        "Ключи: material_type, title, author, year, advisor, keywords (array), "
-        "novelty (string), literature (array), organizations (array), classification (array)."
-    )
+    system = PROMPTS.get('metadata_system') or DEFAULT_PROMPTS.get('metadata_system', '')
     user = f"Файл: {filename}\nФрагмент текста:\n{text}"
 
     payload_template = {
@@ -3901,7 +3903,8 @@ def api_settings():
             'type_dirs': TYPE_DIRS,
             'ocr_langs': OCR_LANGS_CFG,
             'pdf_ocr_pages': int(PDF_OCR_PAGES_CFG),
-            'prompts': PROMPTS,
+        'prompts': PROMPTS,
+        'prompt_defaults': dict(DEFAULT_PROMPTS),
             'ai_rerank_llm': bool(AI_RERANK_LLM),
             'ocr_first_page_dissertation': bool(ALWAYS_OCR_FIRST_PAGE_DISSERTATION),
             'collections': collections,
@@ -6299,10 +6302,45 @@ def scan_cancel():
 
 # ------------------- AI Search (MVP) -------------------
 
+def _normalize_keyword_candidate(raw: str) -> str:
+    """Очистить строку, предназначенную для использования в качестве ключевого термина."""
+    if not raw:
+        return ""
+    cleaned = re.sub(r"\s+", " ", str(raw)).strip()
+    cleaned = cleaned.strip("\"'«»“”[](){}")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    if len(lowered) < 2:
+        return ""
+    return lowered
+
+
+def _extract_quoted_phrases(text: str) -> list[str]:
+    """Извлечь фразы в кавычках и нормализовать их для использования как термов поиска."""
+    if not text:
+        return []
+    pattern = r'"([^"\n]{2,})"|«([^»\n]{2,})»|“([^”\n]{2,})”|”([^“\n]{2,})“|ʼ([^ʼ\n]{2,})ʼ|\'([^\'\n]{2,})\''
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(pattern, str(text)):
+        candidate = next((grp for grp in match.groups() if grp), "")
+        normalized = _normalize_keyword_candidate(candidate)
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        phrases.append(normalized)
+    return phrases
+
+
 def _ai_expand_keywords(query: str) -> list[str]:
     q = (query or "").strip()
     if not q:
         return []
+    mandatory = _extract_quoted_phrases(q)
     # TTL в минутах; по умолчанию 20
     try:
         ttl_min = int(os.getenv("AI_EXPAND_TTL_MIN", "20") or 20)
@@ -6312,7 +6350,11 @@ def _ai_expand_keywords(query: str) -> list[str]:
     now = _now()
     cached = AI_EXPAND_CACHE.get(key)
     if cached and (now - cached[0]) < ttl_min * 60:
-        return cached[1]
+        cached_terms = list(cached[1])
+        for phrase in mandatory:
+            if phrase and phrase not in cached_terms:
+                cached_terms.insert(0, phrase)
+        return cached_terms
     # Запрашиваем ключевые слова у LLM; при сбое используем простые токены
     kws = []
     try:
@@ -6323,14 +6365,23 @@ def _ai_expand_keywords(query: str) -> list[str]:
         # запасной вариант: наивное разделение на токены
         toks = [t.strip() for t in re.split(r"[\s,;]+", q) if t.strip()]
         kws = toks[:12]
-    # удаляем дубликаты, сохраняя порядок
+    # удаляем дубликаты, сохраняя порядок и приводя к нормализованному виду
     seen = set()
-    res = []
+    res: list[str] = []
     for w in kws:
-        lw = w.lower()
-        if lw not in seen:
-            seen.add(lw)
-            res.append(w)
+        normalized = _normalize_keyword_candidate(w)
+        if not normalized:
+            continue
+        if normalized in STOP_WORDS:
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            res.append(normalized)
+    # добавляем обязательные фразы из кавычек в начало
+    for phrase in reversed(mandatory):
+        if phrase and phrase not in seen:
+            res.insert(0, phrase)
+            seen.add(phrase)
     AI_EXPAND_CACHE[key] = (now, res)
     return res
 
@@ -6752,6 +6803,8 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     max_snippets = max(1, min(max_snippets, 10))
     progress = _ProgressLogger(progress_cb)
     query_hash = _query_fingerprint(query, data)
+    mandatory_terms = _extract_quoted_phrases(query)
+    mandatory_set = set(mandatory_terms)
     progress.add(f"Запрос: {query}")
     progress.add(f"Отпечаток запроса: {query_hash[:12]}…")
     if top_k != original_top_k:
@@ -6759,6 +6812,13 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     else:
         progress.add(f"Top K = {top_k}")
     progress.add("Режим: " + ("глубокий" if deep_search else "быстрый"))
+    if mandatory_terms:
+        preview = ', '.join(f'«{term}»' for term in mandatory_terms[:4])
+        if len(mandatory_terms) > 4:
+            preview += '…'
+        progress.add(f"Обязательные фразы: {preview}")
+    else:
+        progress.add("Обязательные фразы: нет")
     sources = data.get('sources') or {}
     use_tags = sources.get('tags', True) if isinstance(sources, dict) else True
     use_text = sources.get('text', True) if isinstance(sources, dict) else True
@@ -6798,16 +6858,25 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     # Расширяем и токенизируем
     keywords = _ai_expand_keywords(query)
     base_tokens = _tokenize_query(query)
-    extra_tokens = []
+    extra_tokens: list[str] = []
+    ai_phrase_terms: list[str] = []
     for w in keywords:
+        normalized_kw = _normalize_keyword_candidate(w)
+        if normalized_kw:
+            if ' ' in normalized_kw and normalized_kw not in mandatory_set:
+                ai_phrase_terms.append(normalized_kw)
         extra_tokens.extend(_tokenize_query(w))
-    # уникальные термины (токены) с сохранением порядка, отдаём приоритет base_tokens
+    # уникальные термины (токены) с сохранением порядка, отдаём приоритет обязательным и LLM-фразам
     seen = set()
     terms: list[str] = []
-    for w in base_tokens + extra_tokens:
-        if w and w not in seen:
-            seen.add(w)
-            terms.append(w)
+    ordered_candidates = mandatory_terms + ai_phrase_terms + base_tokens + extra_tokens
+    for w in ordered_candidates:
+        if not w:
+            continue
+        if w in seen:
+            continue
+        seen.add(w)
+        terms.append(w)
     original_terms = list(terms)
     filtered_out_terms: list[str] = []
     if not terms and query:
@@ -6823,21 +6892,29 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
 
     # Предварительно считаем IDF по каждому термину
     idf = _idf_for_terms(terms)
-    filtered_terms = [w for w in terms if idf.get(w, 1.0) >= KEYWORD_IDF_MIN]
-    if filtered_terms:
-        if len(filtered_terms) < len(terms):
-            removed = [w for w in terms if w not in filtered_terms]
-            filtered_out_terms.extend(removed)
-            progress.add(f"Фильтр ключевых слов: убрано {len(removed)} общеупотребительных терминов")
-        terms = filtered_terms
-    elif terms:
-        fallback_terms = [w for w in terms if len(w) >= 4]
+    filtered_terms: list[str] = []
+    removed_low_idf: list[str] = []
+    for w in terms:
+        if w in mandatory_set:
+            filtered_terms.append(w)
+            continue
+        if idf.get(w, 1.0) >= KEYWORD_IDF_MIN:
+            filtered_terms.append(w)
+        else:
+            removed_low_idf.append(w)
+    if removed_low_idf:
+        filtered_out_terms.extend([w for w in removed_low_idf if w not in filtered_out_terms])
+        progress.add(f"Фильтр ключевых слов: убрано {len(removed_low_idf)} общеупотребительных терминов")
+    if not filtered_terms:
+        fallback_terms = [w for w in terms if (w in mandatory_set) or len(w) >= 4]
         if fallback_terms:
             removed = [w for w in terms if w not in fallback_terms]
             if removed:
-                filtered_out_terms.extend(removed)
+                filtered_out_terms.extend([w for w in removed if w not in filtered_out_terms])
             progress.add("Фильтр ключевых слов: оставляем только более длинные термины")
-            terms = fallback_terms
+            filtered_terms = fallback_terms
+    if filtered_terms:
+        terms = filtered_terms
     try:
         feedback_rows = AiSearchKeywordFeedback.query.filter_by(query_hash=query_hash).all()
     except Exception:
@@ -6847,8 +6924,14 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         banned_terms = {str(row.keyword).lower() for row in feedback_rows if getattr(row, 'keyword', None) and row.action == 'irrelevant'}
         if banned_terms:
             before_len = len(terms)
-            terms = [w for w in terms if w not in banned_terms]
-            removed = [w for w in original_terms if w in banned_terms]
+            kept_terms: list[str] = []
+            removed: list[str] = []
+            for w in terms:
+                if w in banned_terms and w not in mandatory_set:
+                    removed.append(w)
+                else:
+                    kept_terms.append(w)
+            terms = kept_terms
             if removed:
                 filtered_out_terms.extend([w for w in removed if w not in filtered_out_terms])
             if len(terms) < before_len:
@@ -6938,6 +7021,26 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         progress.add(f"Метаданные: найдено кандидатов {len(scores)}")
     else:
         progress.add("Метаданные: пропущено (источник отключён)")
+    if mandatory_set and scores:
+        kept_scores: dict[int, float] = {}
+        kept_hits: dict[int, list[dict]] = {}
+        kept_term_hits: dict[int, set[str]] = {}
+        dropped = 0
+        for fid, score_val in scores.items():
+            matched = term_hits.get(fid, set())
+            if mandatory_set.issubset(matched):
+                kept_scores[fid] = score_val
+                if fid in hits:
+                    kept_hits[fid] = hits[fid]
+                if matched:
+                    kept_term_hits[fid] = matched
+            else:
+                dropped += 1
+        if dropped:
+            progress.add(f"Обязательные фразы: исключено {dropped} кандидатов без совпадений")
+        scores = kept_scores
+        hits = kept_hits
+        term_hits = kept_term_hits
     durations['candidates'] = time.monotonic() - stage_start
     stage_start = time.monotonic()
 
@@ -7246,6 +7349,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         'answer_preview': (answer or '')[:400],
         'keyword_count': len(terms),
         'filtered_keywords': filtered_keywords,
+        'mandatory_terms': mandatory_terms,
     }
     _record_search_metric(query_hash, durations, user, extra_meta)
 
@@ -7254,6 +7358,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         "query_hash": query_hash,
         "keywords": terms,
         "filtered_keywords": filtered_keywords,
+        "mandatory_terms": mandatory_terms,
         "answer": answer,
         "items": results,
         "progress": progress.lines,
