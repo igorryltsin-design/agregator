@@ -150,6 +150,7 @@ LLM_ROUND_ROBIN: dict[str, itertools.cycle] = {}
 LLM_ENDPOINT_SIGNATURE: dict[str, tuple[tuple[int, float, tuple[str, ...]], ...]] = {}
 LLM_ENDPOINT_POOLS: dict[str, list[dict[str, str]]] = {}
 LLM_ENDPOINT_UNIQUE: dict[str, list[dict[str, str]]] = {}
+LLM_SCHEMA_READY = False
 LLM_BUSY_HTTP_CODES = {409, 423, 429, 503}
 LLM_BUSY_STATUS_VALUES = {'busy', 'processing', 'in_progress', 'queued', 'pending', 'rate_limited'}
 LLM_PURPOSES = [
@@ -160,6 +161,10 @@ LLM_PURPOSES = [
     {'id': 'vision', 'label': 'Анализ изображений'},
     {'id': 'rerank', 'label': 'Реранжирование поиска'},
     {'id': 'default', 'label': 'По умолчанию'},
+]
+LLM_PROVIDER_OPTIONS = [
+    {'id': 'openai', 'label': 'OpenAI-совместимый (LM Studio, OpenAI, Azure)'},
+    {'id': 'ollama', 'label': 'Ollama'},
 ]
 TASK_RETENTION_WINDOW = timedelta(days=1)
 TASK_FINAL_STATUSES = ('completed', 'error', 'cancelled')
@@ -373,6 +378,10 @@ LMSTUDIO_API_BASE = os.getenv("LMSTUDIO_API_BASE", "http://localhost:1234/v1")
 # Модель LLM по умолчанию
 LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "google/gemma-3n-e4b")
 LMSTUDIO_API_KEY = os.getenv("LMSTUDIO_API_KEY", "")
+LLM_PROVIDER_CHOICES = {'openai', 'ollama'}
+LM_DEFAULT_PROVIDER = (os.getenv("LM_PROVIDER") or "openai").strip().lower()
+if LM_DEFAULT_PROVIDER not in LLM_PROVIDER_CHOICES:
+    LM_DEFAULT_PROVIDER = 'openai'
 TRANSCRIBE_ENABLED = getenv_bool("TRANSCRIBE_ENABLED", True)
 TRANSCRIBE_BACKEND = os.getenv("TRANSCRIBE_BACKEND", "faster-whisper")
 TRANSCRIBE_MODEL_PATH = os.getenv("TRANSCRIBE_MODEL_PATH", os.getenv('FASTER_WHISPER_DEFAULT_MODEL', 'small'))
@@ -471,6 +480,7 @@ def _runtime_settings_snapshot() -> dict:
         'LMSTUDIO_API_BASE': LMSTUDIO_API_BASE,
         'LMSTUDIO_MODEL': LMSTUDIO_MODEL,
         'LMSTUDIO_API_KEY': LMSTUDIO_API_KEY,
+        'LM_DEFAULT_PROVIDER': LM_DEFAULT_PROVIDER,
         'TRANSCRIBE_ENABLED': bool(TRANSCRIBE_ENABLED),
         'TRANSCRIBE_BACKEND': TRANSCRIBE_BACKEND,
         'TRANSCRIBE_MODEL_PATH': TRANSCRIBE_MODEL_PATH,
@@ -514,7 +524,7 @@ def _load_runtime_settings_from_disk() -> None:
     except Exception as exc:
         logger.warning("Не удалось прочитать настройки: %s", exc)
         return
-    global SCAN_ROOT, EXTRACT_TEXT, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY
+    global SCAN_ROOT, EXTRACT_TEXT, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY, LM_DEFAULT_PROVIDER
     global TRANSCRIBE_ENABLED, TRANSCRIBE_BACKEND, TRANSCRIBE_MODEL_PATH, TRANSCRIBE_LANGUAGE
     global SUMMARIZE_AUDIO, AUDIO_KEYWORDS_LLM, IMAGES_VISION_ENABLED, KEYWORDS_TO_TAGS_ENABLED
     global TYPE_DETECT_FLOW, TYPE_LLM_OVERRIDE, IMPORT_SUBDIR, MOVE_ON_RENAME
@@ -536,6 +546,10 @@ def _load_runtime_settings_from_disk() -> None:
         LMSTUDIO_MODEL = str(data['LMSTUDIO_MODEL'] or LMSTUDIO_MODEL)
     if 'LMSTUDIO_API_KEY' in data:
         LMSTUDIO_API_KEY = str(data['LMSTUDIO_API_KEY'] or '')
+    if 'LM_DEFAULT_PROVIDER' in data:
+        candidate = str(data['LM_DEFAULT_PROVIDER'] or '').strip().lower()
+        if candidate in LLM_PROVIDER_CHOICES:
+            LM_DEFAULT_PROVIDER = candidate
     if 'TRANSCRIBE_ENABLED' in data:
         TRANSCRIBE_ENABLED = bool(data['TRANSCRIBE_ENABLED'])
     if 'TRANSCRIBE_BACKEND' in data:
@@ -1352,6 +1366,7 @@ def _invalidate_llm_cache() -> None:
 
 def _ensure_llm_pool(purpose: str | None) -> None:
     desired = (purpose or 'default').lower()
+    _ensure_llm_schema_once()
     base_default = (LMSTUDIO_API_BASE or '').rstrip('/')
     model_default = LMSTUDIO_MODEL
     key_default = LMSTUDIO_API_KEY
@@ -1368,7 +1383,7 @@ def _ensure_llm_pool(purpose: str | None) -> None:
                 if 'default' in purposes:
                     candidates.append((ep, purposes))
         if candidates:
-            sig = tuple(sorted((ep.id, float(ep.weight or 1.0), tuple(sorted(purposes))) for ep, purposes in candidates))
+            sig = tuple(sorted((ep.id, float(ep.weight or 1.0), (ep.provider or ''), tuple(sorted(purposes))) for ep, purposes in candidates))
             if LLM_ENDPOINT_SIGNATURE.get(desired) != sig:
                 pool: list[dict[str, str]] = []
                 unique: list[dict[str, str]] = []
@@ -1380,11 +1395,12 @@ def _ensure_llm_pool(purpose: str | None) -> None:
                         'base_url': (ep.base_url or base_default).rstrip('/'),
                         'model': ep.model or model_default,
                         'api_key': ep.api_key or key_default,
+                        'provider': (ep.provider or LM_DEFAULT_PROVIDER).strip().lower() or LM_DEFAULT_PROVIDER,
                     }
                     weight = max(1, int(round(float(ep.weight or 1.0))))
                     for _ in range(weight):
                         pool.append(entry)
-                    ident = (entry['id'], entry['base_url'], entry['model'], entry.get('api_key'))
+                    ident = (entry['id'], entry['base_url'], entry['model'], entry.get('api_key'), entry.get('provider'))
                     if ident not in seen:
                         seen.add(ident)
                         unique.append(entry)
@@ -1395,6 +1411,7 @@ def _ensure_llm_pool(purpose: str | None) -> None:
                         'base_url': base_default,
                         'model': model_default,
                         'api_key': key_default,
+                        'provider': LM_DEFAULT_PROVIDER,
                     }
                     pool = [default_entry]
                     unique = [default_entry]
@@ -1412,6 +1429,7 @@ def _ensure_llm_pool(purpose: str | None) -> None:
             'base_url': base_default,
             'model': model_default,
             'api_key': key_default,
+            'provider': LM_DEFAULT_PROVIDER,
         }
         LLM_ENDPOINT_POOLS[desired] = [default_entry]
         LLM_ENDPOINT_UNIQUE[desired] = [default_entry]
@@ -1447,6 +1465,7 @@ def _llm_iter_choices(purpose: str | None):
             'base_url': (LMSTUDIO_API_BASE or '').rstrip('/'),
             'model': LMSTUDIO_MODEL,
             'api_key': LMSTUDIO_API_KEY,
+            'provider': LM_DEFAULT_PROVIDER,
         }
         return
     rotation = LLM_ROUND_ROBIN.get(desired)
@@ -1458,7 +1477,7 @@ def _llm_iter_choices(purpose: str | None):
     seen: set[tuple] = set()
     for _ in range(max_iters):
         choice = next(rotation)
-        ident = (choice.get('id'), choice.get('base_url'), choice.get('model'), choice.get('api_key'))
+        ident = (choice.get('id'), choice.get('base_url'), choice.get('model'), choice.get('api_key'), choice.get('provider'))
         if ident in seen:
             continue
         seen.add(ident)
@@ -1480,6 +1499,13 @@ def _llm_choice_label(choice: dict) -> str:
     if not parts:
         parts.append(f'id={ident}')
     return ' | '.join(parts)
+
+
+def _llm_choice_provider(choice: dict) -> str:
+    provider = str(choice.get('provider') or '').strip().lower()
+    if provider not in LLM_PROVIDER_CHOICES:
+        provider = LM_DEFAULT_PROVIDER
+    return provider
 
 
 def _llm_response_indicates_busy(response) -> bool:
@@ -1518,7 +1544,16 @@ def _llm_choice_url(choice: dict) -> str:
     base = base.rstrip('/')
     if not base:
         return ''
-    return base if base.endswith('/chat/completions') else f"{base}/chat/completions"
+    provider = _llm_choice_provider(choice)
+    if provider == 'ollama':
+        if re.search(r"/api/(chat|generate)$", base):
+            return base
+        return f"{base}/api/chat"
+    if base.endswith('/chat/completions'):
+        return base
+    if base.endswith('/v1'):
+        return f"{base}/chat/completions"
+    return f"{base}/chat/completions"
 
 
 def _llm_choice_headers(choice: dict) -> dict:
@@ -1527,6 +1562,71 @@ def _llm_choice_headers(choice: dict) -> dict:
     if key:
         headers["Authorization"] = f"Bearer {key}"
     return headers
+
+
+def _llm_send_chat(choice: dict, messages: list[dict], *, temperature: float, max_tokens: int | None, top_p: float = 1.0, timeout: int = 120, extra_payload: dict | None = None):
+    provider = _llm_choice_provider(choice)
+    url = _llm_choice_url(choice)
+    if not url:
+        raise ValueError('empty_url')
+    model = choice.get('model') or LMSTUDIO_MODEL
+    if provider == 'ollama':
+        payload = {
+            'model': model,
+            'messages': messages,
+            'stream': False,
+            'options': {
+                'temperature': float(temperature),
+                'top_p': float(top_p),
+            },
+        }
+        if max_tokens is not None:
+            try:
+                payload['options']['num_predict'] = max(0, int(max_tokens))
+            except Exception:
+                pass
+        if extra_payload:
+            payload.update(extra_payload)
+    else:
+        payload = {
+            'model': model,
+            'messages': messages,
+            'temperature': float(temperature),
+            'top_p': float(top_p),
+        }
+        if max_tokens is not None:
+            try:
+                payload['max_tokens'] = max(0, int(max_tokens))
+            except Exception:
+                pass
+        if extra_payload:
+            payload.update(extra_payload)
+    response = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=timeout)
+    return provider, response
+
+
+def _llm_extract_content(provider: str, data) -> str:
+    if not isinstance(data, dict):
+        return ''
+    if provider == 'ollama':
+        message = data.get('message')
+        if isinstance(message, dict):
+            content = message.get('content')
+            if content:
+                return str(content)
+        for key in ('response', 'content', 'text'):
+            value = data.get(key)
+            if value:
+                return str(value)
+        return ''
+    choices = data.get('choices')
+    if isinstance(choices, list) and choices:
+        message = choices[0].get('message') if isinstance(choices[0], dict) else None
+        if isinstance(message, dict):
+            content = message.get('content')
+            if content:
+                return str(content)
+    return ''
 
 
 def _is_public_path(path: str) -> bool:
@@ -1778,6 +1878,32 @@ def ensure_collections_schema():
     except Exception:
         # по возможности продолжаем дальше
         pass
+
+
+def ensure_llm_schema():
+    """Добавить дополнительные поля, используемые LLM-эндпоинтами."""
+    try:
+        with app.app_context():
+            db.create_all()
+            try:
+                from sqlalchemy import text as _text
+                with db.engine.begin() as conn:
+                    rows = list(conn.execute(_text("PRAGMA table_info(llm_endpoints)")))
+                    cols = {r[1] for r in rows}
+                    if 'provider' not in cols:
+                        conn.execute(_text("ALTER TABLE llm_endpoints ADD COLUMN provider TEXT DEFAULT 'openai'"))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _ensure_llm_schema_once():
+    global LLM_SCHEMA_READY
+    if LLM_SCHEMA_READY:
+        return
+    ensure_llm_schema()
+    LLM_SCHEMA_READY = True
 
 # ------------------- Вспомогательные функции безопасности путей -------------------
 def _resolve_under_base(rel_path: str) -> tuple[Path, Path | None]:
@@ -2723,34 +2849,37 @@ def call_lmstudio_summarize(text: str, filename: str) -> str:
     last_error: Exception | None = None
     for choice in _llm_iter_choices('summary'):
         label = _llm_choice_label(choice)
-        url = _llm_choice_url(choice)
-        if not url:
-            app.logger.warning(f"Суммаризация не удалась ({label}): пустой URL конечной точки")
-            continue
-        payload = {
-            "model": choice.get('model') or LMSTUDIO_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 400,
-            "top_p": 1.0,
-        }
+        provider = _llm_choice_provider(choice)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
         try:
-            r = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=120)
-            if _llm_response_indicates_busy(r):
+            provider_name = provider  # preserve for logs
+            _provider, response = _llm_send_chat(
+                choice,
+                messages,
+                temperature=0.2,
+                max_tokens=400,
+                timeout=120,
+            )
+            if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM summary endpoint занята ({label}), переключаемся")
                 last_error = RuntimeError('busy')
                 continue
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response.raise_for_status()
+            data = response.json()
+            content = _llm_extract_content(_provider, data)
             if content:
                 return content
+        except ValueError as ve:
+            last_error = ve
+            app.logger.warning(f"Суммаризация не удалась ({label}): {ve}")
+            continue
         except Exception as e:
             last_error = e
-            app.logger.warning(f"Суммаризация не удалась ({label}): {e}")
+            app.logger.warning(f"Суммаризация не удалась ({label}, {provider_name}): {e}")
+            continue
     if last_error and str(last_error) != 'busy':
         app.logger.warning(f"Суммаризация не удалась: {last_error}")
     return ""
@@ -2759,36 +2888,38 @@ def call_lmstudio_compose(system: str, user: str, *, temperature: float = 0.2, m
     last_error: Exception | None = None
     for choice in _llm_iter_choices('compose'):
         label = _llm_choice_label(choice)
-        url = _llm_choice_url(choice)
-        if not url:
-            app.logger.warning(f"Compose LLM endpoint некорректен ({label}): пустой URL")
-            continue
-        payload = {
-            "model": choice.get('model') or LMSTUDIO_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": float(temperature),
-            "max_tokens": int(max_tokens),
-            "top_p": 1.0,
-        }
+        provider = _llm_choice_provider(choice)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
         try:
-            r = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=120)
-            if _llm_response_indicates_busy(r):
+            provider_name = provider
+            _provider, response = _llm_send_chat(
+                choice,
+                messages,
+                temperature=float(temperature),
+                max_tokens=int(max_tokens),
+                timeout=120,
+            )
+            if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM compose endpoint занята ({label}), переключаемся")
                 last_error = RuntimeError('busy')
                 continue
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response.raise_for_status()
+            data = response.json()
+            content = _llm_extract_content(_provider, data)
             if content:
                 return content
+        except ValueError as ve:
+            last_error = ve
+            app.logger.warning(f"Compose LLM endpoint некорректен ({label}): {ve}")
+            continue
         except Exception as e:
             last_error = e
-            app.logger.warning(f"LM Studio compose failed ({label}): {e}")
+            app.logger.warning(f"LM compose не удался ({label}, {provider_name}): {e}")
     if last_error and str(last_error) != 'busy':
-        app.logger.warning(f"LM Studio compose failed: {last_error}")
+        app.logger.warning(f"LLM compose failed: {last_error}")
     return ""
 def call_lmstudio_keywords(text: str, filename: str):
     """Извлечь короткий список ключевых слов из текста или поискового запроса через LM Studio."""
@@ -2810,29 +2941,27 @@ def call_lmstudio_keywords(text: str, filename: str):
     last_error: Exception | None = None
     for choice in _llm_iter_choices('keywords'):
         label = _llm_choice_label(choice)
-        url = _llm_choice_url(choice)
-        if not url:
-            app.logger.warning(f"LLM keywords endpoint некорректен ({label}): пустой URL")
-            continue
-        payload = {
-            "model": choice.get('model') or LMSTUDIO_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 200,
-            "top_p": 1.0,
-        }
+        provider = _llm_choice_provider(choice)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
         try:
-            r = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=90)
-            if _llm_response_indicates_busy(r):
+            provider_name = provider
+            _provider, response = _llm_send_chat(
+                choice,
+                messages,
+                temperature=0.0,
+                max_tokens=200,
+                timeout=90,
+            )
+            if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM keywords endpoint занята ({label}), переключаемся")
                 last_error = RuntimeError('busy')
                 continue
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response.raise_for_status()
+            data = response.json()
+            content = _llm_extract_content(_provider, data)
             try:
                 obj = json.loads(content)
                 if isinstance(obj, list):
@@ -2851,9 +2980,13 @@ def call_lmstudio_keywords(text: str, filename: str):
             res = [w.strip(" \t\r\n-•") for w in rough if w.strip()]
             if res:
                 return res[:12]
+        except ValueError as ve:
+            last_error = ve
+            app.logger.warning(f"LLM keywords endpoint некорректен ({label}): {ve}")
+            continue
         except Exception as e:
             last_error = e
-            app.logger.warning(f"Извлечение ключевых слов (LLM) не удалось ({label}): {e}")
+            app.logger.warning(f"Извлечение ключевых слов (LLM) не удалось ({label}, {provider_name}): {e}")
     if last_error and str(last_error) != 'busy':
         app.logger.warning(f"Извлечение ключевых слов (LLM) не удалось: {last_error}")
     return []
@@ -2907,29 +3040,29 @@ def call_lmstudio_vision(image_path: Path, filename: str):
     last_error: Exception | None = None
     for choice in _llm_iter_choices('vision'):
         label = _llm_choice_label(choice)
-        url = _llm_choice_url(choice)
-        if not url:
-            app.logger.warning(f"LLM vision endpoint некорректен ({label}): пустой URL")
+        provider = _llm_choice_provider(choice)
+        if provider != 'openai':
+            app.logger.info(f"LLM vision endpoint пропускается ({label}): провайдер {provider} не поддерживается")
             continue
-        payload = {
-            "model": choice.get('model') or LMSTUDIO_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 500,
-            "top_p": 1.0,
-        }
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
         try:
-            r = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=180)
-            if _llm_response_indicates_busy(r):
+            _provider, response = _llm_send_chat(
+                choice,
+                messages,
+                temperature=0.2,
+                max_tokens=500,
+                timeout=180,
+            )
+            if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM vision endpoint занята ({label}), переключаемся")
                 last_error = RuntimeError('busy')
                 continue
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response.raise_for_status()
+            data = response.json()
+            content = _llm_extract_content(_provider, data)
             try:
                 obj = json.loads(content)
                 if isinstance(obj, dict):
@@ -2962,6 +3095,10 @@ def call_lmstudio_vision(image_path: Path, filename: str):
                     pass
             kws_guess, cleaned = _extract_kws_from_text(content or '')
             return {"description": cleaned.strip()[:2000], "keywords": kws_guess}
+        except ValueError as ve:
+            last_error = ve
+            app.logger.warning(f"LLM vision endpoint некорректен ({label}): {ve}")
+            continue
         except Exception as e:
             last_error = e
             app.logger.warning(f"Визуальное распознавание не удалось ({label}): {e}")
@@ -2979,44 +3116,40 @@ def call_lmstudio_for_metadata(text: str, filename: str):
     system = PROMPTS.get('metadata_system') or DEFAULT_PROMPTS.get('metadata_system', '')
     user = f"Файл: {filename}\nФрагмент текста:\n{text}"
 
-    payload_template = {
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.0,
-        "max_tokens": 800,
-        "top_p": 1.0,
-    }
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
     last_error: Exception | None = None
     for choice in _llm_iter_choices('metadata'):
         label = _llm_choice_label(choice)
-        url = _llm_choice_url(choice)
-        if not url:
-            app.logger.warning(f"LLM metadata endpoint некорректен ({label}): пустой URL")
-            continue
-        payload = dict(payload_template)
-        payload["model"] = choice.get('model') or LMSTUDIO_MODEL
-        headers = _llm_choice_headers(choice)
+        provider = _llm_choice_provider(choice)
+        provider_name = provider
 
         max_retries = 3
         backoff = 1.0
         busy = False
         for attempt in range(1, max_retries + 1):
             try:
-                r = requests.post(url, headers=headers, json=payload, timeout=120)
-                if _llm_response_indicates_busy(r):
+                _provider, response = _llm_send_chat(
+                    choice,
+                    messages,
+                    temperature=0.0,
+                    max_tokens=800,
+                    timeout=120,
+                )
+                if _llm_response_indicates_busy(response):
                     app.logger.info(f"LLM metadata endpoint занята ({label}), переключаемся")
                     busy = True
                     last_error = RuntimeError('busy')
                     break
-                text_snippet = (r.text or '')[:2000]
-                if r.status_code != 200:
-                    app.logger.warning(f"LM Studio HTTP {r.status_code} ({label}, попытка {attempt}): {text_snippet}")
-                    r.raise_for_status()
-                data = r.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                text_snippet = (response.text or '')[:2000]
+                if response.status_code != 200:
+                    app.logger.warning(f"LLM HTTP {response.status_code} ({label}, попытка {attempt}): {text_snippet}")
+                    response.raise_for_status()
+                data = response.json()
+                content = _llm_extract_content(_provider, data)
                 try:
                     return json.loads(content)
                 except Exception:
@@ -3026,29 +3159,29 @@ def call_lmstudio_for_metadata(text: str, filename: str):
                     try:
                         return json.loads(m.group(1))
                     except Exception:
-                        app.logger.warning("Не удалось разобрать JSON внутри блока ```json из LM Studio")
+                        app.logger.warning("Не удалось разобрать JSON внутри блока ```json из ответа LLM")
                 m = re.search(r"(\{.*\})", content, flags=re.S)
                 if m:
                     try:
                         return json.loads(m.group(1))
                     except Exception:
-                        app.logger.warning("Не удалось разобрать JSON‑фрагмент из ответа LM Studio")
+                        app.logger.warning("Не удалось разобрать JSON‑фрагмент из ответа LLM")
                 app.logger.warning(f"LLM вернул не‑JSON контент ({label}, первые 300 символов): {content[:300]}")
                 return {}
             except requests.exceptions.RequestException as e:
                 last_error = e
-                app.logger.warning(f"Исключение при запросе к LM Studio ({label}, попытка {attempt}): {e}")
+                app.logger.warning(f"Исключение при запросе к LLM ({label}, {provider_name}, попытка {attempt}): {e}")
                 if attempt < max_retries:
                     import time
                     time.sleep(backoff)
                     backoff *= 2
                     continue
             except ValueError as e:
-                app.logger.warning(f"LM Studio вернул неверный JSON ({label}, попытка {attempt}): {e}")
+                app.logger.warning(f"LLM metadata endpoint некорректен ({label}, {provider_name}, попытка {attempt}): {e}")
                 last_error = e
                 break
             except Exception as e:
-                app.logger.warning(f"Unexpected error calling LM Studio ({label}, попытка {attempt}): {e}")
+                app.logger.warning(f"Unexpected error calling LLM ({label}, {provider_name}, попытка {attempt}): {e}")
                 last_error = e
                 break
         if busy:
@@ -3829,7 +3962,7 @@ def api_voice_search():
 def api_settings():
     """JSON API для чтения/изменения основных настроек UI/сканирования."""
     _require_admin()
-    global SCAN_ROOT, EXTRACT_TEXT, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY
+    global SCAN_ROOT, EXTRACT_TEXT, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY, LM_DEFAULT_PROVIDER
     global TRANSCRIBE_ENABLED, TRANSCRIBE_BACKEND, TRANSCRIBE_MODEL_PATH, TRANSCRIBE_LANGUAGE
     global SUMMARIZE_AUDIO, AUDIO_KEYWORDS_LLM, IMAGES_VISION_ENABLED
     global KEYWORDS_TO_TAGS_ENABLED, TYPE_DETECT_FLOW, TYPE_LLM_OVERRIDE
@@ -3837,6 +3970,7 @@ def api_settings():
     global OCR_LANGS_CFG, PDF_OCR_PAGES_CFG, ALWAYS_OCR_FIRST_PAGE_DISSERTATION
     global PROMPTS, AI_RERANK_LLM, COLLECTIONS_IN_SEPARATE_DIRS, COLLECTION_TYPE_SUBDIRS
     if request.method == 'GET':
+        _ensure_llm_schema_once()
         # включаем коллекции для интерфейса React
         try:
             cols = Collection.query.order_by(Collection.name.asc()).all()
@@ -3868,6 +4002,7 @@ def api_settings():
                 'weight': float(ep.weight or 0.0),
                 'purpose': ep.purpose,
                 'purposes': _llm_parse_purposes(ep.purpose),
+                'provider': (ep.provider or LM_DEFAULT_PROVIDER),
             } for ep in llms]
         except Exception:
             llm_items = []
@@ -3886,6 +4021,7 @@ def api_settings():
             'lm_base': LMSTUDIO_API_BASE,
             'lm_model': LMSTUDIO_MODEL,
             'lm_key': LMSTUDIO_API_KEY,
+            'lm_provider': LM_DEFAULT_PROVIDER,
             'transcribe_enabled': bool(TRANSCRIBE_ENABLED),
             'transcribe_backend': TRANSCRIBE_BACKEND,
             'transcribe_model': TRANSCRIBE_MODEL_PATH,
@@ -3910,6 +4046,7 @@ def api_settings():
             'collections': collections,
             'llm_endpoints': llm_items,
             'llm_purposes': LLM_PURPOSES,
+            'llm_providers': LLM_PROVIDER_OPTIONS,
             'aiword_users': ai_users,
             'default_use_llm': bool(DEFAULT_USE_LLM),
             'default_prune': bool(DEFAULT_PRUNE),
@@ -3918,6 +4055,7 @@ def api_settings():
     prev_base = (LMSTUDIO_API_BASE or '').strip()
     prev_model = (LMSTUDIO_MODEL or '').strip()
     prev_key = (LMSTUDIO_API_KEY or '').strip()
+    prev_provider = LM_DEFAULT_PROVIDER
     SCAN_ROOT = Path(data.get('scan_root') or SCAN_ROOT)
     app.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
     EXTRACT_TEXT = bool(data.get('extract_text', EXTRACT_TEXT))
@@ -3927,6 +4065,15 @@ def api_settings():
     if ((LMSTUDIO_API_BASE or '').strip() != prev_base or
         (LMSTUDIO_MODEL or '').strip() != prev_model or
         (LMSTUDIO_API_KEY or '').strip() != prev_key):
+        _invalidate_llm_cache()
+    provider_candidate = (data.get('lm_provider') or LM_DEFAULT_PROVIDER or '').strip().lower()
+    if provider_candidate in LLM_PROVIDER_CHOICES:
+        LM_DEFAULT_PROVIDER = provider_candidate
+    elif prev_provider in LLM_PROVIDER_CHOICES:
+        LM_DEFAULT_PROVIDER = prev_provider
+    else:
+        LM_DEFAULT_PROVIDER = 'openai'
+    if LM_DEFAULT_PROVIDER != prev_provider:
         _invalidate_llm_cache()
     TRANSCRIBE_ENABLED = bool(data.get('transcribe_enabled', TRANSCRIBE_ENABLED))
     TRANSCRIBE_BACKEND = data.get('transcribe_backend') or TRANSCRIBE_BACKEND
@@ -4459,6 +4606,7 @@ def api_admin_actions():
 @app.route('/api/admin/llm-endpoints', methods=['GET', 'POST'])
 @require_admin
 def api_admin_llm_endpoints():
+    _ensure_llm_schema_once()
     if request.method == 'GET':
         eps = LlmEndpoint.query.order_by(LlmEndpoint.created_at.desc()).all()
         return jsonify({'ok': True, 'items': [
@@ -4470,14 +4618,18 @@ def api_admin_llm_endpoints():
                 'weight': float(ep.weight or 0.0),
                 'purpose': ep.purpose,
                 'purposes': _llm_parse_purposes(ep.purpose),
+                'provider': (ep.provider or LM_DEFAULT_PROVIDER),
                 'created_at': ep.created_at.isoformat() if ep.created_at else None,
             }
             for ep in eps
-        ], 'purposes_catalog': LLM_PURPOSES})
+        ], 'purposes_catalog': LLM_PURPOSES, 'providers_catalog': LLM_PROVIDER_OPTIONS})
     data = request.get_json(silent=True) or {}
     name = (data.get('name') or '').strip()
     base_url = (data.get('base_url') or '').strip()
     model = (data.get('model') or '').strip()
+    provider = (data.get('provider') or LM_DEFAULT_PROVIDER).strip().lower()
+    if provider not in LLM_PROVIDER_CHOICES:
+        return jsonify({'ok': False, 'error': 'некорректный провайдер LLM'}), 400
     if not name or not base_url or not model:
         return jsonify({'ok': False, 'error': 'name, base_url и model обязательны'}), 400
     normalized_purpose = _llm_normalize_purposes(data.get('purposes') if 'purposes' in data else data.get('purpose'))
@@ -4488,6 +4640,7 @@ def api_admin_llm_endpoints():
         api_key=(data.get('api_key') or '').strip() or None,
         weight=float(data.get('weight') or 1.0),
         purpose=normalized_purpose,
+        provider=provider,
     )
     db.session.add(ep)
     db.session.commit()
@@ -4501,6 +4654,7 @@ def api_admin_llm_endpoints():
         'weight': float(ep.weight or 0.0),
         'purpose': ep.purpose,
         'purposes': _llm_parse_purposes(ep.purpose),
+        'provider': ep.provider,
         'created_at': ep.created_at.isoformat() if ep.created_at else None,
     }}), 201
 
@@ -4508,6 +4662,7 @@ def api_admin_llm_endpoints():
 @app.route('/api/admin/llm-endpoints/<int:endpoint_id>', methods=['PATCH', 'DELETE'])
 @require_admin
 def api_admin_llm_endpoint_detail(endpoint_id: int):
+    _ensure_llm_schema_once()
     ep = LlmEndpoint.query.get_or_404(endpoint_id)
     if request.method == 'DELETE':
         db.session.delete(ep)
@@ -4541,6 +4696,13 @@ def api_admin_llm_endpoint_detail(endpoint_id: int):
     elif 'purpose' in data:
         ep.purpose = _llm_normalize_purposes(data.get('purpose'))
         updated = True
+    if 'provider' in data:
+        prov = str(data['provider']).strip().lower()
+        if prov in LLM_PROVIDER_CHOICES:
+            ep.provider = prov
+            updated = True
+        else:
+            return jsonify({'ok': False, 'error': 'некорректный провайдер LLM'}), 400
     if updated:
         db.session.commit()
         _invalidate_llm_cache()
@@ -4553,6 +4715,7 @@ def api_admin_llm_endpoint_detail(endpoint_id: int):
         'weight': float(ep.weight or 0.0),
         'purpose': ep.purpose,
         'purposes': _llm_parse_purposes(ep.purpose),
+        'provider': ep.provider,
         'created_at': ep.created_at.isoformat() if ep.created_at else None,
     }})
 
@@ -7543,4 +7706,5 @@ if __name__ == "__main__":
     with app.app_context():
         db.create_all()
         ensure_collections_schema()
+        ensure_llm_schema()
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False, threaded=True)

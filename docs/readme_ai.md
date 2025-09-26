@@ -164,6 +164,7 @@
 - Весовые коэффициенты (ENV): `AI_SCORE_TITLE/…/TAG`, `AI_BOOST_PHRASE`, `AI_BOOST_MULTI`, `AI_BOOST_SNIPPET_COOCCUR` — см. `app.py:181..189`.
 - LLM‑реранжирование: флаг `AI_RERANK_LLM` (см. `/api/settings`, `runtime_settings.json:49`, `app.py:248`, `app.py:3491/3543`).
 - Ключевые слова/композер: эндпоинты LLM берутся из конфигурации `/api/settings` (пулы по «назначениям»: `keywords`, `compose`, `rerank`).
+- LLM‑эндпоинты: в `/admin/llm` можно указать провайдера (`openai`‑совместимый или `ollama`), базовый URL, модель и вес. Вес добавляет копии эндпоинта в круговую очередь: чем он больше, тем чаще этот сервер выбирается. Если один экземпляр отвечает кодами занятости (`429/503/…`), запрос автоматически перейдёт к следующему свободному эндпоинту.
 - Кэш сниппетов: `AI_SNIPPET_CACHE_TTL_HOURS` (дефолт 24 ч). Таблица `ai_search_snippet_cache`.
 - Фоновая очистка: `AI_SNIPPET_CACHE_SWEEP_INTERVAL_HOURS` (дефолт 24 ч).
 

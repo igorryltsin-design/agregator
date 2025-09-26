@@ -20,8 +20,10 @@ type LlmEndpointInfo = {
   weight: number
   purpose?: string | null
   purposes?: string[]
+  provider?: string
 }
 type LlmPurposeOption = { id: string; label: string }
+type LlmProviderOption = { id: string; label: string }
 type AiwordAccessUser = { user_id: number; username?: string | null; full_name?: string | null }
 type UserSuggestion = { id: number; username: string; full_name?: string | null }
 type Settings = {
@@ -30,6 +32,7 @@ type Settings = {
   lm_base: string
   lm_model: string
   lm_key: string
+  lm_provider: string
   transcribe_enabled: boolean
   transcribe_backend: string
   transcribe_model: string
@@ -53,6 +56,7 @@ type Settings = {
   collections?: Collection[]
   llm_endpoints?: LlmEndpointInfo[]
   llm_purposes?: LlmPurposeOption[]
+  llm_providers?: LlmProviderOption[]
   aiword_users?: AiwordAccessUser[]
   default_use_llm?: boolean
   default_prune?: boolean
@@ -101,6 +105,7 @@ const normalizeSettings = (raw: any): Settings => {
     lm_base: String(raw?.lm_base || ''),
     lm_model: String(raw?.lm_model || ''),
     lm_key: String(raw?.lm_key || ''),
+    lm_provider: String(raw?.lm_provider || 'openai'),
     transcribe_enabled: boolVal(raw?.transcribe_enabled, true),
     transcribe_backend: String(raw?.transcribe_backend || 'faster-whisper'),
     transcribe_model: String(raw?.transcribe_model || ''),
@@ -122,8 +127,14 @@ const normalizeSettings = (raw: any): Settings => {
     prompt_defaults: promptDefaults,
     ai_rerank_llm: boolVal(raw?.ai_rerank_llm, false),
     collections,
-    llm_endpoints: Array.isArray(raw?.llm_endpoints) ? raw.llm_endpoints : [],
+    llm_endpoints: Array.isArray(raw?.llm_endpoints)
+      ? raw.llm_endpoints.map((ep: any) => ({
+          ...ep,
+          provider: ep?.provider ? String(ep.provider) : 'openai',
+        }))
+      : [],
     llm_purposes: Array.isArray(raw?.llm_purposes) ? raw.llm_purposes : [],
+    llm_providers: Array.isArray(raw?.llm_providers) ? raw.llm_providers : [],
     aiword_users: Array.isArray(raw?.aiword_users) ? raw.aiword_users : [],
     default_use_llm: boolVal(raw?.default_use_llm, true),
     default_prune: boolVal(raw?.default_prune, true),
@@ -199,6 +210,29 @@ export default function SettingsPage() {
     llmPurposes.forEach(p => map.set(p.id, p.label))
     return map
   }, [llmPurposes])
+  const llmProviderOptions = useMemo<LlmProviderOption[]>(() => {
+    const defaults: LlmProviderOption[] = [
+      { id: 'openai', label: 'OpenAI-совместимый (LM Studio, OpenAI, Azure)' },
+      { id: 'ollama', label: 'Ollama' },
+    ]
+    const map = new Map(defaults.map(opt => [opt.id, opt] as const))
+    if (Array.isArray(s?.llm_providers)) {
+      s.llm_providers.forEach(opt => {
+        if (opt?.id) {
+          map.set(opt.id, { id: opt.id, label: opt.label || opt.id })
+        }
+      })
+    }
+    if (s?.lm_provider && !map.has(s.lm_provider)) {
+      map.set(s.lm_provider, { id: s.lm_provider, label: s.lm_provider })
+    }
+    return Array.from(map.values())
+  }, [s?.llm_providers, s?.lm_provider])
+  const llmProviderLabels = useMemo(() => {
+    const map = new Map<string, string>()
+    llmProviderOptions.forEach(opt => map.set(opt.id, opt.label))
+    return map
+  }, [llmProviderOptions])
   const promptDefaults = useMemo(() => ({ ...fallbackPromptDefaults, ...(s?.prompt_defaults || {}) }), [s?.prompt_defaults])
   const promptKeys = useMemo(() => {
     const known = new Set(promptOrder)
@@ -367,8 +401,11 @@ export default function SettingsPage() {
     if (!s) return
     setSaving(true)
     try {
-      const { llm_endpoints, llm_purposes, aiword_users, prompt_defaults: _promptDefaults, ...rest } = s
+      const { llm_endpoints, llm_purposes, llm_providers, aiword_users, prompt_defaults: _promptDefaults, ...rest } = s
       void _promptDefaults
+      void llm_endpoints
+      void llm_purposes
+      void llm_providers
       const payload: any = { ...rest, aiword_users: (aiword_users || []).map(u => u.user_id) }
       payload.prompts = { ...promptDefaults, ...(payload.prompts || {}) }
       payload.collections_in_dirs = !!payload.collections_in_dirs
@@ -568,15 +605,28 @@ export default function SettingsPage() {
       <div className="card p-3">
         <div className="fw-semibold mb-2">LLM и типизация</div>
         <div className="row g-3">
-          <div className="col-md-5">
+          <div className="col-md-3">
+            <label className="form-label" htmlFor="lm-provider">Тип API</label>
+            <select
+              id="lm-provider"
+              className="form-select"
+              value={s.lm_provider}
+              onChange={e => setS({ ...s, lm_provider: e.target.value })}
+            >
+              {llmProviderOptions.map(opt => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="col-md-4">
             <label className="form-label">Базовый URL LLM</label>
             <input className="form-control" placeholder="http://localhost:1234/v1" value={s.lm_base} onChange={e => setS({ ...s, lm_base: e.target.value })} />
           </div>
-          <div className="col-md-4">
+          <div className="col-md-3">
             <label className="form-label">Модель LLM</label>
             <input className="form-control" placeholder="gpt-4o-mini" value={s.lm_model} onChange={e => setS({ ...s, lm_model: e.target.value })} />
           </div>
-          <div className="col-md-3">
+          <div className="col-md-2">
             <label className="form-label">LM API Key</label>
             <input className="form-control" placeholder="sk-..." value={s.lm_key} onChange={e => setS({ ...s, lm_key: e.target.value })} />
           </div>
@@ -690,12 +740,13 @@ export default function SettingsPage() {
           {llmEndpoints.map(ep => {
             const selected = ep.purposes && ep.purposes.length ? ep.purposes : ['default']
             const chips = selected.map(id => llmPurposeLabels.get(id) || id)
+            const providerLabel = llmProviderLabels.get(ep.provider || '') || ep.provider || 'openai'
             return (
               <div key={ep.id} className="border rounded-3 p-3" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
                 <div className="d-flex flex-wrap justify-content-between align-items-start gap-3">
                   <div>
                     <div className="fw-semibold">{ep.name}</div>
-                    <div className="text-muted" style={{ fontSize: 13 }}>{ep.model} • {ep.base_url}</div>
+                    <div className="text-muted" style={{ fontSize: 13 }}>{providerLabel} • {ep.model} • {ep.base_url}</div>
                   </div>
                   <div className="d-flex align-items-center gap-2">
                     <label className="form-label m-0" htmlFor={`llm-weight-${ep.id}`} style={{ fontSize: 13 }}>Вес</label>
