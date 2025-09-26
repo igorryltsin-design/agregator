@@ -142,6 +142,7 @@ class LlmEndpoint(db.Model):
     api_key = db.Column(db.String, nullable=True)
     weight = db.Column(db.Float, nullable=False, default=1.0)
     purpose = db.Column(db.String, nullable=True)  # например rerank, summary, transcription
+    provider = db.Column(db.String, nullable=False, default='openai', server_default='openai')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 

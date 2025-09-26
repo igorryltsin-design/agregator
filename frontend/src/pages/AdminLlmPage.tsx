@@ -11,9 +11,11 @@ type LlmEndpoint = {
   purpose?: string | null
   purposes?: string[]
   created_at?: string | null
+  provider?: string
 }
 
 type LlmPurposeOption = { id: string; label: string }
+type LlmProviderOption = { id: string; label: string }
 
 type CreateFormState = {
   name: string
@@ -22,6 +24,7 @@ type CreateFormState = {
   weight: string
   api_key: string
   purposes: string[]
+  provider: string
 }
 
 const defaultForm: CreateFormState = {
@@ -31,6 +34,7 @@ const defaultForm: CreateFormState = {
   weight: '1',
   api_key: '',
   purposes: ['default'],
+  provider: 'openai',
 }
 
 export default function AdminLlmPage() {
@@ -41,6 +45,7 @@ export default function AdminLlmPage() {
   const [loading, setLoading] = useState(false)
   const [form, setForm] = useState<CreateFormState>(defaultForm)
   const [purposeOptions, setPurposeOptions] = useState<LlmPurposeOption[]>([])
+  const [providerOptions, setProviderOptions] = useState<LlmProviderOption[]>([])
 
   const normalizedPurposeOptions = useMemo(() => {
     const options = [...purposeOptions]
@@ -55,6 +60,19 @@ export default function AdminLlmPage() {
     normalizedPurposeOptions.forEach(opt => map.set(opt.id, opt.label))
     return map
   }, [normalizedPurposeOptions])
+  const normalizedProviderOptions = useMemo(() => {
+    const defaults: LlmProviderOption[] = [
+      { id: 'openai', label: 'OpenAI-совместимый (LM Studio, OpenAI, Azure)' },
+      { id: 'ollama', label: 'Ollama' },
+    ]
+    const map = new Map(defaults.map(opt => [opt.id, opt] as const))
+    providerOptions.forEach(opt => {
+      if (opt?.id) {
+        map.set(opt.id, { id: opt.id, label: opt.label || opt.id })
+      }
+    })
+    return Array.from(map.values())
+  }, [providerOptions])
 
   const load = async () => {
     if (!isAdmin) return
@@ -66,6 +84,8 @@ export default function AdminLlmPage() {
         setList(Array.isArray(data.items) ? data.items : [])
         const catalog = Array.isArray(data.purposes_catalog) ? data.purposes_catalog : []
         setPurposeOptions(catalog)
+        const providersCatalog = Array.isArray(data.providers_catalog) ? data.providers_catalog : []
+        setProviderOptions(providersCatalog)
       } else {
         toasts.push(data?.error || 'Не удалось получить список LLM', 'error')
       }
@@ -77,6 +97,12 @@ export default function AdminLlmPage() {
   }
 
   useEffect(() => { load() }, [isAdmin])
+  useEffect(() => {
+    if (!normalizedProviderOptions.length) return
+    if (!normalizedProviderOptions.some(opt => opt.id === form.provider)) {
+      setForm(prev => ({ ...prev, provider: normalizedProviderOptions[0].id }))
+    }
+  }, [normalizedProviderOptions, form.provider])
 
   if (!isAdmin) return <div className="card p-3">Недостаточно прав.</div>
 
@@ -90,6 +116,7 @@ export default function AdminLlmPage() {
         weight: parseFloat(form.weight || '1') || 1,
         api_key: form.api_key.trim(),
         purposes: form.purposes.length ? form.purposes : ['default'],
+        provider: (form.provider || 'openai').trim().toLowerCase(),
       }
       const r = await fetch('/api/admin/llm-endpoints', {
         method: 'POST',
@@ -163,6 +190,18 @@ export default function AdminLlmPage() {
             <input className="form-control" value={form.model} onChange={e => setForm(prev => ({ ...prev, model: e.target.value }))} required placeholder="google/gemma" />
           </div>
           <div className="col-md-2">
+            <label className="form-label">Провайдер</label>
+            <select
+              className="form-select"
+              value={form.provider}
+              onChange={e => setForm(prev => ({ ...prev, provider: e.target.value }))}
+            >
+              {normalizedProviderOptions.map(opt => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="col-md-2">
             <label className="form-label">Вес</label>
             <input className="form-control" type="number" step="0.1" value={form.weight} onChange={e => setForm(prev => ({ ...prev, weight: e.target.value }))} />
           </div>
@@ -206,6 +245,7 @@ export default function AdminLlmPage() {
                 <th>Название</th>
                 <th>URL</th>
                 <th>Модель</th>
+                <th>Провайдер</th>
                 <th style={{ width: 110 }}>Вес</th>
                 <th style={{ minWidth: 220 }}>Назначения</th>
                 <th></th>
@@ -215,12 +255,24 @@ export default function AdminLlmPage() {
               {list.map(item => {
                 const selected = item.purposes && item.purposes.length ? item.purposes : (item.purpose ? item.purpose.split(',').map(x => x.trim()).filter(Boolean) : ['default'])
                 const chips = selected.map(id => purposeLabel.get(id) || id)
+                const providerValue = item.provider || 'openai'
                 return (
                   <tr key={item.id}>
                     <td>{item.id}</td>
                     <td>{item.name}</td>
                     <td style={{ maxWidth: 260 }}>{item.base_url}</td>
                     <td>{item.model}</td>
+                    <td style={{ minWidth: 150 }}>
+                      <select
+                        className="form-select form-select-sm"
+                        value={providerValue}
+                        onChange={e => updateEndpoint(item.id, { provider: e.target.value }, 'Провайдер обновлён')}
+                      >
+                        {normalizedProviderOptions.map(opt => (
+                          <option key={opt.id} value={opt.id}>{opt.label}</option>
+                        ))}
+                      </select>
+                    </td>
                     <td>
                       <input
                         className="form-control form-control-sm"
