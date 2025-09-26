@@ -342,8 +342,14 @@ export default function Catalogue() {
 
   useEffect(() => {
     let cancelled = false;
+    let controller: AbortController | null = null;
 
-    const abortCurrent = () => {};
+    const abortCurrent = () => {
+      if (controller) {
+        controller.abort();
+        controller = null;
+      }
+    };
 
     const hydrateItems = async (items: any[]) => {
       const ids: number[] = (items || []).map((x: any) => x?.file_id).filter(Boolean);
@@ -365,24 +371,41 @@ export default function Catalogue() {
       setLocalPage(1);
     };
 
-    const runAiSearchFallback = async (payload: any) => {
-      const resp = await fetch('/api/ai-search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(text || `HTTP ${resp.status}`);
+    const runAiSearch = async (payload: any) => {
+      abortCurrent();
+      const localController = new AbortController();
+      controller = localController;
+      try {
+        const resp = await fetch('/api/ai-search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: localController.signal,
+        });
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => '');
+          throw new Error(text || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (cancelled) return;
+        setAiQueryHash(String(data.query_hash || ''));
+        const items = Array.isArray(data.items) ? data.items : [];
+        const progressLines = Array.isArray(data.progress) && data.progress.length ? data.progress : ['Поиск завершён'];
+        setAiProgress(progressLines);
+        if (cancelled) return;
+        setAiSources(items);
+        setAiAnswer(data.answer || '');
+        setAiKeywords(Array.isArray(data.keywords) ? data.keywords : []);
+        setAiFilteredKeywords(Array.isArray(data.filtered_keywords) ? data.filtered_keywords : []);
+        await hydrateItems(items);
+      } catch (error: any) {
+        if (cancelled || (error && error.name === 'AbortError')) return;
+        throw error;
+      } finally {
+        if (controller === localController) {
+          controller = null;
+        }
       }
-      const data = await resp.json();
-      if (cancelled) return;
-      setAiQueryHash(String(data.query_hash || ''))
-      const items = Array.isArray(data.items) ? data.items : [];
-      const progressLines = Array.isArray(data.progress) && data.progress.length ? data.progress : ['Поиск завершён'];
-      setAiProgress(prev => (prev.length ? [...prev, ...progressLines] : progressLines));
-      if (cancelled) return;
-      setAiSources(items);
-      setAiAnswer(data.answer || '');
-      setAiKeywords(Array.isArray(data.keywords) ? data.keywords : []);
-      setAiFilteredKeywords(Array.isArray(data.filtered_keywords) ? data.filtered_keywords : []);
-      await hydrateItems(items);
     };
     const load = async () => {
       setLoading(true);
@@ -409,7 +432,16 @@ export default function Catalogue() {
           if (year_from) payload.year_from = year_from;
           if (year_to) payload.year_to = year_to;
           if (selectedTags.length) payload.tag_filters = selectedTags;
-          await runAiSearchFallback(payload);
+          try {
+            await runAiSearch(payload);
+          } catch (error: any) {
+            if (cancelled) return;
+            const rawMessage = error instanceof Error ? error.message : String(error);
+            const normalized = /<!doctype/i.test(rawMessage) ? 'HTTP 404' : rawMessage;
+            setAiProgress([`Ошибка поиска: ${normalized}`]);
+            setAiAnswer('');
+            setAiKeywords([]);
+          }
         } else {
           if (aiMode) {
             if (!dq) {
@@ -680,6 +712,19 @@ export default function Catalogue() {
                   <label className="form-check-label" htmlFor="aiFullText">Полнотекстовое сканирование</label>
                 </div>
                 <small className="text-muted">Читает сам файл вместо кэша. Медленнее, но точнее.</small>
+              </div>
+              <div className="col-12 col-lg-3 d-flex flex-column justify-content-center">
+                <div className="form-check form-switch">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    id="aiLlmSnippets"
+                    checked={aiUseLlmSnippets}
+                    onChange={e => setAiUseLlmSnippets(e.target.checked)}
+                  />
+                  <label className="form-check-label" htmlFor="aiLlmSnippets">LLM сниппеты</label>
+                </div>
+                <small className="text-muted">Формирует короткий пересказ для выдачи (медленнее, но информативнее).</small>
               </div>
               <div className="col-12 col-lg-3">
                 <div className="form-check">

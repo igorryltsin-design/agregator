@@ -15,6 +15,7 @@ export default function ImportPage(){
   const [collectionId, setCollectionId] = useState<string>('')
   const [newCollection, setNewCollection] = useState<string>('')
   const [isPrivate, setIsPrivate] = useState(!isAdmin)
+  const [pickFolders, setPickFolders] = useState(true)
 
   useEffect(()=>{
     (async()=>{
@@ -52,7 +53,13 @@ export default function ImportPage(){
     <div className="card p-3">
       <div className="fw-semibold mb-2">Импорт файлов/папок</div>
       <form onSubmit={submit}>
-        <input className="form-control" type="file" name="files" multiple {...{ webkitdirectory: '' as any, directory: '' as any }} />
+        <input
+          className="form-control"
+          type="file"
+          name="files"
+          multiple
+          {...(pickFolders ? { webkitdirectory: '' as any, directory: '' as any } : {})}
+        />
         <div className="row g-2 mt-2">
           <div className="col-md-6">
             <label className="form-label">Коллекция</label>
@@ -91,6 +98,10 @@ export default function ImportPage(){
           <div className="col-auto form-check form-switch">
             <input className="form-check-input" type="checkbox" id="pr" checked={prune} onChange={e=>setPrune(e.target.checked)} />
             <label className="form-check-label" htmlFor="pr">Удалять отсутствующие</label>
+          </div>
+          <div className="col-auto form-check form-switch">
+            <input className="form-check-input" type="checkbox" id="folderMode" checked={pickFolders} onChange={e=>setPickFolders(e.target.checked)} />
+            <label className="form-check-label" htmlFor="folderMode">Выбирать папки целиком</label>
           </div>
         </div>
         <div className="mt-3"><button className="btn btn-primary" type="submit" disabled={busy}>{busy?'Отправка…':'Импортировать'}</button></div>

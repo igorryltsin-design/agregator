@@ -874,8 +874,9 @@ export default function App() {
       // Выполняем локально вместо /api/agent/*
       let output = '';
       const sys = buildSystemPrompt(payload.project || project);
+      const providedCatalog = (payload.catalog_context || '').trim();
       let catalogContext = '';
-      if (useAgregator) {
+      if (useAgregator && (action !== 'factcheck' || !providedCatalog)) {
         // Determine a meaningful query for the catalogue
         let q = '';
         if (action === 'outline') q = String(payload.topic || project.title || '').slice(0, 300);
@@ -980,9 +981,10 @@ export default function App() {
         }
       } else if (action === 'factcheck') {
         const scope = payload.mode === 'selection' ? 'выделенного фрагмента' : 'всего текста';
-        const catalog = (payload.catalog_context || '').trim();
-        const contextBlock = catalog ? `Контекст каталога:\n${catalog}\n\n` : '';
+        const combinedCatalog = [providedCatalog, catalogContext].filter(Boolean).join('\n\n');
+        const contextBlock = combinedCatalog ? `Контекст каталога:\n${combinedCatalog}\n\n` : '';
         const user = `${contextBlock}Проверь фактические утверждения ${scope}. Для каждого сформируй пункт списка: кратко переформулированный факт, затем статус **Подтверждено**, **Требует проверки** или **Не найдено**, и короткий комментарий.\n- Используй **Подтверждено** только если есть явное совпадение в предоставленных фрагментах и укажи ссылку [#n].\n- Если данных недостаточно или совпадение неточно — ставь **Требует проверки** и поясни, каких сведений не хватает.\n- Используй **Не найдено**, если фрагменты прямо противоречат утверждению.\nЗаверши вывод кратким списком ключевых рисков или неопределённостей.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || content}\n\u0060\u0060\u0060`;
+- Используй **Подтверждено** только если есть явное совпадение в предоставленных фрагментах и укажи ссылку [#n].\n- Если данных недостаточно или совпадение неточно — ставь **Требует проверки** и поясни, каких сведений не хватает.\n- Используй **Не найдено**, если фрагменты прямо противоречат утверждению.\nЗаверши вывод кратким списком ключевых рисков или неопределённостей.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || content}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
           output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 700, (d)=> setLiveText(t=>t + d), injectToEditor);

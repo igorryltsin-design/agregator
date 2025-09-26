@@ -18,6 +18,12 @@ type CollectionRow = {
   members?: Member[]
 }
 
+type UserSuggestion = {
+  id: number
+  username: string
+  full_name?: string | null
+}
+
 const ROLE_LABELS: Record<string, string> = {
   viewer: 'Читатель',
   editor: 'Редактор',
@@ -35,7 +41,10 @@ export default function AdminCollectionsPage() {
   const [rescanLoading, setRescanLoading] = useState(false)
   const [renameLoading, setRenameLoading] = useState(false)
   const [deleteLoading, setDeleteLoading] = useState(false)
-  const [memberForm, setMemberForm] = useState({ user_id: '', role: 'viewer' })
+  const [clearLoading, setClearLoading] = useState(false)
+  const [memberForm, setMemberForm] = useState<{ username: string; role: string; userId: number | null }>({ username: '', role: 'viewer', userId: null })
+  const [memberOptions, setMemberOptions] = useState<UserSuggestion[]>([])
+  const [memberLookupLoading, setMemberLookupLoading] = useState(false)
 
   const loadCollections = async () => {
     setLoading(true)
@@ -94,6 +103,58 @@ export default function AdminCollectionsPage() {
     loadMembers()
   }, [selectedId, toasts])
 
+  useEffect(() => {
+    setMemberForm(prev => ({ username: '', role: prev.role, userId: null }))
+    setMemberOptions([])
+    setMemberLookupLoading(false)
+  }, [selectedId])
+
+  const assignedMemberIds = useMemo(() => new Set(members.map(m => m.user_id)), [members])
+
+  useEffect(() => {
+    setMemberOptions(prev => prev.filter(opt => !assignedMemberIds.has(opt.id)))
+  }, [assignedMemberIds])
+
+  useEffect(() => {
+    if (!isAdmin) return
+    const query = memberForm.username.trim()
+    if (!query) {
+      setMemberOptions([])
+      setMemberLookupLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    const handle = window.setTimeout(async () => {
+      setMemberLookupLoading(true)
+      try {
+        const r = await fetch(`/api/admin/users/search?q=${encodeURIComponent(query)}&limit=8`, { signal: controller.signal })
+        const data = await r.json().catch(() => ({}))
+        if (!controller.signal.aborted && r.ok && data?.ok && Array.isArray(data.users)) {
+          const suggestions: UserSuggestion[] = data.users
+            .filter((u: any) => !assignedMemberIds.has(u.id))
+            .map((u: any) => ({ id: u.id, username: u.username, full_name: u.full_name }))
+          setMemberOptions(suggestions)
+        } else if (!controller.signal.aborted) {
+          setMemberOptions([])
+        }
+      } catch (err) {
+        if (!(err instanceof DOMException && err.name === 'AbortError')) {
+          if (!controller.signal.aborted) {
+            setMemberOptions([])
+          }
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setMemberLookupLoading(false)
+        }
+      }
+    }, 250)
+    return () => {
+      controller.abort()
+      window.clearTimeout(handle)
+    }
+  }, [assignedMemberIds, isAdmin, memberForm.username])
+
   const selectedCollection = useMemo(() => collections.find(c => c.id === selectedId) || null, [collections, selectedId])
 
   const rescanCollection = async () => {
@@ -147,6 +208,28 @@ export default function AdminCollectionsPage() {
     }
   }
 
+  const clearCollection = async () => {
+    if (!selectedId) return
+    if (!confirm('Удалить все файлы из коллекции, не удаляя её саму?')) return
+    setClearLoading(true)
+    try {
+      const r = await fetch(`/api/collections/${selectedId}/clear`, { method: 'POST' })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        const removed = Number(data.removed_files || 0)
+        toasts.push(`Из коллекции удалено файлов: ${removed}`, removed ? 'success' : 'info')
+        setCollections(prev => prev.map(col => col.id === selectedId ? { ...col, count: 0 } : col))
+      } else {
+        toasts.push(data?.error || 'Не удалось очистить коллекцию', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка при очистке коллекции', 'error')
+    } finally {
+      setClearLoading(false)
+      loadCollections()
+    }
+  }
+
   const deleteCollection = async () => {
     if (!selectedId) return
     if (!confirm('Удалить коллекцию и все её файлы? Действие необратимо.')) return
@@ -173,9 +256,15 @@ export default function AdminCollectionsPage() {
   const addMember = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!selectedId) return
-    const payload = {
-      user_id: memberForm.user_id.trim(),
-      role: memberForm.role,
+    const payload: Record<string, unknown> = { role: memberForm.role }
+    const login = memberForm.username.trim()
+    if (memberForm.userId !== null) {
+      payload.user_id = memberForm.userId
+    } else if (login) {
+      payload.username = login
+    } else {
+      toasts.push('Укажите логин пользователя', 'error')
+      return
     }
     try {
       const r = await fetch(`/api/collections/${selectedId}/members`, {
@@ -185,7 +274,8 @@ export default function AdminCollectionsPage() {
       })
       const data = await r.json().catch(() => ({}))
       if (r.ok && data?.ok) {
-        setMemberForm({ user_id: '', role: 'viewer' })
+        setMemberForm(prev => ({ username: '', role: prev.role, userId: null }))
+        setMemberOptions([])
         setMembers(Array.isArray(data.members) ? data.members : [])
         toasts.push('Участник добавлен', 'success')
       } else {
@@ -303,6 +393,14 @@ export default function AdminCollectionsPage() {
                     </button>
                     <button
                       type="button"
+                      className="btn btn-outline-warning"
+                      onClick={clearCollection}
+                      disabled={clearLoading}
+                    >
+                      {clearLoading ? '...' : 'Очистить'}
+                    </button>
+                    <button
+                      type="button"
                       className="btn btn-outline-danger"
                       onClick={deleteCollection}
                       disabled={deleteLoading}
@@ -313,9 +411,36 @@ export default function AdminCollectionsPage() {
                 )}
               </div>
               <form className="row g-2 align-items-end mb-3" onSubmit={addMember}>
-                <div className="col-md-4">
-                  <label className="form-label">ID пользователя</label>
-                  <input className="form-control" value={memberForm.user_id} onChange={e=>setMemberForm({...memberForm, user_id:e.target.value})} required />
+                <div className="col-md-5 position-relative">
+                  <label className="form-label">Логин пользователя</label>
+                  <input
+                    className="form-control"
+                    value={memberForm.username}
+                    onChange={e => setMemberForm({ ...memberForm, username: e.target.value, userId: null })}
+                    placeholder="Например, ivanov"
+                    autoComplete="off"
+                  />
+                  {(memberLookupLoading || memberOptions.length > 0) && (
+                    <div className="border rounded-3 mt-1" style={{ position: 'absolute', insetInlineStart: 0, top: '100%', width: '100%', background: 'var(--surface)', zIndex: 2000, boxShadow: 'var(--card-shadow)' }}>
+                      {memberLookupLoading && <div className="px-3 py-2 text-muted" style={{ fontSize: 13 }}>Поиск…</div>}
+                      {!memberLookupLoading && memberOptions.map((opt, idx) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          className="btn w-100 text-start"
+                          style={{ border: 'none', borderBottom: idx === memberOptions.length - 1 ? 'none' : '1px solid var(--border)', borderRadius: 0 }}
+                          onMouseDown={() => {
+                            setMemberForm({ username: opt.username, role: memberForm.role, userId: opt.id })
+                            setMemberOptions([])
+                          }}
+                        >
+                          <div className="fw-semibold" style={{ fontSize: 13 }}>{opt.full_name || '—'}</div>
+                          <div className="text-muted" style={{ fontSize: 12 }}>@{opt.username}</div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {memberForm.userId !== null && <div className="form-text">ID: {memberForm.userId}</div>}
                 </div>
                 <div className="col-md-4">
                   <label className="form-label">Роль</label>
@@ -325,7 +450,7 @@ export default function AdminCollectionsPage() {
                     <option value="owner" disabled={!isAdmin}>{ROLE_LABELS.owner}</option>
                   </select>
                 </div>
-                <div className="col-md-2">
+                <div className="col-md-3">
                   <button className="btn btn-primary w-100" type="submit">Добавить</button>
                 </div>
               </form>

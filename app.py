@@ -9,12 +9,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import itertools
 
-from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, stream_with_context
+from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort
 from functools import wraps
 from werkzeug.utils import secure_filename
 import sqlite3
 import threading
-from queue import Queue
 
 try:
     from flask import copy_current_app_context
@@ -200,6 +199,8 @@ AI_BOOST_PHRASE = _getf('AI_BOOST_PHRASE', 3.0)
 AI_BOOST_MULTI = _getf('AI_BOOST_MULTI', 0.6)  # дополнительный бонус за каждое уникальное слово
 AI_BOOST_SNIPPET_COOCCUR = _getf('AI_BOOST_SNIPPET_COOCCUR', 0.8)
 SNIPPET_CACHE_TTL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_TTL_HOURS', '24'))
+LM_MAX_INPUT_CHARS = max(500, int(os.getenv('LM_MAX_INPUT_CHARS', '4000')))
+LM_MAX_OUTPUT_TOKENS = max(16, int(os.getenv('LM_MAX_OUTPUT_TOKENS', '256')))
 KEYWORD_IDF_MIN = float(os.getenv('KEYWORD_IDF_MIN', '1.25'))
 CACHE_CLEANUP_INTERVAL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_SWEEP_INTERVAL_HOURS', '24'))
 
@@ -1067,13 +1068,81 @@ try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 except Exception:
     LOG_DIR = BASE_DIR
-log_path = LOG_DIR / 'agregator.log'
+LOG_FILE_PATH = LOG_DIR / 'agregator.log'
 if not any(isinstance(h, RotatingFileHandler) for h in app.logger.handlers):
-    rotating_handler = RotatingFileHandler(log_path, maxBytes=100 * 1024 * 1024, backupCount=5, encoding='utf-8')
+    rotating_handler = RotatingFileHandler(LOG_FILE_PATH, maxBytes=100 * 1024 * 1024, backupCount=5, encoding='utf-8')
     rotating_handler.setLevel(logging.INFO)
     rotating_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s'))
     app.logger.addHandler(rotating_handler)
     logging.getLogger().setLevel(logging.INFO)
+
+
+def _get_rotating_log_handler() -> RotatingFileHandler | None:
+    for handler in app.logger.handlers:
+        if isinstance(handler, RotatingFileHandler):
+            base_filename = getattr(handler, 'baseFilename', '')
+            if Path(base_filename).resolve() == LOG_FILE_PATH.resolve():
+                return handler
+    return None
+
+
+def _list_system_log_files() -> list[dict[str, str | int | float | bool | None]]:
+    files: list[dict[str, str | int | float | bool | None]] = []
+    try:
+        base = LOG_FILE_PATH.name
+        for entry in sorted(LOG_DIR.glob(f"{base}*")):
+            if not entry.is_file():
+                continue
+            try:
+                stat = entry.stat()
+                files.append({
+                    'name': entry.name,
+                    'size': stat.st_size,
+                    'modified_at': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    'rotated': entry.name != base,
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return files
+
+
+def _tail_log_file(path: Path, max_lines: int = 200) -> list[str]:
+    if max_lines <= 0 or not path.exists() or not path.is_file():
+        return []
+    max_lines = min(max_lines, 2000)
+    chunk_size = 8192
+    buffer = b''
+    with path.open('rb') as fh:
+        fh.seek(0, os.SEEK_END)
+        file_size = fh.tell()
+        remaining = file_size
+        newlines = 0
+        while remaining > 0 and newlines <= max_lines:
+            read_size = min(chunk_size, remaining)
+            remaining -= read_size
+            fh.seek(remaining)
+            chunk = fh.read(read_size)
+            buffer = chunk + buffer
+            newlines = buffer.count(b'\n')
+        text = buffer.decode('utf-8', errors='replace')
+        lines = text.splitlines()
+        return lines[-max_lines:]
+
+
+def _resolve_log_name(name: str | None) -> Path | None:
+    candidate = (name or '').strip() or LOG_FILE_PATH.name
+    if candidate == 'current':
+        candidate = LOG_FILE_PATH.name
+    if not candidate.startswith(LOG_FILE_PATH.name):
+        return None
+    path = (LOG_DIR / candidate).resolve()
+    try:
+        path.relative_to(LOG_DIR.resolve())
+    except Exception:
+        return None
+    return path if path.exists() and path.is_file() else None
 # Ограничить максимальный размер загрузки (по умолчанию 50 МБ; настраивается через MAX_CONTENT_LENGTH)
 try:
     app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_CONTENT_LENGTH', str(50 * 1024 * 1024)))
@@ -1564,6 +1633,17 @@ def _llm_choice_headers(choice: dict) -> dict:
     return headers
 
 
+def _llm_timeout_pair(total_timeout: int | float | None) -> tuple[float, float]:
+    try:
+        base = float(total_timeout) if total_timeout is not None else 120.0
+    except Exception:
+        base = 120.0
+    base = max(5.0, min(base, 300.0))
+    connect = min(10.0, max(3.0, base * 0.25))
+    read = max(connect + 2.0, base)
+    return connect, read
+
+
 def _llm_send_chat(choice: dict, messages: list[dict], *, temperature: float, max_tokens: int | None, top_p: float = 1.0, timeout: int = 120, extra_payload: dict | None = None):
     provider = _llm_choice_provider(choice)
     url = _llm_choice_url(choice)
@@ -1601,7 +1681,7 @@ def _llm_send_chat(choice: dict, messages: list[dict], *, temperature: float, ma
                 pass
         if extra_payload:
             payload.update(extra_payload)
-    response = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=timeout)
+    response = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=_llm_timeout_pair(timeout))
     return provider, response
 
 
@@ -2842,6 +2922,7 @@ def transcribe_audio(fp: Path, limit_chars=40000,
 
 def call_lmstudio_summarize(text: str, filename: str) -> str:
     text = (text or "")[: int(os.getenv("SUMMARY_TEXT_LIMIT", "12000"))]
+    text = text[:LM_MAX_INPUT_CHARS]
     if not text:
         return ""
     system = PROMPTS.get('summarize_audio_system') or DEFAULT_PROMPTS.get('summarize_audio_system', '')
@@ -2860,7 +2941,7 @@ def call_lmstudio_summarize(text: str, filename: str) -> str:
                 choice,
                 messages,
                 temperature=0.2,
-                max_tokens=400,
+                max_tokens=min(400, LM_MAX_OUTPUT_TOKENS),
                 timeout=120,
             )
             if _llm_response_indicates_busy(response):
@@ -2899,7 +2980,7 @@ def call_lmstudio_compose(system: str, user: str, *, temperature: float = 0.2, m
                 choice,
                 messages,
                 temperature=float(temperature),
-                max_tokens=int(max_tokens),
+                max_tokens=min(int(max_tokens), LM_MAX_OUTPUT_TOKENS),
                 timeout=120,
             )
             if _llm_response_indicates_busy(response):
@@ -2927,6 +3008,7 @@ def call_lmstudio_keywords(text: str, filename: str):
     if not text:
         return []
     text = text[:int(os.getenv("KWS_TEXT_LIMIT", "8000"))]
+    text = text[:LM_MAX_INPUT_CHARS]
     is_query = str(filename or '').strip().lower() == 'ai-search'
     if is_query:
         system = PROMPTS.get('ai_search_keywords_system') or DEFAULT_PROMPTS.get('ai_search_keywords_system', '')
@@ -2952,7 +3034,7 @@ def call_lmstudio_keywords(text: str, filename: str):
                 choice,
                 messages,
                 temperature=0.0,
-                max_tokens=200,
+                max_tokens=min(200, LM_MAX_OUTPUT_TOKENS),
                 timeout=90,
             )
             if _llm_response_indicates_busy(response):
@@ -3112,31 +3194,31 @@ def call_lmstudio_for_metadata(text: str, filename: str):
     Возвращает dict. Терпимо относится к не-JSON ответам: пытается вытащить из ```json ...``` блока.
     """
     text = (text or "")[: int(os.getenv("LLM_TEXT_LIMIT", "15000"))]
+    text = text[:LM_MAX_INPUT_CHARS]
 
     system = PROMPTS.get('metadata_system') or DEFAULT_PROMPTS.get('metadata_system', '')
-    user = f"Файл: {filename}\nФрагмент текста:\n{text}"
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
 
     last_error: Exception | None = None
     for choice in _llm_iter_choices('metadata'):
         label = _llm_choice_label(choice)
         provider = _llm_choice_provider(choice)
         provider_name = provider
+        current_text = text
 
         max_retries = 3
         backoff = 1.0
         busy = False
         for attempt in range(1, max_retries + 1):
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Файл: {filename}\nФрагмент текста:\n{current_text}"},
+            ]
             try:
                 _provider, response = _llm_send_chat(
                     choice,
                     messages,
                     temperature=0.0,
-                    max_tokens=800,
+                    max_tokens=min(800, LM_MAX_OUTPUT_TOKENS),
                     timeout=120,
                 )
                 if _llm_response_indicates_busy(response):
@@ -3171,6 +3253,18 @@ def call_lmstudio_for_metadata(text: str, filename: str):
             except requests.exceptions.RequestException as e:
                 last_error = e
                 app.logger.warning(f"Исключение при запросе к LLM ({label}, {provider_name}, попытка {attempt}): {e}")
+                if isinstance(e, requests.HTTPError):
+                    resp = getattr(e, 'response', None)
+                    detail = ''
+                    if resp is not None:
+                        try:
+                            detail = resp.text or ''
+                        except Exception:
+                            detail = ''
+                    if detail and 'number of tokens to keep' in detail.lower() and len(current_text) > 800:
+                        current_text = current_text[: max(len(current_text) // 2, 800)]
+                        app.logger.info(f"LLM metadata: сокращаем контекст до {len(current_text)} символов и повторяем")
+                        continue
                 if attempt < max_retries:
                     import time
                     time.sleep(backoff)
@@ -3969,6 +4063,7 @@ def api_settings():
     global IMPORT_SUBDIR, MOVE_ON_RENAME, TYPE_DIRS, DEFAULT_USE_LLM, DEFAULT_PRUNE
     global OCR_LANGS_CFG, PDF_OCR_PAGES_CFG, ALWAYS_OCR_FIRST_PAGE_DISSERTATION
     global PROMPTS, AI_RERANK_LLM, COLLECTIONS_IN_SEPARATE_DIRS, COLLECTION_TYPE_SUBDIRS
+    provider_default = globals().get('LM_DEFAULT_PROVIDER', 'openai')
     if request.method == 'GET':
         _ensure_llm_schema_once()
         # включаем коллекции для интерфейса React
@@ -4002,7 +4097,7 @@ def api_settings():
                 'weight': float(ep.weight or 0.0),
                 'purpose': ep.purpose,
                 'purposes': _llm_parse_purposes(ep.purpose),
-                'provider': (ep.provider or LM_DEFAULT_PROVIDER),
+                'provider': (ep.provider or provider_default),
             } for ep in llms]
         except Exception:
             llm_items = []
@@ -4021,7 +4116,7 @@ def api_settings():
             'lm_base': LMSTUDIO_API_BASE,
             'lm_model': LMSTUDIO_MODEL,
             'lm_key': LMSTUDIO_API_KEY,
-            'lm_provider': LM_DEFAULT_PROVIDER,
+            'lm_provider': provider_default,
             'transcribe_enabled': bool(TRANSCRIBE_ENABLED),
             'transcribe_backend': TRANSCRIBE_BACKEND,
             'transcribe_model': TRANSCRIBE_MODEL_PATH,
@@ -4055,7 +4150,7 @@ def api_settings():
     prev_base = (LMSTUDIO_API_BASE or '').strip()
     prev_model = (LMSTUDIO_MODEL or '').strip()
     prev_key = (LMSTUDIO_API_KEY or '').strip()
-    prev_provider = LM_DEFAULT_PROVIDER
+    prev_provider = provider_default
     SCAN_ROOT = Path(data.get('scan_root') or SCAN_ROOT)
     app.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
     EXTRACT_TEXT = bool(data.get('extract_text', EXTRACT_TEXT))
@@ -4472,9 +4567,62 @@ def _cleanup_old_tasks() -> None:
         app.logger.warning(f"[tasks] cleanup failed: {exc}")
 
 
-@app.route('/api/admin/tasks', methods=['GET'])
+@app.route('/api/admin/tasks', methods=['GET', 'DELETE'])
 @require_admin
 def api_admin_tasks():
+    if request.method == 'DELETE':
+        payload = request.get_json(silent=True) or {}
+        status_key = str(request.args.get('status') or payload.get('status') or 'final').strip().lower()
+        before_raw = str(request.args.get('before') or payload.get('before') or '').strip()
+        status_map: dict[str, tuple[str, ...] | None] = {
+            'final': TASK_FINAL_STATUSES,
+            'done': TASK_FINAL_STATUSES,
+            'completed': ('completed',),
+            'complete': ('completed',),
+            'errors': ('error',),
+            'error': ('error',),
+            'failed': ('error',),
+            'cancelled': ('cancelled',),
+            'canceled': ('cancelled',),
+            'all': None,
+            'any': None,
+        }
+        statuses = status_map.get(status_key or 'final')
+        if statuses is None and status_key not in ('all', 'any'):
+            return jsonify({'ok': False, 'error': 'unsupported_status'}), 400
+        cutoff: datetime | None = None
+        if before_raw:
+            try:
+                if len(before_raw) <= 10:
+                    cutoff = datetime.strptime(before_raw, '%Y-%m-%d') + timedelta(days=1)
+                else:
+                    cutoff = datetime.fromisoformat(before_raw)
+            except Exception:
+                return jsonify({'ok': False, 'error': 'invalid_datetime'}), 400
+        query = TaskRecord.query
+        if statuses:
+            query = query.filter(TaskRecord.status.in_(statuses))
+        elif status_key not in ('all', 'any'):
+            query = query.filter(TaskRecord.status.in_(TASK_FINAL_STATUSES))
+        if cutoff is not None:
+            query = query.filter(TaskRecord.created_at.isnot(None)).filter(TaskRecord.created_at < cutoff)
+        try:
+            deleted = query.delete(synchronize_session=False)
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            app.logger.warning(f"[tasks] bulk delete failed: {exc}")
+            return jsonify({'ok': False, 'error': 'delete_failed'}), 500
+        actor = _load_current_user()
+        detail_payload = {'deleted': deleted, 'status': status_key or 'final'}
+        if cutoff is not None:
+            detail_payload['before'] = cutoff.isoformat()
+        try:
+            _log_user_action(actor, 'task_cleanup', 'task', None, detail=json.dumps(detail_payload))
+        except Exception:
+            pass
+        app.logger.info(f"[tasks] bulk delete {deleted} records (status={status_key or 'final'}, before={cutoff.isoformat() if cutoff else '—'})")
+        return jsonify({'ok': True, 'deleted': deleted})
     try:
         limit = int(request.args.get('limit', '50'))
     except Exception:
@@ -4544,6 +4692,106 @@ def api_admin_task_detail(task_id: int):
             pass
     db.session.commit()
     return jsonify({'ok': True, 'task': _task_to_dict(task)})
+
+
+@app.route('/api/admin/system-logs', methods=['GET', 'DELETE'])
+@require_admin
+def api_admin_system_logs():
+    if request.method == 'DELETE':
+        payload = request.get_json(silent=True) or {}
+        name = str(request.args.get('name') or payload.get('name') or LOG_FILE_PATH.name).strip()
+        path = _resolve_log_name(name)
+        if not path:
+            return jsonify({'ok': False, 'error': 'log_not_found'}), 404
+        try:
+            with path.open('w', encoding='utf-8') as fh:
+                fh.truncate(0)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 500
+        handler = _get_rotating_log_handler()
+        if handler and Path(getattr(handler, 'baseFilename', '')).resolve() == path.resolve():
+            handler.acquire()
+            try:
+                handler.flush()
+                stream = getattr(handler, 'stream', None)
+                if stream:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                handler.stream = handler._open()
+            finally:
+                handler.release()
+        actor = _load_current_user()
+        try:
+            detail = json.dumps({'name': path.name, 'action': 'truncate'})
+        except Exception:
+            detail = None
+        _log_user_action(actor, 'system_log_clear', 'log', None, detail=detail)
+        app.logger.info(f"[logs] {getattr(actor, 'username', 'admin')} truncated log {path.name}")
+        return jsonify({'ok': True, 'files': _list_system_log_files()})
+
+    try:
+        limit = int(request.args.get('limit', '200'))
+    except Exception:
+        limit = 200
+    limit = max(10, min(limit, 2000))
+    name = str(request.args.get('name') or '').strip()
+    path = _resolve_log_name(name) or LOG_FILE_PATH
+    if not path.exists():
+        return jsonify({'ok': False, 'error': 'log_not_found'}), 404
+    available_files = _list_system_log_files()
+    selected = next((entry for entry in available_files if entry.get('name') == path.name), None)
+    if not selected:
+        try:
+            stat = path.stat()
+            selected = {
+                'name': path.name,
+                'size': stat.st_size,
+                'modified_at': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                'rotated': path.name != LOG_FILE_PATH.name,
+            }
+        except Exception:
+            selected = {'name': path.name, 'rotated': path.name != LOG_FILE_PATH.name}
+    lines = _tail_log_file(path, limit)
+    return jsonify({'ok': True, 'file': selected, 'lines': lines, 'available': available_files, 'limit': limit})
+
+
+@app.route('/api/admin/system-logs/rotate', methods=['POST'])
+@require_admin
+def api_admin_system_logs_rotate():
+    handler = _get_rotating_log_handler()
+    if not handler:
+        return jsonify({'ok': False, 'error': 'rotation_unavailable'}), 400
+    handler.acquire()
+    try:
+        handler.flush()
+        handler.doRollover()
+        if handler.stream is None:
+            handler.stream = handler._open()
+    except Exception as exc:
+        handler.release()
+        app.logger.warning(f"[logs] manual rotation failed: {exc}")
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+    handler.release()
+    actor = _load_current_user()
+    try:
+        detail = json.dumps({'name': LOG_FILE_PATH.name, 'action': 'rotate'})
+    except Exception:
+        detail = None
+    _log_user_action(actor, 'system_log_rotate', 'log', None, detail=detail)
+    app.logger.info(f"[logs] {getattr(actor, 'username', 'admin')} rotated system log")
+    return jsonify({'ok': True, 'files': _list_system_log_files()})
+
+
+@app.route('/api/admin/system-logs/download', methods=['GET'])
+@require_admin
+def api_admin_system_logs_download():
+    name = str(request.args.get('name') or LOG_FILE_PATH.name).strip()
+    path = _resolve_log_name(name)
+    if not path:
+        abort(404)
+    return send_file(path, mimetype='text/plain', as_attachment=True, download_name=path.name, conditional=True)
 
 
 @app.route('/api/admin/actions', methods=['GET', 'DELETE'])
@@ -5733,18 +5981,58 @@ def api_collection_rename_all(collection_id: int):
     return jsonify({'ok': True, 'renamed': renamed, 'errors': errors})
 
 
-def _delete_collection_files(col_id: int) -> tuple[int, list[str]]:
+@app.route('/api/collections/<int:collection_id>/clear', methods=['POST'])
+@require_admin
+def api_collection_clear(collection_id: int):
+    col = Collection.query.get_or_404(collection_id)
+    removed_files, errors = _delete_collection_files(collection_id)
+    try:
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+    actor = _load_current_user()
+    try:
+        detail = json.dumps({'removed_files': removed_files, 'errors': len(errors)})
+    except Exception:
+        detail = None
+    _log_user_action(actor, 'collection_clear', 'collection', col.id, detail=detail)
+    if errors:
+        app.logger.warning(f"[collections] clear reported {len(errors)} issues for collection {collection_id}: {errors[:3]}")
+    return jsonify({'ok': True, 'removed_files': removed_files, 'errors': errors})
+
+
+def _delete_collection_files(col_id: int, remove_fs: bool = True) -> tuple[int, list[str]]:
     files = File.query.filter(File.collection_id == col_id).all()
     removed = 0
     errors: list[str] = []
+    static_folder = Path(app.static_folder or (BASE_DIR / 'static'))
+    thumbs_dir = static_folder / 'thumbnails'
+    cache_dir = static_folder / 'cache' / 'text_excerpts'
     for f in files:
         path = Path(f.path) if f.path else None
-        if path and path.exists():
+        if remove_fs and path and path.exists():
             try:
                 path.unlink()
                 removed += 1
             except Exception as exc:
-                errors.append(f"{path}: {exc}")
+                errors.append(f"fs:{path}:{exc}")
+        rel_path = Path(f.rel_path) if f.rel_path else None
+        if rel_path:
+            try:
+                thumb = thumbs_dir / (rel_path.stem + '.png')
+                if thumb.exists():
+                    thumb.unlink()
+            except Exception as exc:
+                errors.append(f"thumb:{rel_path}:{exc}")
+        try:
+            key_base = f.sha1 or (f.rel_path or '').replace('/', '_')
+            if key_base:
+                cache_file = cache_dir / f"{key_base}.txt"
+                if cache_file.exists():
+                    cache_file.unlink()
+        except Exception as exc:
+            errors.append(f"cache:{f.id}:{exc}")
         db.session.delete(f)
     return removed, errors
 
@@ -6841,13 +7129,6 @@ class _ProgressLogger:
 
 
 
-def _format_sse(payload: dict) -> str:
-    try:
-        return 'data: ' + json.dumps(payload, ensure_ascii=False) + '\n\n'
-    except Exception:
-        return 'data: {}\n\n'
-
-
 def _tokenize_query(q: str) -> list[str]:
     s = (q or '').lower()
     # оставляем буквы, цифры, дефис, подчёркивание; разделяем по остальным символам
@@ -7402,7 +7683,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 snippet_text = ""
                 error_logged = False
                 try:
-                    snippet_text = (call_lmstudio_compose(system, user_msg, temperature=0.0, max_tokens=180) or '').strip()
+                    snippet_text = (call_lmstudio_compose(system, user_msg, temperature=0.0, max_tokens=min(180, LM_MAX_OUTPUT_TOKENS)) or '').strip()
                 except Exception as exc:
                     error_logged = True
                     progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — ошибка: {exc}")
@@ -7437,7 +7718,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 "Ссылайся на источники квадратными скобками [n] там, где берешь факт. Не упоминай слова 'стенограмма' или подобные."
             )
             user_msg = f"Вопрос: {query}\nФрагменты:\n" + "\n".join(lines)
-            answer = (call_lmstudio_compose(system, user_msg, temperature=0.1, max_tokens=350) or "").strip()
+            answer = (call_lmstudio_compose(system, user_msg, temperature=0.1, max_tokens=min(350, LM_MAX_OUTPUT_TOKENS)) or "").strip()
             if answer:
                 progress.add(f"LLM ответ готов ({len(answer)} символов)")
             else:
@@ -7565,88 +7846,6 @@ def api_ai_search():
         logger.exception("AI search failed", exc_info=True)
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"ok": True, **result})
-
-
-@app.route('/api/ai-search/stream', methods=['POST'])
-def api_ai_search_stream():
-    data = request.get_json(silent=True) or {}
-    user = _load_current_user()
-    query_preview = str(data.get('query') or '').strip()[:200]
-    detail_obj = {
-        'query_preview': query_preview,
-        'top_k': data.get('top_k'),
-        'deep_search': data.get('deep_search'),
-        'sources': data.get('sources'),
-        'stream': True,
-    }
-    try:
-        detail_payload = json.dumps(detail_obj, ensure_ascii=False)
-    except Exception:
-        detail_payload = str(detail_obj)
-    try:
-        _log_user_action(user, 'ai_search_stream', 'search', None, detail=detail_payload[:2000])
-    except Exception:
-        pass
-    try:
-        app.logger.info(
-            "[user-action] user=%s action=ai_search_stream query_preview=%s top_k=%s deep_search=%s",
-            getattr(user, 'username', None) or 'anonymous',
-            query_preview,
-            detail_obj.get('top_k'),
-            detail_obj.get('deep_search')
-        )
-    except Exception:
-        pass
-    queue: Queue = Queue()
-
-    def emit(line: str) -> None:
-        queue.put({'type': 'progress', 'line': line})
-
-    def worker() -> None:
-        try:
-            result = _ai_search_core(data, progress_cb=emit)
-            queue.put({'type': 'result', 'payload': result})
-        except ValueError as exc:
-            queue.put({'type': 'error', 'message': str(exc), 'status': 400})
-        except Exception as exc:
-            logger.exception("AI search stream failed", exc_info=True)
-            queue.put({'type': 'error', 'message': str(exc), 'status': 500})
-        finally:
-            queue.put({'type': 'done'})
-
-    worker_wrapped = copy_current_app_context(worker)
-    threading.Thread(target=worker_wrapped, daemon=True).start()
-
-    def event_stream():
-        yield ': init\n\n'
-        while True:
-            event = queue.get()
-            typ = event.get('type')
-            if typ == 'progress':
-                yield _format_sse({'type': 'progress', 'line': event.get('line')})
-            elif typ == 'result':
-                payload = event.get('payload') or {}
-                yield _format_sse({'type': 'result', 'payload': payload})
-            elif typ == 'error':
-                payload = {'type': 'error', 'message': event.get('message', 'unknown')}
-                status = event.get('status')
-                if status:
-                    payload['status'] = status
-                yield _format_sse(payload)
-            elif typ == 'done':
-                yield 'data: [DONE]\n\n'
-                break
-
-    resp = Response(stream_with_context(event_stream()), mimetype='text/event-stream')
-    try:
-        resp.headers['Cache-Control'] = 'no-cache'
-        resp.headers['X-Accel-Buffering'] = 'no'
-        resp.headers['Connection'] = 'keep-alive'
-    except Exception:
-        pass
-    return resp
-
-
 @app.route('/api/ai-search/feedback', methods=['POST'])
 def api_ai_search_feedback():
     user = _load_current_user()
