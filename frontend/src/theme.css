@@ -23,7 +23,7 @@
   --frosted-surface: rgba(17, 31, 61, 0.78);
   --tag-bg: color-mix(in srgb, var(--surface-hover) 70%, var(--accent) 30%);
   --tag-text: color-mix(in srgb, var(--text) 92%, #ffffff 8%);
-  --tag-border: color-mix(in srgb, var(--accent) 32%, transparent);
+  --tag-border: color-mix(in srgb, var(--accent) 32%, var(--bg));
   --bs-body-bg: var(--bg);
   --bs-body-color: var(--text);
   --bs-border-color: var(--border);
@@ -53,7 +53,7 @@
   --frosted-surface: rgba(255, 255, 255, 0.92);
   --tag-bg: color-mix(in srgb, var(--surface-hover) 92%, var(--accent) 8%);
   --tag-text: color-mix(in srgb, var(--accent) 52%, var(--text) 48%);
-  --tag-border: color-mix(in srgb, var(--accent) 22%, transparent);
+  --tag-border: color-mix(in srgb, var(--accent) 22%, var(--bg));
   --bs-body-bg: var(--bg);
   --bs-body-color: var(--text);
   --bs-border-color: var(--border);
@@ -61,11 +61,14 @@
 
 html, body {
   min-height: 100%;
-  background: radial-gradient(140% 120% at 12% 10%, rgba(62, 130, 247, 0.14), transparent 58%),
-              radial-gradient(120% 140% at 82% 6%, rgba(14, 165, 233, 0.1), transparent 52%),
-              linear-gradient(180deg, color-mix(in srgb, var(--bg) 94%, transparent) 0%, var(--bg) 100%);
+  background-color: var(--bg);
+  background-image: radial-gradient(140% 120% at 12% 10%, rgba(62, 130, 247, 0.14), var(--bg) 55%),
+                    radial-gradient(120% 140% at 82% 6%, rgba(14, 165, 233, 0.1), var(--bg) 50%),
+                    linear-gradient(180deg, color-mix(in srgb, var(--bg) 92%, var(--bg-soft) 8%) 0%, var(--bg) 100%);
+  background-repeat: no-repeat;
+  background-attachment: fixed;
   color: var(--text);
-  transition: background 0.3s ease, color 0.3s ease;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 html[data-theme="light"],
@@ -92,7 +95,7 @@ a:hover, a:focus { color: var(--primary); }
 }
 
 ::-webkit-scrollbar-track {
-  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  background: color-mix(in srgb, var(--surface) 82%, var(--bg));
   border-radius: 999px;
 }
 
@@ -106,9 +109,9 @@ a:hover, a:focus { color: var(--primary); }
 }
 
 .navbar {
-  background: color-mix(in srgb, var(--surface-raised) 88%, transparent) !important;
+  background: color-mix(in srgb, var(--surface-raised) 88%, var(--bg)) !important;
   backdrop-filter: blur(18px);
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, var(--bg));
   position: sticky;
   top: 0;
   z-index: 1200;
@@ -123,24 +126,24 @@ a:hover, a:focus { color: var(--primary); }
 .toast,
 .modal-content,
 .list-group-item {
-  background: color-mix(in srgb, var(--surface) 94%, transparent) !important;
+  background: color-mix(in srgb, var(--surface) 94%, var(--bg)) !important;
   color: color-mix(in srgb, var(--text) 96%, var(--text-strong) 4%) !important;
 }
 
 .bg-body-secondary {
-  border-color: color-mix(in srgb, var(--border) 70%, transparent) !important;
+  border-color: color-mix(in srgb, var(--border) 70%, var(--bg)) !important;
 }
 
 .bg-body-tertiary {
-  background: color-mix(in srgb, var(--surface-hover) 92%, transparent) !important;
-  border-color: color-mix(in srgb, var(--border) 60%, transparent) !important;
+  background: color-mix(in srgb, var(--surface-hover) 92%, var(--bg)) !important;
+  border-color: color-mix(in srgb, var(--border) 60%, var(--bg)) !important;
 }
 
 pre,
 code,
 .code-block {
   color: color-mix(in srgb, var(--text) 96%, var(--text-strong) 4%);
-  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
 }
 
 .form-control,
@@ -148,9 +151,9 @@ code,
 .form-check-input,
 .form-control-plaintext,
 .input-group-text {
-  background: color-mix(in srgb, var(--surface-raised) 90%, transparent);
+  background: color-mix(in srgb, var(--surface-raised) 90%, var(--bg));
   color: var(--text);
-  border-color: color-mix(in srgb, var(--border) 80%, transparent);
+  border-color: color-mix(in srgb, var(--border) 80%, var(--bg));
   transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
 }
 
@@ -160,9 +163,9 @@ input[type="file"] {
 
 input[type="file"]::file-selector-button,
 input[type="file"]::-webkit-file-upload-button {
-  background: color-mix(in srgb, var(--surface-hover) 90%, transparent);
+  background: color-mix(in srgb, var(--surface-hover) 90%, var(--bg));
   color: color-mix(in srgb, var(--text) 85%, var(--text-strong) 15%);
-  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 75%, var(--bg));
   border-radius: 10px;
   padding: 5px 14px;
   margin-right: 12px;
@@ -177,7 +180,7 @@ input[type="file"]::-webkit-file-upload-button:hover,
 input[type="file"]::-webkit-file-upload-button:focus {
   background: color-mix(in srgb, var(--surface-hover) 82%, var(--accent) 18%);
   color: var(--text-strong);
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--bg));
   box-shadow: 0 10px 22px rgba(37, 99, 235, 0.18);
   transform: translateY(-1px);
 }
@@ -191,7 +194,7 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 }
 
 .form-control::placeholder {
-  color: color-mix(in srgb, var(--muted) 80%, transparent);
+  color: color-mix(in srgb, var(--muted) 80%, var(--text));
 }
 
 .form-control:focus,
@@ -204,8 +207,8 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 .form-control:disabled,
 .form-select:disabled,
 .input-group-text:has(.form-control:disabled) {
-  background: color-mix(in srgb, var(--surface) 72%, transparent);
-  color: color-mix(in srgb, var(--muted) 72%, transparent);
+  background: color-mix(in srgb, var(--surface) 72%, var(--bg));
+  color: color-mix(in srgb, var(--muted) 72%, var(--text));
 }
 
 .btn-primary {
@@ -227,14 +230,14 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 .btn-outline-secondary,
 .btn-outline-secondary:focus-visible {
   color: color-mix(in srgb, var(--text) 88%, var(--text-strong) 12%);
-  border-color: color-mix(in srgb, var(--border-strong) 65%, transparent);
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border-color: color-mix(in srgb, var(--border-strong) 65%, var(--bg));
+  background: color-mix(in srgb, var(--surface) 88%, var(--bg));
   transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
 }
 
 .btn-outline-secondary:hover,
 .btn-outline-secondary:focus {
-  background: color-mix(in srgb, var(--surface-hover) 92%, transparent);
+  background: color-mix(in srgb, var(--surface-hover) 92%, var(--bg));
   color: var(--text-strong);
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong) 55%);
   transform: translateY(-1px);
@@ -257,83 +260,83 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 .btn-outline-warning,
 .btn-outline-danger {
   transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
-  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  background: color-mix(in srgb, var(--surface) 90%, var(--bg));
   color: currentColor;
 }
 
 .btn-outline-primary {
   color: color-mix(in srgb, var(--accent) 82%, var(--text) 18%);
-  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--bg));
 }
 
 .btn-outline-primary:hover,
 .btn-outline-primary:focus {
   background: color-mix(in srgb, var(--accent) 18%, var(--surface));
   color: color-mix(in srgb, var(--text-strong) 80%, white 20%);
-  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--bg));
   transform: translateY(-1px);
   box-shadow: 0 10px 24px rgba(37, 99, 235, 0.18);
 }
 
 .btn-outline-success {
   color: color-mix(in srgb, var(--success) 78%, var(--text) 22%);
-  border-color: color-mix(in srgb, var(--success) 55%, transparent);
+  border-color: color-mix(in srgb, var(--success) 55%, var(--bg));
 }
 
 .btn-outline-success:hover,
 .btn-outline-success:focus {
   background: color-mix(in srgb, var(--success) 20%, var(--surface));
   color: color-mix(in srgb, var(--text-strong) 85%, white 15%);
-  border-color: color-mix(in srgb, var(--success) 70%, transparent);
+  border-color: color-mix(in srgb, var(--success) 70%, var(--bg));
   transform: translateY(-1px);
   box-shadow: 0 10px 24px rgba(34, 197, 94, 0.16);
 }
 
 .btn-outline-info {
   color: color-mix(in srgb, var(--accent) 75%, var(--text) 25%);
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--bg));
 }
 
 .btn-outline-info:hover,
 .btn-outline-info:focus {
   background: color-mix(in srgb, var(--accent) 16%, var(--surface));
   color: color-mix(in srgb, var(--text-strong) 80%, white 20%);
-  border-color: color-mix(in srgb, var(--accent) 68%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 68%, var(--bg));
   transform: translateY(-1px);
   box-shadow: 0 10px 24px rgba(14, 165, 233, 0.16);
 }
 
 .btn-outline-warning {
   color: color-mix(in srgb, var(--warning) 78%, var(--text) 22%);
-  border-color: color-mix(in srgb, var(--warning) 52%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 52%, var(--bg));
 }
 
 .btn-outline-warning:hover,
 .btn-outline-warning:focus {
   background: color-mix(in srgb, var(--warning) 20%, var(--surface));
   color: color-mix(in srgb, var(--text-strong) 85%, white 15%);
-  border-color: color-mix(in srgb, var(--warning) 68%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 68%, var(--bg));
   transform: translateY(-1px);
   box-shadow: 0 10px 24px rgba(245, 158, 11, 0.2);
 }
 
 .btn-outline-danger {
   color: color-mix(in srgb, var(--danger) 78%, var(--text) 22%);
-  border-color: color-mix(in srgb, var(--danger) 58%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 58%, var(--bg));
 }
 
 .btn-outline-danger:hover,
 .btn-outline-danger:focus {
   background: color-mix(in srgb, var(--danger) 18%, var(--surface));
   color: color-mix(in srgb, var(--text-strong) 90%, white 10%);
-  border-color: color-mix(in srgb, var(--danger) 70%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 70%, var(--bg));
   transform: translateY(-1px);
   box-shadow: 0 10px 24px rgba(248, 113, 113, 0.2);
 }
 
 .card {
-  background: color-mix(in srgb, var(--surface-raised) 94%, transparent);
-  border-color: color-mix(in srgb, var(--border) 78%, transparent);
+  background: color-mix(in srgb, var(--surface-raised) 94%, var(--bg));
+  border-color: color-mix(in srgb, var(--border) 78%, var(--bg));
   box-shadow: var(--card-shadow);
   border-radius: 16px;
   transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
@@ -341,15 +344,15 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 
 .card-header,
 .card-footer {
-  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
   border-color: var(--border);
 }
 
 .media-frame {
-  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, var(--bg));
   border-radius: 12px;
   padding: 6px;
-  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
 }
 
 .media-frame audio {
@@ -380,8 +383,8 @@ input[type="file"]:disabled::-webkit-file-upload-button {
   color: var(--text);
   border-color: var(--border);
   --bs-table-bg: var(--surface);
-  --bs-table-striped-bg: color-mix(in srgb, var(--surface) 85%, transparent);
-  --bs-table-hover-bg: color-mix(in srgb, var(--surface) 78%, transparent);
+  --bs-table-striped-bg: color-mix(in srgb, var(--surface) 85%, var(--bg));
+  --bs-table-hover-bg: color-mix(in srgb, var(--surface) 78%, var(--bg));
   --bs-table-striped-color: var(--text);
   --bs-table-hover-color: var(--text);
 }
@@ -390,12 +393,12 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 .list-group-item,
 .modal-content,
 .toast {
-  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+  border-color: color-mix(in srgb, var(--border) 70%, var(--bg));
 }
 
 .modal-header,
 .modal-footer {
-  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+  border-color: color-mix(in srgb, var(--border) 70%, var(--bg));
 }
 
 .list-group-item {
@@ -403,7 +406,7 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 }
 
 .list-group-item:hover {
-  background: color-mix(in srgb, var(--surface-hover) 90%, transparent);
+  background: color-mix(in srgb, var(--surface-hover) 90%, var(--bg));
   color: var(--text-strong);
 }
 
@@ -412,12 +415,182 @@ input[type="file"]:disabled::-webkit-file-upload-button {
   border-color: var(--primary-2);
 }
 
+.form-switch {
+  --switch-width: 35px;
+  --switch-height: 18px;
+  --switch-padding: 4px;
+  --switch-track-off: color-mix(in srgb, var(--surface) 65%, var(--bg));
+  --switch-track-on: color-mix(in srgb, var(--primary) 85%, var(--primary-2) 15%);
+  --switch-track-disabled: color-mix(in srgb, var(--surface) 55%, var(--bg));
+  --switch-handle: color-mix(in srgb, var(--surface) 96%, #ffffff 4%);
+  --switch-handle-checked: color-mix(in srgb, var(--surface) 86%, #ffffff 14%);
+  --switch-handle-disabled: color-mix(in srgb, var(--surface) 84%, var(--bg));
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding-left: 0;
+  min-height: var(--switch-height);
+}
+
 .form-switch .form-check-input {
-  background-color: color-mix(in srgb, var(--surface) 65%, transparent);
+  position: relative;
+  width: var(--switch-width);
+  height: var(--switch-height);
+  margin-left: 0;
+  margin-right: 0;
+  flex-shrink: 0;
+  background-color: var(--switch-track-off);
+  border: 1px solid color-mix(in srgb, var(--border) 75%, var(--bg));
+  border-radius: var(--switch-height);
+  background-image: none;
+  appearance: none;
+  cursor: pointer;
+  transition: background-color 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+.form-switch .form-check-input::after {
+  content: "";
+  position: absolute;
+  top: var(--switch-padding);
+  left: var(--switch-padding);
+  width: calc(var(--switch-height) - var(--switch-padding) * 2);
+  height: calc(var(--switch-height) - var(--switch-padding) * 2);
+  border-radius: 999px;
+  background: var(--switch-handle);
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.18);
+  transform: translateX(0);
+  transition: transform 0.25s ease, background 0.25s ease, box-shadow 0.25s ease;
+}
+
+.form-switch .form-check-input:hover::after {
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.2);
+}
+
+.form-switch .form-check-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 .form-switch .form-check-input:checked {
-  background-color: var(--primary);
+  background-color: var(--switch-track-on);
+  border-color: color-mix(in srgb, var(--primary-2) 82%, var(--bg));
+}
+
+.form-switch .form-check-input:checked::after {
+  transform: translateX(calc(var(--switch-width) - var(--switch-height)));
+  background: var(--switch-handle-checked);
+  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.2);
+}
+
+.form-switch .form-check-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+  background-color: var(--switch-track-disabled);
+  border-color: color-mix(in srgb, var(--border) 60%, var(--bg));
+}
+
+.form-switch .form-check-input:disabled::after {
+  background: var(--switch-handle-disabled);
+  box-shadow: none;
+}
+
+.form-switch .form-check-label {
+  margin-bottom: 0;
+  line-height: 1.2;
+}
+
+/* Admin facet settings layout tweaks */
+.facet-settings .facet-switch {
+  --switch-width: 32px;
+  --switch-height: 18px;
+  --switch-padding: 2px;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.facet-settings .facet-switch .form-check-input {
+  margin-top: 0;
+}
+
+.facet-settings .facet-switch .form-check-label {
+  line-height: 1.3;
+}
+
+.facet-settings .form-check .form-check-input {
+  position: static;
+  float: none;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.facet-settings .form-check-label {
+  margin-left: 0;
+  padding-left: 0;
+  font-size: 0.92rem;
+}
+
+.facet-settings .form-check {
+  margin-bottom: 0;
+}
+
+.facet-settings .facet-radio {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.facet-settings .facet-radio .form-check-input {
+  margin-top: 0;
+}
+
+.facet-settings .facet-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 4px 10px;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+  background-color: color-mix(in srgb, var(--surface) 94%, var(--bg));
+}
+
+.facet-settings .facet-option .form-check-input {
+  margin-top: 0;
+}
+
+.facet-settings .facet-option:hover {
+  background-color: color-mix(in srgb, var(--surface) 82%, var(--bg));
+  border-color: color-mix(in srgb, var(--primary-2) 35%, var(--bg));
+}
+
+.facet-settings .facet-option-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.facet-settings .facet-option .form-check-label {
+  font-size: 0.9rem;
+}
+
+.facet-settings .facet-option-count {
+  min-width: 32px;
+  text-align: right;
+  font-size: 0.8rem;
+}
+
+.facet-settings .compact-input .form-control,
+.facet-settings .compact-input .input-group > .btn {
+  padding-top: 0.35rem;
+  padding-bottom: 0.35rem;
+}
+
+.facet-settings .compact-input .form-control,
+.facet-settings .compact-input .form-select {
+  min-height: auto;
 }
 
 /* KPI widgets */
@@ -466,7 +639,7 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 /* Floating search */
-.floating-search { position: sticky; top: 8px; z-index: 1040; backdrop-filter: blur(4px); background: color-mix(in srgb, var(--surface) 92%, transparent); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; }
+.floating-search { position: sticky; top: 8px; z-index: 1040; backdrop-filter: blur(4px); background: color-mix(in srgb, var(--surface) 92%, var(--bg)); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; }
 
 /* Focus rings */
 *:focus { outline: 2px solid var(--accent) !important; outline-offset: 2px; }

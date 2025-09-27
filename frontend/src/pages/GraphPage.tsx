@@ -9,7 +9,7 @@ export default function GraphPage() {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [keys, setKeys] = useState<string[]>(['author'])
+  const [keys, setKeys] = useState<string[]>([])
   const [availableKeys, setAvailableKeys] = useState<string[]>([])
   const [view, setView] = useState<'graph'|'cloud'>('graph')
   const [facetData, setFacetData] = useState<Record<string,[string,number][]>>({})
@@ -88,17 +88,35 @@ export default function GraphPage() {
 
   // Load facets once to discover tag keys and counts for cloud
   useEffect(() => {
+    let cancelled = false
     const load = async () => {
       try {
-        const res = await fetch('/api/facets')
-        const data = await res.json()
-        const keys = Object.keys(data.tag_facets || {})
-        setAvailableKeys(keys)
-        setFacetData(data.tag_facets || {})
-        if (!keys.includes('author') && keys.length) setKeys([keys[0]])
-      } catch {}
+        const res = await fetch('/api/facets?context=graph')
+        const data = await res.json().catch(() => null)
+        if (cancelled || !data) return
+        const tagFacets = data.tag_facets && typeof data.tag_facets === 'object' ? data.tag_facets : {}
+        const allowed = Array.isArray(data.allowed_keys) ? data.allowed_keys : null
+        const derivedKeys = Object.keys(tagFacets)
+        const available = (allowed && allowed.length) ? allowed : derivedKeys
+        setFacetData(tagFacets)
+        setAvailableKeys(available)
+        setKeys(prev => {
+          const filtered = prev.filter(k => available.includes(k))
+          if (filtered.length) return filtered.slice(0, 3)
+          if (available.length) return available.slice(0, Math.min(3, available.length))
+          return []
+        })
+      } catch (error) {
+        if (!cancelled) {
+          console.error('graph facets error:', error)
+          setFacetData({})
+          setAvailableKeys([])
+          setKeys([])
+        }
+      }
     }
     load()
+    return () => { cancelled = true }
   }, [])
 
   function clearHighlight(){

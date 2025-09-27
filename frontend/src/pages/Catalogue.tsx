@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { materialTypeRu, tagKeyRu, materialTypeOptions, materialTypeSlug } from '../utils/locale'
+import { useToasts } from '../ui/Toasts'
 
 type Tag = { key: string; value: string }
 type FileItem = {
@@ -16,6 +17,13 @@ type FileItem = {
 }
 
 type CollectionOption = { id: number; name: string }
+
+type FacetData = {
+  types: [string | null, number][]
+  tag_facets: Record<string, [string, number][]>
+  include_types?: boolean
+  allowed_keys?: string[] | null
+}
 
 function useDebounced<T>(v: T, delay = 400) {
   const [val, setVal] = useState(v)
@@ -55,7 +63,7 @@ export default function Catalogue() {
   const [aiFullText, setAiFullText] = useState<boolean>(false)
   const [aiUseLlmSnippets, setAiUseLlmSnippets] = useState<boolean>(false)
   const [showAiSettings, setShowAiSettings] = useState<boolean>(false)
-  const [facets, setFacets] = useState<{ types: [string|null, number][], tag_facets: Record<string,[string,number][]> } | null>(null)
+  const [facets, setFacets] = useState<FacetData | null>(null)
   const [previewRel, setPreviewRel] = useState<string| null>(null)
   const [selectedTags, setSelectedTags] = useState<string[]>(() => sp.getAll('tag'))
   const [aiAnswer, setAiAnswer] = useState<string>('')
@@ -81,6 +89,7 @@ export default function Catalogue() {
   const [editItem, setEditItem] = useState<FileItem | null>(null)
   const [editForm, setEditForm] = useState<any>(null)
   const [collections, setCollections] = useState<CollectionOption[]>([])
+  const toasts = useToasts()
   const logAction = useCallback((message: string, level: 'info'|'error'|'success' = 'info') => {
     const prefixed = `[catalogue] ${message}`
     if (level === 'error') {
@@ -499,14 +508,36 @@ export default function Catalogue() {
   }, [params, offset, selectedTags, aiMode, commit, aiTopK, aiDeepSearch, aiUseTags, aiUseText, aiMaxCandidates, aiChunkChars, aiMaxChunks, aiMaxSnippets, aiFullText, aiUseLlmSnippets, dq, collectionId, type, year_from, year_to, page]);
 
   useEffect(() => {
+    let cancelled = false
     const load = async () => {
-      const p = new URLSearchParams(params)
-      selectedTags.forEach(t => p.append('tag', t))
-      const res = await fetch(`/api/facets?${p.toString()}`)
-      const data = await res.json()
-      setFacets(data)
+      try {
+        const p = new URLSearchParams(params)
+        p.delete('commit')
+        p.set('context', 'search')
+        selectedTags.forEach(t => p.append('tag', t))
+        const res = await fetch(`/api/facets?${p.toString()}`)
+        const data = await res.json().catch(() => null)
+        if (cancelled) return
+        if (res.ok && data) {
+          const payload: FacetData = {
+            types: Array.isArray(data.types) ? data.types : [],
+            tag_facets: data.tag_facets && typeof data.tag_facets === 'object' ? data.tag_facets : {},
+            include_types: data.include_types !== undefined ? Boolean(data.include_types) : true,
+            allowed_keys: Array.isArray(data.allowed_keys) ? data.allowed_keys : null,
+          }
+          setFacets(payload)
+        } else {
+          setFacets(null)
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error('facets error:', error)
+          setFacets(null)
+        }
+      }
     }
     load()
+    return () => { cancelled = true }
   }, [params, selectedTags])
 
   const pages = Math.max(Math.ceil(total / perPage), 1)
@@ -514,6 +545,15 @@ export default function Catalogue() {
     const next = selectedTags.filter((_, i) => i !== idx)
     setSelectedTags(next)
     sp.delete('tag'); next.forEach(t => sp.append('tag', t)); sp.set('page','1'); setSp(sp)
+  }
+
+  const handleResetFacets = () => {
+    if (!type && selectedTags.length === 0) return
+    setSelectedTags([])
+    sp.delete('tag')
+    sp.delete('type')
+    sp.set('page', '1')
+    setSp(sp)
   }
 
   const handleCollectionChange = (value: string) => {
@@ -537,53 +577,87 @@ export default function Catalogue() {
     return () => io.disconnect()
   }, [sentinelRef.current, loading, pages, localPage, aiMode])
 
+  const hasFacetFilters = Boolean(type) || selectedTags.length > 0
+
   return (
     <>
     <div className="row g-3">
       <div className="col-12 col-lg-3">
-        <div className="card p-3">
-          <div className="fw-semibold mb-2">Фильтры</div>
-          <div className="d-grid gap-2">
-            {/* Тип: выбор из списка типов */}
-            <select className="form-select" value={type} onChange={e => { const v=e.target.value; v?sp.set('type',v):sp.delete('type'); sp.set('page','1'); setSp(sp) }}>
-              <option value="">Все типы</option>
-              {(facets?.types||[]).map(([k],i)=> (
-                <option key={i} value={String(k||'')}>{materialTypeRu(k, 'Другое')}</option>
-              ))}
-            </select>
-            <div className="d-flex gap-2">
-              <input className="form-control" placeholder="Год с" value={year_from} onChange={e=>{ const v=e.target.value; v?sp.set('year_from',v):sp.delete('year_from'); sp.set('page','1'); setSp(sp) }} />
-              <input className="form-control" placeholder="Год по" value={year_to} onChange={e=>{ const v=e.target.value; v?sp.set('year_to',v):sp.delete('year_to'); sp.set('page','1'); setSp(sp) }} />
-            </div>
-            <div className="d-flex gap-2">
-              <input className="form-control" placeholder="Размер ≥ байт" value={size_min} onChange={e=>{ const v=e.target.value; v?sp.set('size_min',v):sp.delete('size_min'); sp.set('page','1'); setSp(sp) }} />
-              <input className="form-control" placeholder="Размер ≤ байт" value={size_max} onChange={e=>{ const v=e.target.value; v?sp.set('size_max',v):sp.delete('size_max'); sp.setSp(sp) }} />
-            </div>
+        <div className="card p-3" style={{ position: 'sticky', top: 8, maxHeight: 'calc(100vh - 120px)', overflow: 'auto' }}>
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <div className="fw-semibold">Фасеты</div>
+            <button className="btn btn-sm btn-outline-secondary" onClick={handleResetFacets} disabled={!hasFacetFilters}>
+              Сбросить
+            </button>
           </div>
-        </div>
-        <div className="card p-3 mt-3" style={{ position:'sticky', top:8, maxHeight:'calc(100vh - 120px)', overflow:'auto' }}>
-          <div className="fw-semibold mb-2">Фасеты</div>
           {!facets && <div className="text-secondary">Загрузка…</div>}
           {facets && (
-            <div>
-              <div className="mb-2">Типы:</div>
-              <div className="mb-3">
-                {facets.types.map(([k, c], i) => (
-                  <div key={i} className="d-flex justify-content-between">
-                    <button className="btn btn-sm btn-outline-secondary" onClick={()=>{ if(k){ sp.set('type', String(k)); sp.set('page','1'); setSp(sp) } }}>{materialTypeRu(k, 'Другое')}</button>
-                    <span className="text-secondary">{c}</span>
+            <div className="d-flex flex-column gap-3">
+              {facets.include_types !== false && facets.types.length > 0 && (
+                <div>
+                  <div className="mb-2">Типы:</div>
+                  <div className="d-flex flex-column gap-2">
+                    {facets.types.map(([k, c], i) => {
+                      const value = String(k || '')
+                      const active = type === value
+                      return (
+                        <button
+                          key={i}
+                          className={`btn btn-sm ${active ? 'btn-secondary' : 'btn-outline-secondary'} d-flex justify-content-between`}
+                          onClick={() => {
+                            if (active) {
+                              sp.delete('type')
+                            } else if (k) {
+                              sp.set('type', value)
+                            }
+                            sp.set('page', '1')
+                            setSp(sp)
+                          }}
+                        >
+                          <span>{materialTypeRu(k, 'Другое')}</span>
+                          <span className="text-secondary">{c}</span>
+                        </button>
+                      )
+                    })}
                   </div>
-                ))}
-              </div>
-              <div className="mb-2">Теги:</div>
+                </div>
+              )}
               <div>
+                <div className="mb-2">Теги:</div>
+                {Object.keys(facets.tag_facets).length === 0 && (
+                  <div className="text-secondary" style={{ fontSize: '0.9rem' }}>
+                    Нет доступных фасетов. Настройте их в разделе администрирования.
+                  </div>
+                )}
                 {Object.entries(facets.tag_facets).map(([key, values]) => (
-                  <div key={key} className="mb-2">
+                  <div key={key} className="mb-3">
                     <div className="text-secondary">{tagKeyRu(key)}</div>
-                    <div className="d-flex flex-wrap gap-2">
-                      {values.slice(0, 12).map(([val, cnt], i) => (
-                        <button key={i} className="btn btn-sm btn-outline-secondary" onClick={()=>{ const next=[...selectedTags, `${key}=${val}`]; setSelectedTags(next); sp.delete('tag'); next.forEach(x=>sp.append('tag',x)); sp.set('page','1'); setSp(sp) }}>{val} <span className="text-secondary">({cnt})</span></button>
-                      ))}
+                    <div className="d-flex flex-wrap gap-2 mt-1">
+                      {values.slice(0, 12).map(([val, cnt], i) => {
+                        const tagValue = `${key}=${val}`
+                        const active = selectedTags.includes(tagValue)
+                        return (
+                          <button
+                            key={i}
+                            className={`btn btn-sm ${active ? 'btn-secondary' : 'btn-outline-secondary'}`}
+                            onClick={() => {
+                              if (active) {
+                                const next = selectedTags.filter(x => x !== tagValue)
+                                setSelectedTags(next)
+                                sp.delete('tag'); next.forEach(x => sp.append('tag', x))
+                              } else {
+                                const next = [...selectedTags, tagValue]
+                                setSelectedTags(next)
+                                sp.delete('tag'); next.forEach(x => sp.append('tag', x))
+                              }
+                              sp.set('page', '1')
+                              setSp(sp)
+                            }}
+                          >
+                            {val} <span className="text-secondary">({cnt})</span>
+                          </button>
+                        )
+                      })}
                     </div>
                   </div>
                 ))}
@@ -1046,7 +1120,41 @@ export default function Catalogue() {
                       }catch(e:any){ toasts.push('Сбой сети при переименовании','error'); logAction(`NETWORK ${String(e)}`,'error') }
                     }} title="Автопереименование">✎</button>
                     <a className="btn btn-sm btn-outline-secondary" href={`/download/${encodeURIComponent(f.rel_path)}`}>Скачать</a>
-                    <button className="btn btn-sm btn-outline-danger ms-auto" onClick={async()=>{ if(!confirm('Удалить запись?')) return; const r=await fetch(`/api/files/${f.id}`, { method:'DELETE' }); if (r.status===204) location.reload() }} title="Удалить">✖</button>
+                    <button
+                      className="btn btn-sm btn-outline-danger ms-auto"
+                      onClick={async () => {
+                        if (!confirm('Удалить запись?')) return
+                        try {
+                          const resp = await fetch(`/api/files/${f.id}`, { method: 'DELETE' })
+                          if (resp.status === 204) {
+                            setItems(list => list.filter(x => x.id !== f.id))
+                            setTotal(count => Math.max(0, count - 1))
+                            setAiSources(src => (Array.isArray(src) ? src.filter((s: any) => s?.file_id !== f.id) : src))
+                            setFeedbackStatus(prev => {
+                              const next = { ...prev }
+                              Object.keys(next).forEach(key => {
+                                if (key.startsWith(`relevant:file-${f.id}`) || key.startsWith(`irrelevant:file-${f.id}`)) {
+                                  delete next[key]
+                                }
+                              })
+                              return next
+                            })
+                            if (previewRel === f.rel_path) setPreviewRel(null)
+                            toasts.push('Файл отправлен в удалённые', 'success')
+                          } else {
+                            const text = await resp.text().catch(() => '')
+                            console.error('delete failed', resp.status, text)
+                            toasts.push('Не удалось удалить файл', 'error')
+                          }
+                        } catch (error) {
+                          console.error('delete request failed', error)
+                          toasts.push('Сбой сети при удалении', 'error')
+                        }
+                      }}
+                      title="Удалить"
+                    >
+                      ✖
+                    </button>
                   </div>
                 )}
               </div>

@@ -2,10 +2,12 @@ from flask import Blueprint, jsonify, request, Response, g, abort
 from io import StringIO
 import csv
 from pathlib import Path
+from datetime import datetime
 import json
 
 from models import (File, Tag, db, upsert_tag, file_to_dict, ChangeLog,
-                    Collection, CollectionMember, User, UserActionLog)
+                    Collection, CollectionMember, User, UserActionLog,
+                    AiSearchSnippetCache, AiSearchKeywordFeedback)
 from flask import current_app
 from sqlalchemy import func
 import re
@@ -102,13 +104,13 @@ def _log_user_action(action: str, entity: str | None = None, entity_id: int | No
 
 
 def _can_write_collection(collection_id: int | None) -> bool:
-    if collection_id is None:
-        return False
     user = _current_user()
     if not user:
         return False
     if getattr(user, 'role', '') == 'admin':
         return True
+    if collection_id is None:
+        return False
     try:
         col = Collection.query.get(collection_id)
         if col and col.owner_id == user.id:
@@ -127,6 +129,30 @@ def _can_write_collection(collection_id: int | None) -> bool:
 def _require_collection_write(collection_id: int | None):
     if not _can_write_collection(collection_id):
         abort(403)
+
+
+def _resolve_trash_directory(base_dir: Path | None = None) -> Path | None:
+    base_dir = base_dir or Path(current_app.config.get('UPLOAD_FOLDER') or '.').expanduser()
+    try:
+        base_dir = base_dir.resolve()
+    except Exception:
+        pass
+    deleted_cfg = current_app.config.get('DELETED_FOLDER')
+    try:
+        trash_dir = Path(deleted_cfg).expanduser() if deleted_cfg else Path('_deleted')
+    except Exception:
+        trash_dir = Path('_deleted')
+    if not trash_dir.is_absolute():
+        try:
+            trash_dir = (base_dir / trash_dir).resolve()
+        except Exception:
+            trash_dir = base_dir / trash_dir
+    else:
+        try:
+            trash_dir = trash_dir.resolve()
+        except Exception:
+            pass
+    return trash_dir
 
 
 def _collection_to_dict(col: Collection, include_members: bool = False) -> dict:
@@ -213,6 +239,19 @@ def api_graph():
     """
     keys_param = (request.args.get('keys') or '').strip()
     tag_keys = [k.strip() for k in keys_param.split(',') if k.strip()] or ['author']
+    allowed_cfg = current_app.config.get('GRAPH_FACET_TAG_KEYS')
+    if isinstance(allowed_cfg, (list, tuple)):
+        allowed_keys = [str(v or '').strip() for v in allowed_cfg if str(v or '').strip()]
+    elif allowed_cfg is None:
+        allowed_keys = None
+    else:
+        allowed_keys = []
+    if allowed_keys is not None:
+        tag_keys = [k for k in tag_keys if k in allowed_keys]
+        if not tag_keys:
+            tag_keys = allowed_keys[:3] if allowed_keys else []
+    if not tag_keys:
+        tag_keys = ['author']
     try:
         limit = max(min(int(request.args.get('limit', '500')), 2000), 1)
     except Exception:
@@ -345,8 +384,17 @@ def api_file_create():
     db.session.flush()
     for tag in data.get("tags", []):
         upsert_tag(f, tag.get("key"), tag.get("value"))
+    db.session.flush()
+    try:
+        from app import _sync_file_to_fts
+        _sync_file_to_fts(f)
+    except Exception:
+        pass
     db.session.commit()
     _log_user_action('file_create', 'file', f.id, detail=str(data))
+    invalidate = current_app.config.get('invalidate_facets')
+    if callable(invalidate):
+        invalidate('file create')
     return jsonify(file_to_dict(f)), 201
 
 @routes.route("/api/files/<int:file_id>", methods=["PUT"])
@@ -406,6 +454,12 @@ def api_file_update(file_id):
                 pass
     except Exception as e:
         current_app.logger.warning(f"Auto-move on type change failed: {e}")
+    db.session.flush()
+    try:
+        from app import _sync_file_to_fts
+        _sync_file_to_fts(f)
+    except Exception:
+        pass
     db.session.commit()
     try:
         tag_snapshot = []
@@ -424,6 +478,9 @@ def api_file_update(file_id):
     except Exception:
         pass
     _log_user_action('file_update', 'file', f.id, detail=str(data))
+    invalidate = current_app.config.get('invalidate_facets')
+    if callable(invalidate):
+        invalidate('file update')
     return jsonify(file_to_dict(f))
 
 @routes.route('/api/files/move-by-type', methods=['POST'])
@@ -501,44 +558,118 @@ def api_move_by_type():
 
 @routes.route("/api/files/<int:file_id>", methods=["DELETE"])
 def api_file_delete(file_id):
-    _require_admin()
     f = File.query.get_or_404(file_id)
-    remove_fs = str(request.args.get('rm', '')).lower() in ('1','true','yes','on')
+    _require_collection_write(f.collection_id)
+    actor = _current_user()
+    remove_fs = str(request.args.get('rm', '')).lower() in ('1', 'true', 'yes', 'on')
 
-    # Опционально удалить сам файл; всегда удаляем производные артефакты
-    warnings = []
-    if remove_fs:
-        try:
-            fp = Path(f.path).resolve()
-            if fp.exists() and fp.is_file():
-                fp.unlink()
-        except Exception as e:
-            current_app.logger.warning(f"Failed to delete file on disk: {e}")
-            warnings.append(f"fs:{e}")
+    # Сохраняем необходимые данные до удаления записи
+    file_path = Path(f.path).expanduser() if f.path else None
+    rel_path_raw = (f.rel_path or '').strip()
+    sha1 = (f.sha1 or '').strip()
 
-    # Удалить сгенерированный thumbnail
+    # Чистим связанные записи вручную, чтобы избежать ошибок каскадного удаления в SQLite
     try:
-        thumb = Path(current_app.static_folder) / 'thumbnails' / (Path(f.rel_path).stem + '.png')
-        if thumb.exists():
-            thumb.unlink()
-    except Exception as e:
-        current_app.logger.warning(f"Failed to delete thumbnail: {e}")
-        warnings.append(f"thumb:{e}")
+        Tag.query.filter_by(file_id=f.id).delete(synchronize_session=False)
+        ChangeLog.query.filter_by(file_id=f.id).delete(synchronize_session=False)
+        AiSearchSnippetCache.query.filter_by(file_id=f.id).delete(synchronize_session=False)
+        AiSearchKeywordFeedback.query.filter_by(file_id=f.id).update({AiSearchKeywordFeedback.file_id: None}, synchronize_session=False)
+        db.session.delete(f)
+        db.session.commit()
+        try:
+            from app import _delete_file_from_fts
+            _delete_file_from_fts(file_id)
+        except Exception:
+            pass
+    except Exception as exc:
+        db.session.rollback()
+        current_app.logger.error(f"Failed to delete file record {file_id}: {exc}", exc_info=True)
+        return jsonify({'ok': False, 'error': 'Не удалось удалить запись из базы'}), 500
 
-    # Удалить кэшированный фрагмент текста
+    warnings: list[str] = []
+    moved_to: str | None = None
+
+    # Работа с файловой системой выполняется после успешного удаления из БД
+    if file_path and file_path.exists():
+        if remove_fs:
+            try:
+                file_path.unlink()
+            except Exception as exc:
+                current_app.logger.warning(f"Failed to delete file on disk: {exc}")
+                warnings.append(f"fs:{exc}")
+        else:
+            try:
+                base_dir = Path(current_app.config.get('UPLOAD_FOLDER') or '.').expanduser()
+                try:
+                    base_dir = base_dir.resolve()
+                except Exception:
+                    pass
+                trash_dir = _resolve_trash_directory(base_dir) or (base_dir / '_deleted')
+                try:
+                    trash_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+
+                rel_candidate: Path | None = None
+                if rel_path_raw:
+                    sanitized = rel_path_raw.replace('\\', '/').lstrip('/').strip()
+                    rel_parts = [p for p in sanitized.split('/') if p not in ('', '.', '..')]
+                    if rel_parts:
+                        rel_candidate = Path(*rel_parts)
+                if rel_candidate is None:
+                    try:
+                        rel_candidate = file_path.relative_to(base_dir)
+                    except Exception:
+                        rel_candidate = Path(file_path.name)
+
+                target_path = trash_dir / rel_candidate
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if target_path.exists():
+                    suffix = target_path.suffix
+                    stem = target_path.stem
+                    ts = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+                    target_path = target_path.with_name(f"{stem}_{ts}{suffix}")
+                file_path.rename(target_path)
+                moved_to = str(target_path)
+            except Exception as exc:
+                current_app.logger.warning(f"Failed to move file to trash: {exc}")
+                warnings.append(f"move:{exc}")
+    elif file_path:
+        warnings.append('fs:missing')
+
+    # Удаляем производные артефакты (thumbnail, текстовые фрагменты)
+    rel_path_for_artifacts = rel_path_raw
+    try:
+        thumb_base = Path(rel_path_for_artifacts).stem if rel_path_for_artifacts else None
+        if thumb_base:
+            thumb = Path(current_app.static_folder) / 'thumbnails' / (thumb_base + '.png')
+            if thumb.exists():
+                thumb.unlink()
+    except Exception as exc:
+        current_app.logger.warning(f"Failed to delete thumbnail: {exc}")
+        warnings.append(f"thumb:{exc}")
+
     try:
         cache_dir = Path(current_app.static_folder) / 'cache' / 'text_excerpts'
-        key = (f.sha1 or (f.rel_path or '').replace('/', '_')) + '.txt'
-        cache_file = cache_dir / key
-        if cache_file.exists():
-            cache_file.unlink()
-    except Exception as e:
-        current_app.logger.warning(f"Failed to delete cached excerpt: {e}")
-        warnings.append(f"cache:{e}")
+        safe_rel = rel_path_for_artifacts.replace('/', '_').replace('\\', '_') if rel_path_for_artifacts else ''
+        key_base = sha1 or safe_rel
+        if key_base:
+            cache_file = cache_dir / f"{key_base}.txt"
+            if cache_file.exists():
+                cache_file.unlink()
+    except Exception as exc:
+        current_app.logger.warning(f"Failed to delete cached excerpt: {exc}")
+        warnings.append(f"cache:{exc}")
 
-    db.session.delete(f)
-    db.session.commit()
-    # Всегда возвращаем успех для упрощения UI; проблемы пишем в лог
+    detail_parts = [f"rm={int(remove_fs)}", f"user={getattr(actor, 'id', None)}"]
+    if moved_to:
+        detail_parts.append(f"moved_to={moved_to}")
+    if warnings:
+        detail_parts.append(f"warnings={';'.join(warnings)}")
+    _log_user_action('file_delete', 'file', file_id, detail='; '.join(detail_parts))
+    invalidate = current_app.config.get('invalidate_facets')
+    if callable(invalidate):
+        invalidate('file delete')
     return "", 204
 
 @routes.route('/api/admin/collections', methods=['GET'])
