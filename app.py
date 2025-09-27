@@ -5,11 +5,13 @@ import re
 import json
 import hashlib
 import logging
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 import itertools
 
-from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort
+from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app
 from functools import wraps
 from werkzeug.utils import secure_filename
 import sqlite3
@@ -25,7 +27,8 @@ except ImportError:  # запасной вариант для старых ве�
             with current_app.app_context():
                 return func(*args, **kwargs)
         return wrapper
-from sqlalchemy import func, and_, or_
+from sqlalchemy import func, and_, or_, exists, text, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import aliased
 from models import (
     db,
@@ -46,6 +49,24 @@ from models import (
     AiSearchKeywordFeedback,
     AiSearchMetric,
 )
+
+
+@event.listens_for(Engine, "connect")
+def _configure_sqlite_pragmas(dbapi_connection, connection_record):
+    """Ensure required PRAGMA flags are enabled for SQLite connections."""
+    try:
+        import sqlite3 as _sqlite3
+    except Exception:
+        _sqlite3 = None
+    if _sqlite3 is not None and isinstance(dbapi_connection, _sqlite3.Connection):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys = 1")
+            cursor.execute("PRAGMA trusted_schema = 1")
+            cursor.execute("PRAGMA recursive_triggers = 1")
+        finally:
+            cursor.close()
+
 
 import fitz  # библиотека PyMuPDF
 import requests
@@ -102,6 +123,416 @@ except Exception:
     _morph = None
 
 logger = logging.getLogger(__name__)
+
+
+class TimedCache:
+    def __init__(self, max_items: int = 128, ttl: float = 60.0):
+        self.max_items = max(1, int(max_items))
+        self.ttl = float(ttl)
+        self._store: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _prune(self) -> None:
+        now = time.time()
+        dead = [key for key, (expires, _val) in self._store.items() if expires <= now]
+        for key in dead:
+            self._store.pop(key, None)
+        while len(self._store) > self.max_items:
+            self._store.popitem(last=False)
+
+    def get(self, key: tuple) -> object | None:
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            expires, value = item
+            if expires <= time.time():
+                self._store.pop(key, None)
+                return None
+            self._store.move_to_end(key)
+            return value
+
+    def set(self, key: tuple, value: object) -> None:
+        with self._lock:
+            self._store[key] = (time.time() + self.ttl, value)
+            self._store.move_to_end(key)
+            self._prune()
+
+    def get_or_set(self, key: tuple, factory):
+        cached = self.get(key)
+        if cached is not None:
+            return cached
+        value = factory()
+        self.set(key, value)
+        return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+
+FACET_CACHE = TimedCache(max_items=256, ttl=60)
+
+
+def _invalidate_facets_cache(reason: str | None = None) -> None:
+    try:
+        FACET_CACHE.clear()
+        if reason:
+            logger.debug('Facet cache invalidated: %s', reason)
+    except Exception:
+        pass
+
+
+def _current_allowed_collections() -> set[int] | None:
+    allowed = getattr(g, 'allowed_collection_ids', None)
+    if allowed is None:
+        return None
+    try:
+        return set(int(x) for x in allowed)
+    except Exception:
+        return None
+
+
+def _ensure_search_support() -> None:
+    """Create indexes, FTS tables and triggers to accelerate search."""
+    try:
+        with db.engine.begin() as conn:
+            statements = [
+                "CREATE INDEX IF NOT EXISTS idx_files_title_nocase ON files(title COLLATE NOCASE)",
+                "CREATE INDEX IF NOT EXISTS idx_files_author_nocase ON files(author COLLATE NOCASE)",
+                "CREATE INDEX IF NOT EXISTS idx_files_keywords_nocase ON files(keywords COLLATE NOCASE)",
+                "CREATE INDEX IF NOT EXISTS idx_files_filename_nocase ON files(filename COLLATE NOCASE)",
+                "CREATE INDEX IF NOT EXISTS idx_tags_key_nocase ON tags(key COLLATE NOCASE)",
+                "CREATE INDEX IF NOT EXISTS idx_tags_value_nocase ON tags(value COLLATE NOCASE)",
+            ]
+            for stmt in statements:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as exc:
+                    logger.debug('Index creation failed (%s): %s', stmt, exc)
+
+            # FTS tables for files and tags
+            conn.execute(text(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                    file_id UNINDEXED,
+                    title,
+                    author,
+                    keywords,
+                    abstract,
+                    text_excerpt,
+                    tokenize='unicode61'
+                )
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS tags_fts USING fts5(
+                    tag_id UNINDEXED,
+                    file_id UNINDEXED,
+                    key,
+                    value,
+                    tokenize='unicode61'
+                )
+                """
+            ))
+
+            # Triggers for files -> files_fts
+            conn.execute(text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_files_ai AFTER INSERT ON files BEGIN
+                    INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
+                    VALUES (new.id, new.id,
+                        coalesce(new.title,''),
+                        coalesce(new.author,''),
+                        coalesce(new.keywords,''),
+                        coalesce(new.abstract,''),
+                        coalesce(new.text_excerpt,''));
+                END;
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_files_au AFTER UPDATE ON files BEGIN
+                    INSERT INTO files_fts(files_fts, rowid) VALUES('delete', old.id);
+                    INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
+                    VALUES (new.id, new.id,
+                        coalesce(new.title,''),
+                        coalesce(new.author,''),
+                        coalesce(new.keywords,''),
+                        coalesce(new.abstract,''),
+                        coalesce(new.text_excerpt,''));
+                END;
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_files_ad AFTER DELETE ON files BEGIN
+                    INSERT INTO files_fts(files_fts, rowid) VALUES('delete', old.id);
+                END;
+                """
+            ))
+
+            # Triggers for tags -> tags_fts
+            conn.execute(text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_tags_ai AFTER INSERT ON tags BEGIN
+                    INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
+                    VALUES (new.id, new.id, new.file_id, coalesce(new.key,''), coalesce(new.value,''));
+                END;
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_tags_au AFTER UPDATE ON tags BEGIN
+                    INSERT INTO tags_fts(tags_fts, rowid) VALUES('delete', old.id);
+                    INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
+                    VALUES (new.id, new.id, new.file_id, coalesce(new.key,''), coalesce(new.value,''));
+                END;
+                """
+            ))
+            conn.execute(text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_tags_ad AFTER DELETE ON tags BEGIN
+                    INSERT INTO tags_fts(tags_fts, rowid) VALUES('delete', old.id);
+                END;
+                """
+            ))
+
+            # Удаляем старые триггеры (удержание FTS переносим в код)
+            try:
+                conn.execute(text("DROP TRIGGER IF EXISTS trg_files_ai"))
+                conn.execute(text("DROP TRIGGER IF EXISTS trg_files_au"))
+                conn.execute(text("DROP TRIGGER IF EXISTS trg_files_ad"))
+                conn.execute(text("DROP TRIGGER IF EXISTS trg_tags_ai"))
+                conn.execute(text("DROP TRIGGER IF EXISTS trg_tags_au"))
+                conn.execute(text("DROP TRIGGER IF EXISTS trg_tags_ad"))
+            except Exception as exc:
+                logger.debug('drop legacy triggers failed: %s', exc)
+
+            _rebuild_files_fts(conn)
+            _rebuild_tags_fts(conn)
+    except Exception as exc:
+        logger.warning('Failed to initialize search support: %s', exc)
+
+
+def _rebuild_files_fts(conn=None):
+    def _run(connection):
+        try:
+            connection.execute(text("DELETE FROM files_fts"))
+            connection.execute(text(
+                """
+                INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
+                SELECT id, id,
+                    coalesce(title,''),
+                    coalesce(author,''),
+                    coalesce(keywords,''),
+                    coalesce(abstract,''),
+                    coalesce(text_excerpt,'')
+                FROM files
+                """
+            ))
+        except Exception as exc:
+            logger.debug('files_fts rebuild failed: %s', exc)
+
+    if conn is not None:
+        _run(conn)
+    else:
+        with db.engine.begin() as connection:
+            _run(connection)
+
+
+def _rebuild_tags_fts(conn=None):
+    def _run(connection):
+        try:
+            connection.execute(text("DELETE FROM tags_fts"))
+            connection.execute(text(
+                """
+                INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
+                SELECT id, id, file_id, coalesce(key,''), coalesce(value,'')
+                FROM tags
+                """
+            ))
+        except Exception as exc:
+            logger.debug('tags_fts rebuild failed: %s', exc)
+
+    if conn is not None:
+        _run(conn)
+    else:
+        with db.engine.begin() as connection:
+            _run(connection)
+
+
+def _sync_file_to_fts(file_obj: File | None):
+    if not file_obj or not getattr(file_obj, 'id', None):
+        return
+    try:
+        db.session.execute(text("DELETE FROM files_fts WHERE rowid = :rid"), {'rid': file_obj.id})
+        db.session.execute(text(
+            """
+            INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
+            VALUES (:rid, :rid, :title, :author, :keywords, :abstract, :text_excerpt)
+            """
+        ), {
+            'rid': file_obj.id,
+            'title': file_obj.title or '',
+            'author': file_obj.author or '',
+            'keywords': file_obj.keywords or '',
+            'abstract': getattr(file_obj, 'abstract', '') or '',
+            'text_excerpt': file_obj.text_excerpt or '',
+        })
+    except Exception as exc:
+        logger.debug('sync files_fts failed for id %s: %s', getattr(file_obj, 'id', None), exc)
+    try:
+        db.session.execute(text("DELETE FROM tags_fts WHERE file_id = :file_id"), {'file_id': file_obj.id})
+        tag_rows = []
+        try:
+            tags_iter = list(file_obj.tags or [])
+        except Exception:
+            tags_iter = []
+        for tag in tags_iter:
+            if not getattr(tag, 'id', None):
+                continue
+            tag_rows.append({
+                'rowid': tag.id,
+                'tag_id': tag.id,
+                'file_id': file_obj.id,
+                'key': (tag.key or ''),
+                'value': (tag.value or ''),
+            })
+        if tag_rows:
+            db.session.execute(text(
+                """
+                INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
+                VALUES (:rowid, :tag_id, :file_id, :key, :value)
+                """
+            ), tag_rows)
+    except Exception as exc:
+        logger.debug('sync tags_fts failed for file %s: %s', getattr(file_obj, 'id', None), exc)
+
+
+def _delete_file_from_fts(file_id: int | None):
+    if not file_id:
+        return
+    try:
+        db.session.execute(text("DELETE FROM files_fts WHERE rowid = :rid"), {'rid': file_id})
+    except Exception as exc:
+        logger.debug('delete from files_fts failed for %s: %s', file_id, exc)
+    try:
+        db.session.execute(text("DELETE FROM tags_fts WHERE file_id = :file_id"), {'file_id': file_id})
+    except Exception as exc:
+        logger.debug('delete from tags_fts failed for %s: %s', file_id, exc)
+
+
+_FTS_TOKEN_PATTERN = re.compile(r"[\w\d]+", re.UNICODE)
+
+
+def _fts_match_query(query: str) -> str | None:
+    tokens = _FTS_TOKEN_PATTERN.findall((query or '').lower())
+    cleaned = [token for token in tokens if token]
+    if not cleaned:
+        return None
+    cleaned = cleaned[:8]
+    return ' '.join(f'{token}*' for token in cleaned)
+
+
+def _search_candidate_ids(query: str, limit: int = 4000) -> list[int] | None:
+    match_expr = _fts_match_query(query)
+    if match_expr is None:
+        return []
+    ids: set[int] = set()
+    try:
+        rows = db.session.execute(
+            text("SELECT rowid FROM files_fts WHERE files_fts MATCH :match LIMIT :limit"),
+            {'match': match_expr, 'limit': limit},
+        ).fetchall()
+        ids.update(int(row[0]) for row in rows)
+    except Exception as exc:
+        logger.debug('files_fts MATCH failed: %s', exc)
+        return None
+    try:
+        rows = db.session.execute(
+            text("SELECT file_id FROM tags_fts WHERE tags_fts MATCH :match LIMIT :limit"),
+            {'match': match_expr, 'limit': limit},
+        ).fetchall()
+        ids.update(int(row[0]) for row in rows)
+    except Exception as exc:
+        logger.debug('tags_fts MATCH failed: %s', exc)
+    return list(ids)
+
+
+def _apply_like_filter(base_query, query: str):
+    like = f"%{query}%"
+    filters = [
+        File.title.ilike(like),
+        File.author.ilike(like),
+        File.keywords.ilike(like),
+        File.filename.ilike(like),
+        File.text_excerpt.ilike(like),
+    ]
+    if hasattr(File, 'abstract'):
+        filters.append(File.abstract.ilike(like))
+    tag_like = exists().where(and_(
+        Tag.file_id == File.id,
+        or_(Tag.value.ilike(like), Tag.key.ilike(like))
+    ))
+    filters.append(tag_like)
+    return base_query.filter(or_(*filters))
+
+
+def _apply_text_search_filter(base_query, query: str):
+    candidates = _search_candidate_ids(query)
+    if candidates is None:
+        return _apply_like_filter(base_query, query)
+    if not candidates:
+        return base_query.filter(File.id == -1)
+    return base_query.filter(File.id.in_(candidates))
+
+
+class TimedCache:
+    def __init__(self, max_items: int = 128, ttl: float = 60.0):
+        self.max_items = max(1, int(max_items))
+        self.ttl = float(ttl)
+        self._store: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _prune(self) -> None:
+        now = time.time()
+        dead = [key for key, (expires, _val) in self._store.items() if expires <= now]
+        for key in dead:
+            self._store.pop(key, None)
+        while len(self._store) > self.max_items:
+            self._store.popitem(last=False)
+
+    def get(self, key: tuple) -> object | None:
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            expires, value = item
+            if expires <= time.time():
+                self._store.pop(key, None)
+                return None
+            self._store.move_to_end(key)
+            return value
+
+    def set(self, key: tuple, value: object) -> None:
+        with self._lock:
+            self._store[key] = (time.time() + self.ttl, value)
+            self._store.move_to_end(key)
+            self._prune()
+
+    def get_or_set(self, key: tuple, factory):
+        cached = self.get(key)
+        if cached is not None:
+            return cached
+        value = factory()
+        self.set(key, value)
+        return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
 
 _RU_SYNONYMS = {
     'машина': ['автомобиль', 'авто', 'тачка', 'car'],
@@ -473,6 +904,24 @@ FW_CACHE_DIR = Path(os.getenv("FASTER_WHISPER_CACHE_DIR", str((Path(__file__).pa
 
 SETTINGS_STORE_PATH = BASE_DIR / 'runtime_settings.json'
 
+# ------------------- Facet configuration (search & graph) -------------------
+
+SEARCH_FACET_TAG_KEYS: list[str] | None = None
+GRAPH_FACET_TAG_KEYS: list[str] | None = None
+SEARCH_FACET_INCLUDE_TYPES: bool = True
+
+
+def _facet_config_state() -> dict:
+    return {
+        'search': {
+            'include_types': bool(SEARCH_FACET_INCLUDE_TYPES),
+            'tag_keys': list(SEARCH_FACET_TAG_KEYS) if SEARCH_FACET_TAG_KEYS is not None else None,
+        },
+        'graph': {
+            'tag_keys': list(GRAPH_FACET_TAG_KEYS) if GRAPH_FACET_TAG_KEYS is not None else None,
+        }
+    }
+
 
 def _runtime_settings_snapshot() -> dict:
     return {
@@ -504,6 +953,9 @@ def _runtime_settings_snapshot() -> dict:
         'ALWAYS_OCR_FIRST_PAGE_DISSERTATION': bool(ALWAYS_OCR_FIRST_PAGE_DISSERTATION),
         'PROMPTS': dict(PROMPTS),
         'AI_RERANK_LLM': bool(AI_RERANK_LLM),
+        'SEARCH_FACET_TAG_KEYS': list(SEARCH_FACET_TAG_KEYS) if SEARCH_FACET_TAG_KEYS is not None else None,
+        'GRAPH_FACET_TAG_KEYS': list(GRAPH_FACET_TAG_KEYS) if GRAPH_FACET_TAG_KEYS is not None else None,
+        'SEARCH_FACET_INCLUDE_TYPES': bool(SEARCH_FACET_INCLUDE_TYPES),
     }
 
 
@@ -532,6 +984,7 @@ def _load_runtime_settings_from_disk() -> None:
     global COLLECTIONS_IN_SEPARATE_DIRS, COLLECTION_TYPE_SUBDIRS, TYPE_DIRS
     global DEFAULT_USE_LLM, DEFAULT_PRUNE
     global OCR_LANGS_CFG, PDF_OCR_PAGES_CFG, ALWAYS_OCR_FIRST_PAGE_DISSERTATION, PROMPTS, AI_RERANK_LLM
+    global SEARCH_FACET_TAG_KEYS, GRAPH_FACET_TAG_KEYS, SEARCH_FACET_INCLUDE_TYPES
 
     if 'SCAN_ROOT' in data:
         try:
@@ -622,6 +1075,30 @@ def _load_runtime_settings_from_disk() -> None:
                 PROMPTS[key] = value
     if 'AI_RERANK_LLM' in data:
         AI_RERANK_LLM = bool(data['AI_RERANK_LLM'])
+    if 'SEARCH_FACET_TAG_KEYS' in data:
+        raw = data.get('SEARCH_FACET_TAG_KEYS')
+        if raw is None:
+            SEARCH_FACET_TAG_KEYS = None
+        elif isinstance(raw, (list, tuple)):
+            SEARCH_FACET_TAG_KEYS = [str(v).strip() for v in raw if str(v or '').strip()]
+        else:
+            SEARCH_FACET_TAG_KEYS = []
+    if 'GRAPH_FACET_TAG_KEYS' in data:
+        raw = data.get('GRAPH_FACET_TAG_KEYS')
+        if raw is None:
+            GRAPH_FACET_TAG_KEYS = None
+        elif isinstance(raw, (list, tuple)):
+            GRAPH_FACET_TAG_KEYS = [str(v).strip() for v in raw if str(v or '').strip()]
+        else:
+            GRAPH_FACET_TAG_KEYS = []
+    if 'SEARCH_FACET_INCLUDE_TYPES' in data:
+        SEARCH_FACET_INCLUDE_TYPES = bool(data['SEARCH_FACET_INCLUDE_TYPES'])
+
+    app_ref = globals().get('app')
+    if app_ref:
+        app_ref.config['SEARCH_FACET_TAG_KEYS'] = SEARCH_FACET_TAG_KEYS
+        app_ref.config['GRAPH_FACET_TAG_KEYS'] = GRAPH_FACET_TAG_KEYS
+        app_ref.config['SEARCH_FACET_INCLUDE_TYPES'] = SEARCH_FACET_INCLUDE_TYPES
 
 
 # ------------------- Lightweight response helpers -------------------
@@ -1150,6 +1627,17 @@ except Exception:
     app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 db.init_app(app)
 
+# Применяем обязательные PRAGMA сразу для текущего соединения
+try:
+    with app.app_context():
+        with db.engine.connect() as conn:
+            conn.execute(text("PRAGMA foreign_keys = 1"))
+            conn.execute(text("PRAGMA trusted_schema = 1"))
+            conn.execute(text("PRAGMA recursive_triggers = 1"))
+        db.engine.dispose()
+except Exception as pragma_exc:
+    logger.warning('Failed to apply SQLite PRAGMA settings: %s', pragma_exc)
+
 
 # Модели описаны в models.py и импортируются выше.
 
@@ -1161,6 +1649,9 @@ app.config.setdefault('MOVE_ON_RENAME', MOVE_ON_RENAME)
 app.config.setdefault('COLLECTIONS_IN_SEPARATE_DIRS', COLLECTIONS_IN_SEPARATE_DIRS)
 app.config.setdefault('COLLECTION_TYPE_SUBDIRS', COLLECTION_TYPE_SUBDIRS)
 app.config.setdefault('TYPE_DIRS', TYPE_DIRS)
+app.config.setdefault('SEARCH_FACET_TAG_KEYS', SEARCH_FACET_TAG_KEYS)
+app.config.setdefault('GRAPH_FACET_TAG_KEYS', GRAPH_FACET_TAG_KEYS)
+app.config.setdefault('SEARCH_FACET_INCLUDE_TYPES', SEARCH_FACET_INCLUDE_TYPES)
 
 # ------------------- Утилиты -------------------
 
@@ -3293,6 +3784,7 @@ def upsert_tag(file_obj: File, key: str, value: str):
     if not t:
         t = Tag(file_id=file_obj.id, key=key, value=value)
         db.session.add(t)
+        _invalidate_facets_cache('tag upsert')
 
 def _upsert_keyword_tags(file_obj: File):
     """Разложить строку ключевых слов на отдельные теги 'ключевое слово'."""
@@ -3302,6 +3794,7 @@ def _upsert_keyword_tags(file_obj: File):
             Tag.query.filter_by(file_id=file_obj.id).filter(
                 or_(Tag.key == 'ключевое слово', Tag.key == 'keywords')
             ).delete(synchronize_session=False)
+            _invalidate_facets_cache('tag cleanup')
         except Exception:
             pass
         raw = (file_obj.keywords or '')
@@ -3678,11 +4171,21 @@ def prune_missing_files():
     for f in File.query.all():
         try:
             if not Path(f.path).exists():
+                fid = f.id
                 db.session.delete(f)
                 removed += 1
+                try:
+                    _delete_file_from_fts(fid)
+                except Exception as exc:
+                    logger.debug('fts delete failed for missing file %s: %s', fid, exc)
         except Exception:
+            fid = getattr(f, 'id', None)
             db.session.delete(f)
             removed += 1
+            try:
+                _delete_file_from_fts(fid)
+            except Exception as exc:
+                logger.debug('fts delete failed for missing file %s: %s', fid, exc)
     db.session.commit()
     return removed
 
@@ -3845,14 +4348,7 @@ def api_search():
     if material_type:
         query = query.filter(File.material_type == material_type)
     if q and not smart:
-        like = f"%{q}%"
-        query = query.filter(or_(
-            File.title.ilike(like),
-            File.author.ilike(like),
-            File.keywords.ilike(like),
-            File.filename.ilike(like),
-            File.text_excerpt.ilike(like),
-        ))
+        query = _apply_text_search_filter(query, q)
     if year_from:
         query = query.filter(File.year >= year_from)
     if year_to:
@@ -3873,6 +4369,13 @@ def api_search():
             t = aliased(Tag)
             query = query.join(t, t.file_id == File.id).filter(and_(t.key == k, t.value.ilike(f"%{v}%")))
     query = query.distinct()
+
+    if q and smart:
+        candidates = _search_candidate_ids(q)
+        if candidates:
+            query = query.filter(File.id.in_(candidates))
+        elif candidates == []:
+            return jsonify([])
 
     rows = query.order_by(File.mtime.desc().nullslast()).limit(200).all()
     if q and smart:
@@ -3929,15 +4432,7 @@ def api_search_v2():
     if material_type:
         base = base.filter(File.material_type == material_type)
     if q and not smart:
-        like = f"%{q}%"
-        base = base.filter(or_(
-            File.title.ilike(like),
-            File.author.ilike(like),
-            File.keywords.ilike(like),
-            File.filename.ilike(like),
-            File.text_excerpt.ilike(like),
-            File.abstract.ilike(like),
-        ))
+        base = _apply_text_search_filter(base, q)
     if year_from:
         base = base.filter(File.year >= year_from)
     if year_to:
@@ -3964,6 +4459,11 @@ def api_search_v2():
     qx = qx.distinct()
 
     if q and smart:
+        candidates = _search_candidate_ids(q)
+        if candidates:
+            qx = qx.filter(File.id.in_(candidates))
+        elif candidates == []:
+            return jsonify({"items": [], "total": 0})
         # Морфологическая фильтрация на сервере с синонимами
         qlem = list(_expand_synonyms(_lemmas(q)))
         # Ограничиваем выборку разумным числом для подсчёта, упорядоченным по свежести
@@ -4274,17 +4774,253 @@ def api_settings():
     _save_runtime_settings_to_disk()
     return jsonify({'ok': True})
 
+def _facet_key_options(limit: int = 200) -> list[dict]:
+    options: dict[str, dict] = {}
+    try:
+        rows = db.session.query(Tag.key, func.count(Tag.id)) \
+            .group_by(Tag.key) \
+            .order_by(func.count(Tag.id).desc()) \
+            .limit(limit).all()
+    except Exception:
+        rows = []
+    for key, count in rows:
+        skey = str(key or '').strip()
+        if not skey:
+            continue
+        options[skey] = {'key': skey, 'count': int(count or 0), 'samples': []}
+    # Добавляем автора по данным файлов, чтобы всегда был доступен для графа
+    try:
+        author_count = db.session.query(func.count(File.id)) \
+            .filter(File.author.isnot(None)) \
+            .filter(File.author != '') \
+            .scalar()
+    except Exception:
+        author_count = None
+    if 'author' not in options:
+        options['author'] = {'key': 'author', 'count': int(author_count or 0), 'samples': []}
+    try:
+        schema_keys = db.session.query(TagSchema.key).distinct().all()
+    except Exception:
+        schema_keys = []
+    for (schema_key,) in schema_keys:
+        skey = str(schema_key or '').strip()
+        if not skey or skey in options:
+            continue
+        options[skey] = {'key': skey, 'count': 0, 'samples': []}
+    keys = list(options.keys())
+    if keys:
+        try:
+            sample_rows = db.session.query(Tag.key, Tag.value, func.count(Tag.id)) \
+                .filter(Tag.key.in_(keys)) \
+                .group_by(Tag.key, Tag.value) \
+                .order_by(Tag.key.asc(), func.count(Tag.id).desc()) \
+                .limit(max(len(keys) * 6, 120)).all()
+        except Exception:
+            sample_rows = []
+        sample_map: dict[str, list[str]] = {k: [] for k in keys}
+        for key, value, _cnt in sample_rows:
+            skey = str(key or '').strip()
+            sval = str(value or '').strip()
+            if not skey or not sval:
+                continue
+            bucket = sample_map.setdefault(skey, [])
+            if len(bucket) >= 5 or sval in bucket:
+                continue
+            bucket.append(sval)
+        for key, meta in options.items():
+            meta['samples'] = sample_map.get(key, [])
+    return sorted(options.values(), key=lambda item: item['count'], reverse=True)
+
+
+@app.route('/api/facet-config', methods=['GET', 'POST'])
+def api_facet_config():
+    admin = _require_admin()
+
+    def _payload() -> dict:
+        return {
+            'ok': True,
+            'config': _facet_config_state(),
+            'options': _facet_key_options()
+        }
+
+    if request.method == 'GET':
+        return jsonify(_payload())
+
+    data = request.get_json(silent=True) or {}
+    search_payload = data.get('search') if isinstance(data.get('search'), dict) else {}
+    graph_payload = data.get('graph') if isinstance(data.get('graph'), dict) else {}
+
+    def _parse_keys(value) -> list[str] | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            cleaned = [str(v or '').strip() for v in value if str(v or '').strip()]
+            return cleaned
+        return []
+
+    global SEARCH_FACET_TAG_KEYS, GRAPH_FACET_TAG_KEYS, SEARCH_FACET_INCLUDE_TYPES
+    include_types = bool(search_payload.get('include_types', SEARCH_FACET_INCLUDE_TYPES))
+    search_keys = _parse_keys(search_payload.get('tag_keys'))
+    graph_keys = _parse_keys(graph_payload.get('tag_keys'))
+
+    SEARCH_FACET_INCLUDE_TYPES = include_types
+    SEARCH_FACET_TAG_KEYS = search_keys
+    GRAPH_FACET_TAG_KEYS = graph_keys
+    current_app.config['SEARCH_FACET_INCLUDE_TYPES'] = SEARCH_FACET_INCLUDE_TYPES
+    current_app.config['SEARCH_FACET_TAG_KEYS'] = SEARCH_FACET_TAG_KEYS
+    current_app.config['GRAPH_FACET_TAG_KEYS'] = GRAPH_FACET_TAG_KEYS
+    _save_runtime_settings_to_disk()
+    try:
+        detail = json.dumps({
+            'search': {'include_types': include_types, 'tag_keys': search_keys},
+            'graph': {'tag_keys': graph_keys}
+        }, ensure_ascii=False)
+        _log_user_action(admin, 'facet_config_update', 'facet_config', None, detail)
+    except Exception:
+        pass
+    return jsonify(_payload())
+
+
 @app.route('/api/facets')
 def api_facets():
     """Фасеты для текущих фильтров: типы и теги (с учётом выбранных фильтров)."""
-    q = request.args.get("q", "").strip()
-    material_type = request.args.get("type", "").strip()
-    tag_filters = request.args.getlist("tag")
-    year_from = (request.args.get("year_from") or "").strip()
-    year_to = (request.args.get("year_to") or "").strip()
-    size_min = (request.args.get("size_min") or "").strip()
-    size_max = (request.args.get("size_max") or "").strip()
+    q = request.args.get('q', '').strip()
+    material_type = request.args.get('type', '').strip()
+    tag_filters = request.args.getlist('tag')
+    context = (request.args.get('context') or 'search').strip().lower()
+    if context not in ('search', 'graph'):
+        context = 'search'
+    cfg_key = 'GRAPH_FACET_TAG_KEYS' if context == 'graph' else 'SEARCH_FACET_TAG_KEYS'
+    allowed_cfg = current_app.config.get(cfg_key)
+    if isinstance(allowed_cfg, (list, tuple)):
+        allowed_keys_list = [str(v or '').strip() for v in allowed_cfg if str(v or '').strip()]
+    elif allowed_cfg is None:
+        allowed_keys_list = None
+    else:
+        allowed_keys_list = []
+    allowed_keys_set = set(allowed_keys_list or []) if allowed_keys_list is not None else None
+    include_types = bool(current_app.config.get('SEARCH_FACET_INCLUDE_TYPES', True)) if context == 'search' else False
+
+    year_from = (request.args.get('year_from') or '').strip()
+    year_to = (request.args.get('year_to') or '').strip()
+    size_min = (request.args.get('size_min') or '').strip()
+    size_max = (request.args.get('size_max') or '').strip()
     collection_filter = _parse_collection_param(request.args.get('collection_id'))
+    allowed_scope = _current_allowed_collections()
+
+    def build_payload() -> dict:
+        base_query = _apply_file_access_filter(File.query)
+        try:
+            base_query = base_query.join(Collection, File.collection_id == Collection.id).filter(Collection.searchable == True)
+        except Exception:
+            pass
+        if collection_filter is not None:
+            base_query = base_query.filter(File.collection_id == collection_filter)
+        if material_type:
+            base_query = base_query.filter(File.material_type == material_type)
+
+        filtered_query = base_query
+        if q:
+            candidates = _search_candidate_ids(q, limit=6000)
+            if candidates is None:
+                filtered_query = _apply_like_filter(filtered_query, q)
+            elif not candidates:
+                return {
+                    'types': [] if include_types else [],
+                    'tag_facets': {},
+                    'include_types': include_types,
+                    'allowed_keys': allowed_keys_list,
+                    'context': context,
+                }
+            else:
+                filtered_query = filtered_query.filter(File.id.in_(candidates))
+        if year_from:
+            filtered_query = filtered_query.filter(File.year >= year_from)
+        if year_to:
+            filtered_query = filtered_query.filter(File.year <= year_to)
+        if size_min:
+            try:
+                filtered_query = filtered_query.filter(File.size >= int(size_min))
+            except Exception:
+                pass
+        if size_max:
+            try:
+                filtered_query = filtered_query.filter(File.size <= int(size_max))
+            except Exception:
+                pass
+
+        filtered_query = filtered_query.distinct()
+
+        types_facet: list[list] = []
+        if include_types:
+            ids_for_types = filtered_query.with_entities(File.id).subquery()
+            types = db.session.query(File.material_type, func.count(File.id)) \
+                .filter(File.id.in_(ids_for_types)) \
+                .group_by(File.material_type).all()
+            types_facet = [[mt, cnt] for (mt, cnt) in types]
+
+        base_ids_subq = filtered_query.with_entities(File.id).subquery()
+        base_keys = [row[0] for row in db.session.query(Tag.key).filter(Tag.file_id.in_(base_ids_subq)).distinct().all()]
+        selected: dict[str, list[str]] = {}
+        for tf in tag_filters:
+            if '=' in tf:
+                k, v = tf.split('=', 1)
+                selected.setdefault(k, []).append(v)
+                if k not in base_keys:
+                    base_keys.append(k)
+
+        if allowed_keys_set is not None:
+            base_keys = [k for k in base_keys if k in allowed_keys_set or k in selected]
+        for key in selected:
+            if key not in base_keys:
+                base_keys.append(key)
+
+        tag_facets: dict[str, list[list]] = {}
+        for key in base_keys:
+            if allowed_keys_set is not None and key not in allowed_keys_set and key not in selected:
+                continue
+            qk = filtered_query
+            for tf in tag_filters:
+                if '=' not in tf:
+                    continue
+                k, v = tf.split('=', 1)
+                if k == key:
+                    continue
+                tk = aliased(Tag)
+                qk = qk.join(tk, tk.file_id == File.id).filter(and_(tk.key == k, tk.value.ilike(f'%{v}%')))
+            ids_subq = qk.with_entities(File.id).distinct().subquery()
+            rows = db.session.query(Tag.value, func.count(Tag.id)) \
+                .filter(and_(Tag.file_id.in_(ids_subq), Tag.key == key)) \
+                .group_by(Tag.value) \
+                .order_by(func.count(Tag.id).desc()) \
+                .all()
+            tag_facets[key] = [[val, cnt] for (val, cnt) in rows]
+            if key in selected:
+                present_vals = {val for (val, _c) in tag_facets[key]}
+                for v in selected[key]:
+                    if v not in present_vals:
+                        tag_facets[key].append([v, 0])
+
+        return {
+            'types': types_facet,
+            'tag_facets': tag_facets,
+            'include_types': include_types,
+            'allowed_keys': allowed_keys_list,
+            'context': context,
+        }
+
+    cache_key = None
+    if context == 'search':
+        args_tuple = tuple((k, tuple(v)) for k, v in sorted((item for item in request.args.lists() if item[0] != 'commit')))
+        scope_key = None if allowed_scope is None else tuple(sorted(allowed_scope))
+        allowed_key_tuple = None if allowed_keys_list is None else tuple(sorted(allowed_keys_list))
+        cache_key = ('facets-v2', args_tuple, scope_key, include_types, allowed_key_tuple)
+
+    if cache_key is not None:
+        payload = FACET_CACHE.get_or_set(cache_key, build_payload)
+    else:
+        payload = build_payload()
+    return jsonify(payload)
 
     base_query = _apply_file_access_filter(File.query)
     try:
@@ -4296,14 +5032,22 @@ def api_facets():
     if material_type:
         base_query = base_query.filter(File.material_type == material_type)
     if q:
-        like = f"%{q}%"
-        base_query = base_query.filter(or_(
+        like = f'%{q}%'
+        tag_like = exists().where(and_(
+            Tag.file_id == File.id,
+            or_(Tag.value.ilike(like), Tag.key.ilike(like))
+        ))
+        filters = [
             File.title.ilike(like),
             File.author.ilike(like),
             File.keywords.ilike(like),
             File.filename.ilike(like),
             File.text_excerpt.ilike(like),
-        ))
+        ]
+        if hasattr(File, 'abstract'):
+            filters.append(File.abstract.ilike(like))
+        filters.append(tag_like)
+        base_query = base_query.filter(or_(*filters))
     if year_from:
         base_query = base_query.filter(File.year >= year_from)
     if year_to:
@@ -4319,16 +5063,16 @@ def api_facets():
         except Exception:
             pass
 
-    # Фасет типов (независим от фильтров тегов)
-    types = db.session.query(File.material_type, func.count(File.id))
-    types = types.filter(File.id.in_(base_query.with_entities(File.id)))
-    types = types.group_by(File.material_type).all()
-    types_facet = [[mt, cnt] for (mt, cnt) in types]
+    types_facet: list[list] = []
+    if include_types:
+        types = db.session.query(File.material_type, func.count(File.id))
+        types = types.filter(File.id.in_(base_query.with_entities(File.id)))
+        types = types.group_by(File.material_type).all()
+        types_facet = [[mt, cnt] for (mt, cnt) in types]
 
-    # Фасеты тегов: по каждому ключу, присутствующему в базовой выборке
     base_ids_subq = base_query.with_entities(File.id).subquery()
     base_keys = [row[0] for row in db.session.query(Tag.key).filter(Tag.file_id.in_(base_ids_subq)).distinct().all()]
-    selected = {}
+    selected: dict[str, list[str]] = {}
     for tf in tag_filters:
         if '=' in tf:
             k, v = tf.split('=', 1)
@@ -4336,8 +5080,16 @@ def api_facets():
             if k not in base_keys:
                 base_keys.append(k)
 
-    tag_facets = {}
+    if allowed_keys_set is not None:
+        base_keys = [k for k in base_keys if k in allowed_keys_set or k in selected]
+    for key in selected:
+        if key not in base_keys:
+            base_keys.append(key)
+
+    tag_facets: dict[str, list[list]] = {}
     for key in base_keys:
+        if allowed_keys_set is not None and key not in allowed_keys_set and key not in selected:
+            continue
         qk = base_query
         for tf in tag_filters:
             if '=' not in tf:
@@ -4346,7 +5098,7 @@ def api_facets():
             if k == key:
                 continue
             tk = aliased(Tag)
-            qk = qk.join(tk, tk.file_id == File.id).filter(and_(tk.key == k, tk.value.ilike(f"%{v}%")))
+            qk = qk.join(tk, tk.file_id == File.id).filter(and_(tk.key == k, tk.value.ilike(f'%{v}%')))
         ids_subq = qk.with_entities(File.id).distinct().subquery()
         rows = db.session.query(Tag.value, func.count(Tag.id)) \
             .filter(and_(Tag.file_id.in_(ids_subq), Tag.key == key)) \
@@ -4360,7 +5112,13 @@ def api_facets():
                 if v not in present_vals:
                     tag_facets[key].append([v, 0])
 
-    return jsonify({"types": types_facet, "tag_facets": tag_facets})
+    return jsonify({
+        'types': types_facet,
+        'tag_facets': tag_facets,
+        'include_types': include_types,
+        'allowed_keys': allowed_keys_list,
+        'context': context,
+    })
 
 @app.route("/settings", methods=["GET"])
 def settings_redirect():
@@ -5450,6 +6208,12 @@ def init_db():
 from routes import routes
 app.register_blueprint(routes)
 
+with app.app_context():
+    _ensure_search_support()
+
+app.config['invalidate_facets'] = _invalidate_facets_cache
+app.config['facet_cache'] = FACET_CACHE
+
 # ------------------- Single-file Refresh API -------------------
 @app.route("/api/files/<int:file_id>/refresh", methods=["POST"])
 def api_file_refresh(file_id):
@@ -6033,7 +6797,12 @@ def _delete_collection_files(col_id: int, remove_fs: bool = True) -> tuple[int, 
                     cache_file.unlink()
         except Exception as exc:
             errors.append(f"cache:{f.id}:{exc}")
+        fid = f.id
         db.session.delete(f)
+        try:
+            _delete_file_from_fts(fid)
+        except Exception as exc:
+            errors.append(f"fts:{fid}:{exc}")
     return removed, errors
 
 
@@ -6095,8 +6864,32 @@ SCAN_PROGRESS = {
 SCAN_CANCEL = False
 SCAN_TASK_ID: int | None = None
 
+def _resolve_deleted_dir(root: Path) -> Path | None:
+    deleted_cfg = app.config.get('DELETED_FOLDER')
+    try:
+        trash_dir = Path(deleted_cfg).expanduser() if deleted_cfg else Path('_deleted')
+    except Exception:
+        trash_dir = Path('_deleted')
+    if not trash_dir.is_absolute():
+        try:
+            return (root / trash_dir).resolve()
+        except Exception:
+            return root / trash_dir
+    try:
+        return trash_dir.resolve()
+    except Exception:
+        return trash_dir
+
+
 def _iter_files_for_scan(root: Path):
+    trash_dir = _resolve_deleted_dir(root)
     for path in root.rglob("*"):
+        if trash_dir is not None:
+            try:
+                path.relative_to(trash_dir)
+                continue
+            except ValueError:
+                pass
         if not path.is_file():
             continue
         ext = path.suffix.lower()
@@ -6183,6 +6976,10 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
     global SCAN_PROGRESS, SCAN_CANCEL, SCAN_TASK_ID
     with app.app_context():
         try:
+            try:
+                db.session.rollback()
+            except Exception:
+                db.session.remove()
             task = None
             if SCAN_TASK_ID:
                 try:
@@ -6546,7 +7343,11 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                     upsert_tag(file_obj, "автор", file_obj.author)
                 if file_obj.year:
                     upsert_tag(file_obj, "год", str(file_obj.year))
-
+                db.session.flush()
+                try:
+                    _sync_file_to_fts(file_obj)
+                except Exception as sync_exc:
+                    _scan_log(f"fts sync failed: {sync_exc}", level='warn')
                 db.session.commit()
 
             removed = 0
@@ -6555,6 +7356,11 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 SCAN_PROGRESS["updated_at"] = time.time()
                 _scan_log("Удаление отсутствующих файлов")
                 removed = prune_missing_files()
+                try:
+                    _rebuild_files_fts()
+                    _rebuild_tags_fts()
+                except Exception as rebuild_exc:
+                    _scan_log(f"fts rebuild failed: {rebuild_exc}", level='warn')
                 db.session.commit()
             SCAN_PROGRESS.update({"removed": removed, "stage": "done", "running": False, "updated_at": time.time()})
             _scan_log("Сканирование завершено")
@@ -6582,6 +7388,10 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
             SCAN_TASK_ID = None
             SCAN_PROGRESS["task_id"] = None
             SCAN_PROGRESS["scope"] = None
+            try:
+                db.session.remove()
+            except Exception:
+                pass
 
 @app.route("/scan/start", methods=["POST"])
 @require_admin

@@ -2171,7 +2171,7 @@ export default function App() {
               <Brain className="w-8 h-8 text-blue-600 dark:text-blue-400 mr-3" />
               <div>
                 <h1 className="text-xl font-bold text-gray-900 dark:text-white">
-                  LLM Writer Agent {autoSaveEnabled && (<span title="Автосохранение" className={`${savingPulse ? 'opacity-100' : 'opacity-40'} transition-opacity text-sm`}>💾</span>)}
+                  AI Word {autoSaveEnabled && (<span title="Автосохранение" className={`${savingPulse ? 'opacity-100' : 'opacity-40'} transition-opacity text-sm`}>💾</span>)}
                 </h1>
                 <p className="text-sm text-gray-500 dark:text-gray-400">
                   Made by Ryltsin.I.A

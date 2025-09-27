@@ -10,6 +10,7 @@ export default function App() {
   const location = useLocation()
   const { user, loading, logout } = useAuth()
   const q = sp.get('q') || ''
+  const [searchDraft, setSearchDraft] = useState(q)
   const [theme, setTheme] = useState<string>(()=>{
     const saved = localStorage.getItem('theme')
     if (saved) return saved
@@ -41,6 +42,10 @@ export default function App() {
       localStorage.setItem('theme', theme)
     }
   }, [theme, loading, user])
+
+  useEffect(() => {
+    setSearchDraft(q)
+  }, [q])
 
   useEffect(() => {
     if (!adminMenuOpen) return
@@ -131,18 +136,27 @@ export default function App() {
     }
   }
 
+  const commitSearch = useCallback((value: string, replace = true) => {
+    const next = new URLSearchParams(sp)
+    const trimmed = value.trim()
+    if (trimmed) {
+      next.set('q', trimmed)
+    } else {
+      next.delete('q')
+    }
+    next.set('page', '1')
+    next.set('commit', String(Date.now()))
+    setSp(next, { replace })
+  }, [sp, setSp])
+
   const handleVoiceSearch = useCallback((text: string) => {
     const normalized = text.trim()
     if (!normalized) {
       return
     }
-    if (searchRef.current) {
-      searchRef.current.value = normalized
-    }
-    sp.set('q', normalized)
-    sp.set('commit', String(Date.now()))
-    setSp(sp, { replace: true })
-  }, [sp, setSp])
+    setSearchDraft(normalized)
+    commitSearch(normalized, true)
+  }, [commitSearch])
 
   const handleVoiceError = useCallback((message: string) => {
     if (!message) return
@@ -162,6 +176,7 @@ export default function App() {
     { to: 'admin/logs', label: 'Логи' },
     { to: 'admin/llm', label: 'LLM' },
     { to: 'admin/ai-metrics', label: 'AI метрики' },
+    { to: 'admin/facets', label: 'Фасеты' },
     { to: 'admin/collections', label: 'Коллекции' },
   ]), [])
 
@@ -187,15 +202,19 @@ export default function App() {
               <div style={{fontSize:12}}>made by Ryltsin I.A.</div>
             </span>
           </Link>
-          <input
-            className="form-control"
-            style={{ width: 600, maxWidth: '60%', flex: '0 1 auto' }}
-            placeholder="Поиск…"
-            value={q}
-            ref={searchRef}
-            onChange={e => { sp.set('q', e.target.value); sp.delete('commit'); setSp(sp, { replace: true }) }}
-            onKeyDown={e => { if (e.key === 'Enter') { sp.set('commit', String(Date.now())); setSp(sp, { replace: true }) } }}
-          />
+          <div className="d-flex align-items-center gap-2" style={{ width: 600, maxWidth: '60%', flex: '0 1 auto' }}>
+            <input
+              className="form-control"
+              placeholder="Поиск…"
+              value={searchDraft}
+              ref={searchRef}
+              onChange={e => setSearchDraft(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitSearch(searchDraft, true) } }}
+            />
+            <button className="btn btn-outline-secondary" type="button" onClick={() => commitSearch(searchDraft, true)}>
+              Найти
+            </button>
+          </div>
           <VoiceSearchButton onTranscribed={handleVoiceSearch} onError={handleVoiceError} />
           <div className="ms-auto d-flex align-items-center gap-2 flex-wrap justify-content-end" style={{ rowGap: '0.3rem' }}>
             <button className="btn btn-outline-secondary" onClick={()=> setTheme(t => t==='dark'?'light':'dark')} aria-label="Переключить тему">{theme==='dark'?'🌙':'☀️'}</button>
