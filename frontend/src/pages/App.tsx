@@ -3,6 +3,8 @@ import { Link, Outlet, useLocation, useNavigate, useSearchParams } from 'react-r
 import { useToasts } from '../ui/Toasts'
 import { useAuth } from '../ui/Auth'
 import VoiceSearchButton from '../ui/VoiceSearchButton'
+import agregatorLogo from '../../logo/agregator.png'
+import aiWordLogo from '../../logo/AIWord.png'
 
 export default function App() {
   const [sp, setSp] = useSearchParams()
@@ -197,9 +199,8 @@ export default function App() {
       <nav className="navbar navbar-expand px-3 py-2 mb-3">
         <div className="d-flex align-items-center gap-2 w-100">
           <Link className="navbar-brand m-0" to="/" style={{ color: 'var(--text)' }}>
-            <span style={{display:'inline-block', lineHeight:1.05}}>
-              <div style={{fontWeight:600}}>Agregator</div>
-              <div style={{fontSize:12}}>made by Ryltsin I.A.</div>
+            <span className="app-brand-badge">
+              <img src={agregatorLogo} alt="Agregator" />
             </span>
           </Link>
           <div className="d-flex align-items-center gap-2" style={{ width: 600, maxWidth: '60%', flex: '0 1 auto' }}>
@@ -247,7 +248,18 @@ export default function App() {
             <span className="badge bg-secondary text-uppercase" style={{ letterSpacing: 0.3 }}>{user.role === 'admin' ? 'Админ' : 'Пользователь'}</span>
             <button className="btn btn-outline-secondary" onClick={handleLogout}>Выход</button>
             {canUseAiword && (
-              <a className="btn btn-primary" href="/aiword" target="_blank" rel="noopener">AIWord</a>
+              <a
+                className="aiword-launch-link d-flex align-items-center"
+                href="/aiword"
+                target="_blank"
+                rel="noopener"
+                aria-label="AIWord"
+              >
+                <span className="aiword-logo-badge aiword-logo-badge--nav">
+                  <img src={aiWordLogo} alt="AIWord" />
+                </span>
+                <span className="visually-hidden">AIWord</span>
+              </a>
             )}
           </div>
         </div>
