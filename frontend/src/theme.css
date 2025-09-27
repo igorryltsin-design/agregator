@@ -118,6 +118,23 @@ a:hover, a:focus { color: var(--primary); }
   transition: background 0.3s ease, border-color 0.3s ease;
 }
 
+.btn.icon-only {
+  padding: 0.35rem 0.55rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+}
+
+.btn.icon-only .icon-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.2rem;
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
 .bg-body-secondary,
 .bg-body-tertiary,
 .offcanvas,
