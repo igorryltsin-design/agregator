@@ -19,7 +19,6 @@ import {
   CheckCircle,
   AlertCircle,
   Clock,
-  Brain,
   PenTool,
   Moon,
   Sun,
@@ -44,6 +43,7 @@ import {
   StopCircle,
   Database
 } from 'lucide-react';
+import aiWordLogo from '@logo/AIWord.png';
 
 type PdfTextItem = { str?: string } & Record<string, unknown>;
 type PdfTextContent = { items: PdfTextItem[] };
@@ -984,7 +984,6 @@ export default function App() {
         const combinedCatalog = [providedCatalog, catalogContext].filter(Boolean).join('\n\n');
         const contextBlock = combinedCatalog ? `Контекст каталога:\n${combinedCatalog}\n\n` : '';
         const user = `${contextBlock}Проверь фактические утверждения ${scope}. Для каждого сформируй пункт списка: кратко переформулированный факт, затем статус **Подтверждено**, **Требует проверки** или **Не найдено**, и короткий комментарий.\n- Используй **Подтверждено** только если есть явное совпадение в предоставленных фрагментах и укажи ссылку [#n].\n- Если данных недостаточно или совпадение неточно — ставь **Требует проверки** и поясни, каких сведений не хватает.\n- Используй **Не найдено**, если фрагменты прямо противоречат утверждению.\nЗаверши вывод кратким списком ключевых рисков или неопределённостей.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || content}\n\u0060\u0060\u0060`;
-- Используй **Подтверждено** только если есть явное совпадение в предоставленных фрагментах и укажи ссылку [#n].\n- Если данных недостаточно или совпадение неточно — ставь **Требует проверки** и поясни, каких сведений не хватает.\n- Используй **Не найдено**, если фрагменты прямо противоречат утверждению.\nЗаверши вывод кратким списком ключевых рисков или неопределённостей.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || content}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
           output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 700, (d)=> setLiveText(t=>t + d), injectToEditor);
@@ -2167,16 +2166,18 @@ export default function App() {
       <header className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
-            <div className="flex items-center">
-              <Brain className="w-8 h-8 text-blue-600 dark:text-blue-400 mr-3" />
-              <div>
-                <h1 className="text-xl font-bold text-gray-900 dark:text-white">
-                  AI Word {autoSaveEnabled && (<span title="Автосохранение" className={`${savingPulse ? 'opacity-100' : 'opacity-40'} transition-opacity text-sm`}>💾</span>)}
-                </h1>
-                <p className="text-sm text-gray-500 dark:text-gray-400">
-                  Made by Ryltsin.I.A
-                </p>
-              </div>
+            <div className="flex items-center gap-2">
+              <span className="aiword-logo-badge">
+                <img src={aiWordLogo} alt="AIWord" className="h-10 w-auto" />
+              </span>
+              {autoSaveEnabled && (
+                <span
+                  title="Автосохранение"
+                  className={`${savingPulse ? 'opacity-100' : 'opacity-40'} transition-opacity text-base text-gray-600 dark:text-gray-300`}
+                >
+                  💾
+                </span>
+              )}
             </div>
             
             <div className="flex items-center space-x-2">

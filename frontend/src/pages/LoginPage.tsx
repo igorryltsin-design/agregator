@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../ui/Auth'
+import agregatorLogo from '../../logo/agregator.png'
 
 export default function LoginPage(){
   const { login, user, loading } = useAuth()
@@ -40,7 +41,12 @@ export default function LoginPage(){
         <div className="orb orb-4"></div>
       </div>
       <div className="login-card card p-4">
-        <div className="fw-semibold fs-4 mb-3 text-center">Agregator — вход</div>
+        <div className="text-center mb-3">
+          <span className="app-brand-badge app-brand-badge--lg">
+            <img src={agregatorLogo} alt="Agregator" />
+          </span>
+        </div>
+        <div className="fw-semibold fs-5 mb-3 text-center">Вход</div>
         <div className="text-muted text-center mb-4" style={{ fontSize: 14 }}>
           Управляйте коллекциями, задачами и LLM-сервисами в едином окне.
         </div>
