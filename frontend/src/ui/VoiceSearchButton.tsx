@@ -197,24 +197,28 @@ export default function VoiceSearchButton({ onTranscribed, onError, disabled }: 
 
   const icon = useMemo(() => {
     if (isBusy) {
-      return <span className="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+      return (
+        <span className="icon-glyph" aria-hidden="true">
+          <span className="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+        </span>
+      )
     }
     if (isRecording) {
-      return <span style={{ fontSize: '0.9rem' }}>⏹</span>
+      return <span className="icon-glyph" aria-hidden="true">⏹</span>
     }
-    return <span style={{ fontSize: '1rem' }}>🎤</span>
+    return <span className="icon-glyph" aria-hidden="true">🎤</span>
   }, [isBusy, isRecording])
 
   if (!supported) {
     return (
       <button
         type="button"
-        className="btn btn-outline-secondary"
+        className="btn btn-outline-secondary icon-only"
         disabled
         title={buttonLabel}
         aria-disabled="true"
       >
-        🎤
+        {icon}
       </button>
     )
   }
@@ -222,7 +226,7 @@ export default function VoiceSearchButton({ onTranscribed, onError, disabled }: 
   return (
     <button
       type="button"
-      className={`btn btn-outline-${isRecording ? 'danger' : 'secondary'}`}
+      className={`btn btn-outline-${isRecording ? 'danger' : 'secondary'} icon-only`}
       onClick={isRecording ? stopRecording : startRecording}
       disabled={disabled || isBusy}
       aria-pressed={isRecording}
@@ -233,4 +237,3 @@ export default function VoiceSearchButton({ onTranscribed, onError, disabled }: 
     </button>
   )
 }
-

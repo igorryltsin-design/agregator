@@ -25,11 +25,16 @@ export default function App() {
   const [scanMin, setScanMin] = useState(false)
   const [scanRunning, setScanRunning] = useState(false)
   const [scanStat, setScanStat] = useState<any>(null)
+  const [showHelp, setShowHelp] = useState(false)
   const toasts = useToasts()
   const isAdmin = user?.role === 'admin'
   const canUseAiword = !!user?.aiword_access
   const canImport = !!user?.can_import || isAdmin
   const adminMenuRef = useRef<HTMLDivElement | null>(null)
+  const helpDialogRef = useRef<HTMLDivElement | null>(null)
+  const helpTitleId = 'agregator-help-title'
+  const helpDescId = 'agregator-help-desc'
+  const iconButtonClass = 'btn btn-outline-secondary icon-only'
 
   useEffect(() => {
     if (!loading && !user) {
@@ -109,6 +114,21 @@ export default function App() {
     poll()
     return () => { if (timer) clearTimeout(timer) }
   }, [scanOpen])
+
+  useEffect(() => {
+    if (!showHelp) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowHelp(false)
+      }
+    }
+    const node = helpDialogRef.current
+    node?.focus()
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [showHelp])
 
   const startScan = async () => {
     if (!isAdmin) {
@@ -212,16 +232,47 @@ export default function App() {
               onChange={e => setSearchDraft(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitSearch(searchDraft, true) } }}
             />
-            <button className="btn btn-outline-secondary" type="button" onClick={() => commitSearch(searchDraft, true)}>
-              Найти
+            <button
+              className={iconButtonClass}
+              type="button"
+              onClick={() => commitSearch(searchDraft, true)}
+              aria-label="Выполнить поиск"
+              title="Выполнить поиск"
+            >
+              <span className="icon-glyph" aria-hidden="true">🔍</span>
             </button>
           </div>
           <VoiceSearchButton onTranscribed={handleVoiceSearch} onError={handleVoiceError} />
           <div className="ms-auto d-flex align-items-center gap-2 flex-wrap justify-content-end" style={{ rowGap: '0.3rem' }}>
-            <button className="btn btn-outline-secondary" onClick={()=> setTheme(t => t==='dark'?'light':'dark')} aria-label="Переключить тему">{theme==='dark'?'🌙':'☀️'}</button>
-            <Link className="btn btn-outline-secondary" to="graph">Граф</Link>
-            <Link className="btn btn-outline-secondary" to="stats">Статистика</Link>
-            {canImport && <Link className="btn btn-outline-secondary" to="ingest">Импорт</Link>}
+            <button
+              className={iconButtonClass}
+              type="button"
+              onClick={() => setShowHelp(true)}
+              aria-label="Справка по Agregator"
+              title="Справка по Agregator"
+            >
+              <span className="icon-glyph" aria-hidden="true">❔</span>
+            </button>
+            <button
+              className={iconButtonClass}
+              type="button"
+              onClick={()=> setTheme(t => t==='dark'?'light':'dark')}
+              aria-label="Переключить тему"
+              title="Переключить тему"
+            >
+              <span className="icon-glyph" aria-hidden="true">{theme==='dark'?'🌙':'☀️'}</span>
+            </button>
+            <Link className={iconButtonClass} to="graph" aria-label="Граф" title="Граф">
+              <span className="icon-glyph" aria-hidden="true">🕸️</span>
+            </Link>
+            <Link className={iconButtonClass} to="stats" aria-label="Статистика" title="Статистика">
+              <span className="icon-glyph" aria-hidden="true">📊</span>
+            </Link>
+            {canImport && (
+              <Link className={iconButtonClass} to="ingest" aria-label="Импорт" title="Импорт">
+                <span className="icon-glyph" aria-hidden="true">📥</span>
+              </Link>
+            )}
             {isAdmin && (
               <div className="position-relative" ref={adminMenuRef}>
                 <button className="btn btn-outline-secondary" type="button" onClick={() => setAdminMenuOpen(v => !v)} aria-expanded={adminMenuOpen}>
@@ -244,9 +295,13 @@ export default function App() {
                 )}
               </div>
             )}
-            <Link className="btn btn-outline-secondary" to="profile">Профиль</Link>
+            <Link className={iconButtonClass} to="profile" aria-label="Профиль" title="Профиль">
+              <span className="icon-glyph" aria-hidden="true">👤</span>
+            </Link>
             <span className="badge bg-secondary text-uppercase" style={{ letterSpacing: 0.3 }}>{user.role === 'admin' ? 'Админ' : 'Пользователь'}</span>
-            <button className="btn btn-outline-secondary" onClick={handleLogout}>Выход</button>
+            <button className={iconButtonClass} type="button" onClick={handleLogout} aria-label="Выйти" title="Выйти">
+              <span className="icon-glyph" aria-hidden="true">🚪</span>
+            </button>
             {canUseAiword && (
               <a
                 className="aiword-launch-link d-flex align-items-center"
@@ -264,6 +319,103 @@ export default function App() {
           </div>
         </div>
       </nav>
+      {showHelp && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={helpTitleId}
+          aria-describedby={helpDescId}
+          className="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center"
+          style={{ background: 'rgba(0, 0, 0, 0.6)', zIndex: 2000 }}
+          onClick={() => setShowHelp(false)}
+        >
+          <div
+            ref={helpDialogRef}
+            tabIndex={-1}
+            className="rounded-4 shadow-lg"
+            style={{ background: 'var(--surface)', color: 'var(--text)', maxWidth: 720, width: '90%', padding: '24px 28px', border: '1px solid var(--border)' }}
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="d-flex justify-content-between align-items-start mb-3 gap-3">
+              <div>
+                <h2 id={helpTitleId} className="h4 mb-2" style={{ color: 'var(--text)' }}>Agregator — справка</h2>
+                <p id={helpDescId} className="mb-0 muted" style={{ color: 'var(--muted)' }}>
+                  Краткое описание назначения каталога, основных разделов интерфейса и полезных горячих клавиш.
+                </p>
+              </div>
+              <button className="btn btn-outline-secondary" type="button" onClick={() => setShowHelp(false)} aria-label="Закрыть справку">✕</button>
+            </div>
+            <div className="d-grid gap-3" style={{ fontSize: 14, lineHeight: 1.5 }}>
+              <section>
+                <h3 className="h6 mb-2" style={{ color: 'var(--text)' }}>О приложении</h3>
+                <p className="mb-0">
+                  Agregator — локальный каталог научных материалов с поддержкой полнотекстового и AI-поиска, расширенными
+                  метаданными и управлением доступом. Приложение индексирует выбранные директории, извлекает текст и теги,
+                  строит связи «файл ↔ коллекция ↔ теги» и предоставляет единый интерфейс для работы команды.
+                </p>
+              </section>
+              <section>
+                <h3 className="h6 mb-2" style={{ color: 'var(--text)' }}>Главные разделы интерфейса</h3>
+                <ul className="mb-0" style={{ paddingLeft: 18 }}>
+                  <li><strong>Поиск</strong> — основная лента материалов с фильтрами по типу, тегам, коллекциям и AI-ответами.</li>
+                  <li><strong>Граф</strong> — визуализация связей между файлами, тегами и коллекциями для быстрого анализа тем.</li>
+                  <li><strong>Статистика</strong> — обзор по количеству материалов, динамике пополнения и заполненности метаданных.</li>
+                  {canImport && <li><strong>Импорт</strong> — загрузка новых файлов, создание коллекций и запуск пакетного сканирования.</li>}
+                  <li><strong>Профиль</strong> — персональные настройки, API-ключи и права доступа.</li>
+                  {isAdmin && <li><strong>Администрирование</strong> — управление пользователями, задачами сканирования, журналом действий и LLM-эндпоинтами.</li>}
+                  {canUseAiword && <li><strong>AIWord</strong> — отдельный редактор научных текстов, открывается в новой вкладке.</li>}
+                </ul>
+              </section>
+              <section>
+                <h3 className="h6 mb-2" style={{ color: 'var(--text)' }}>Режимы поиска</h3>
+                <p className="mb-2">
+                  В строке поиска доступны два сценария: классический полнотекстовый поиск и AI-поиск с генерацией кратких ответов.
+                  Между режимами можно переключаться над результатами выдачи.
+                </p>
+                <ul className="mb-0" style={{ paddingLeft: 18 }}>
+                  <li>
+                    <strong>Классический поиск</strong> — обрабатывает запрос мгновенно, использует морфологию, синонимы и фильтры.
+                    Результаты сортируются по релевантности и дате; запуск осуществляется клавишей Enter или иконкой 🔍, после чего
+                    выдачу можно уточнять тегами, коллекциями и годами.
+                  </li>
+                  <li>
+                    <strong>AI-поиск</strong> — расширяет запрос LLM, реранжирует найденные материалы и формирует краткий ответ с цитатами.
+                    Работает чуть медленнее, отображает индикатор прогресса и стримит результат; использует модели, заданные
+                    администратором в разделе «LLM».
+                  </li>
+                </ul>
+              </section>
+              <section>
+                <h3 className="h6 mb-2" style={{ color: 'var(--text)' }}>Сканирование и обновление каталога</h3>
+                <p className="mb-0">
+                  Используйте кнопку «Сканировать» в правом нижнем углу (или раздел «Импорт») для запуска обхода файлов. Во время
+                  процесса отображается статистика и прогресс. Доступно ручное обновление отдельного файла через карточку материала.
+                </p>
+              </section>
+              <section>
+                <h3 className="h6 mb-2" style={{ color: 'var(--text)' }}>AI-помощь</h3>
+                <p className="mb-0">
+                  AI-ответы используют те же отфильтрованные документы, поэтому классический поиск помогает подготовить выдачу.
+                  Вкладка AI отображает ход обработки, подсвечивает источники и доступна только при настроенных LLM-эндпоинтах в
+                  админ-панели.
+                </p>
+              </section>
+              <section>
+                <h3 className="h6 mb-2" style={{ color: 'var(--text)' }}>Горячие клавиши</h3>
+                <ul className="mb-0" style={{ paddingLeft: 18 }}>
+                  <li><strong>/</strong> — перейти в поле поиска.</li>
+                  <li><strong>Esc</strong> — закрыть выпадающие окна и справку.</li>
+                </ul>
+              </section>
+            </div>
+            <div className="text-end mt-4">
+              <button className="btn btn-primary" type="button" onClick={() => setShowHelp(false)}>
+                Понятно
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="container-fluid">
         <Outlet />
       </div>
