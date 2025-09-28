@@ -42,6 +42,7 @@ export default function AdminCollectionsPage() {
   const [renameLoading, setRenameLoading] = useState(false)
   const [deleteLoading, setDeleteLoading] = useState(false)
   const [clearLoading, setClearLoading] = useState(false)
+  const [exportLoading, setExportLoading] = useState(false)
   const [memberForm, setMemberForm] = useState<{ username: string; role: string; userId: number | null }>({ username: '', role: 'viewer', userId: null })
   const [memberOptions, setMemberOptions] = useState<UserSuggestion[]>([])
   const [memberLookupLoading, setMemberLookupLoading] = useState(false)
@@ -253,6 +254,51 @@ export default function AdminCollectionsPage() {
     }
   }
 
+  const exportExcel = async () => {
+    if (!selectedId) return
+    setExportLoading(true)
+    try {
+      const r = await fetch(`/api/collections/${selectedId}/export/excel`)
+      if (!r.ok) {
+        let message = 'Не удалось экспортировать коллекцию'
+        try {
+          const data = await r.json()
+          if (data?.error) message = data.error
+        } catch {}
+        toasts.push(message, 'error')
+        return
+      }
+      const blob = await r.blob()
+      let filename = `collection-${selectedId}.xlsx`
+      const disposition = r.headers.get('Content-Disposition') || r.headers.get('content-disposition')
+      if (disposition) {
+        const match = disposition.match(/filename\s*=\s*"?([^";]+)"?/i)
+        if (match && match[1]) {
+          try {
+            filename = decodeURIComponent(match[1])
+          } catch {
+            filename = match[1]
+          }
+        }
+      }
+      const url = window.URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      window.setTimeout(() => {
+        window.URL.revokeObjectURL(url)
+        link.remove()
+      }, 0)
+      toasts.push('Файл экспорта загружен', 'success')
+    } catch {
+      toasts.push('Ошибка сети при экспорте коллекции', 'error')
+    } finally {
+      setExportLoading(false)
+    }
+  }
+
   const addMember = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!selectedId) return
@@ -373,42 +419,52 @@ export default function AdminCollectionsPage() {
                     {selectedCollection.owner_username ? `Владелец: ${selectedCollection.owner_username}` : 'Владелец не задан'} · {selectedCollection.is_private ? 'Приватная' : 'Общая'}
                   </div>
                 </div>
-                {isAdmin && (
-                  <div className="btn-group btn-group-sm">
-                    <button
-                      type="button"
-                      className="btn btn-outline-secondary"
-                      onClick={rescanCollection}
-                      disabled={rescanLoading}
-                    >
-                      {rescanLoading ? '...' : 'Пересканировать'}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-outline-secondary"
-                      onClick={renameAll}
-                      disabled={renameLoading}
-                    >
-                      {renameLoading ? '...' : 'Переименовать все'}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-outline-warning"
-                      onClick={clearCollection}
-                      disabled={clearLoading}
-                    >
-                      {clearLoading ? '...' : 'Очистить'}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-outline-danger"
-                      onClick={deleteCollection}
-                      disabled={deleteLoading}
-                    >
-                      {deleteLoading ? '...' : 'Удалить'}
-                    </button>
-                  </div>
-                )}
+                <div className="d-flex align-items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    onClick={exportExcel}
+                    disabled={exportLoading}
+                  >
+                    {exportLoading ? '...' : 'Экспорт в Excel'}
+                  </button>
+                  {isAdmin && (
+                    <div className="btn-group btn-group-sm">
+                      <button
+                        type="button"
+                        className="btn btn-outline-secondary"
+                        onClick={rescanCollection}
+                        disabled={rescanLoading}
+                      >
+                        {rescanLoading ? '...' : 'Пересканировать'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-outline-secondary"
+                        onClick={renameAll}
+                        disabled={renameLoading}
+                      >
+                        {renameLoading ? '...' : 'Переименовать все'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-outline-warning"
+                        onClick={clearCollection}
+                        disabled={clearLoading}
+                      >
+                        {clearLoading ? '...' : 'Очистить'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-outline-danger"
+                        onClick={deleteCollection}
+                        disabled={deleteLoading}
+                      >
+                        {deleteLoading ? '...' : 'Удалить'}
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
               <form className="row g-2 align-items-end mb-3" onSubmit={addMember}>
                 <div className="col-md-5 position-relative">

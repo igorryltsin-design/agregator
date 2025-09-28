@@ -178,6 +178,7 @@ docker compose up -d
 | `/api/graph`, `/api/graph/build` | GET, POST | Построение графа связей и автодобавление тегов. |
 | `/api/stats`, `/api/stats/tag-values` | GET | Дашборд статистики. |
 | `/export/csv`, `/export/bibtex`, `/api/aiword/bibtex` | GET | Экспорт каталога. |
+| `/api/collections/<id>/export/excel` | GET | Экспорт выбранной коллекции в Excel (гиперссылки на файлы). |
 | `/api/ai-search`, `/api/ai-search/stream` | POST | AI-поиск (JSON/Server-Sent Events). |
 | `/api/admin/users`, `/api/admin/tasks`, `/api/admin/llm-endpoints`, `/api/admin/actions` | GET/POST/PATCH/DELETE | Администрирование пользователей, задач, LLM, логов. |
 | `/scan/start`, `/scan/status`, `/scan/cancel` | POST/GET | Управление фоновым сканированием. |

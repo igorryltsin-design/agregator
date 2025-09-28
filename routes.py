@@ -1,8 +1,8 @@
 from flask import Blueprint, jsonify, request, Response, g, abort
-from io import StringIO
+from io import StringIO, BytesIO
 import csv
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 import json
 
 from models import (File, Tag, db, upsert_tag, file_to_dict, ChangeLog,
@@ -34,6 +34,35 @@ _RU_SYNONYMS = {
     'страница': ['стр', 'страницы', 'pages', 'page'],
     'год': ['лет', 'г'],
 }
+
+_XLSX_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def _xlsx_safe(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool, datetime, date)):
+        return value
+    text = str(value)
+    if not text:
+        return ""
+    sanitized = _XLSX_ILLEGAL_RE.sub(' ', text)
+    def _valid_char(ch: str) -> bool:
+        cp = ord(ch)
+        if cp in (0x09, 0x0A, 0x0D):
+            return True
+        if 0x20 <= cp <= 0xD7FF:
+            return True
+        if 0xE000 <= cp <= 0xFFFD:
+            return cp not in (0xFFFE, 0xFFFF)
+        if 0x10000 <= cp <= 0x10FFFF:
+            return True
+        return False
+    sanitized = ''.join(ch if _valid_char(ch) else ' ' for ch in sanitized)
+    max_len = 32767
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len]
+    return sanitized
 
 def _ru_tokens(text: str) -> list[str]:
     s = (text or '').lower()
@@ -784,6 +813,145 @@ def export_bibtex():
     for file in files:
         output.write(f"@misc{{{file.id},\n  title={{ {file.filename} }},\n  tags={{ {', '.join(f'{t.key}={t.value}' for t in file.tags)} }}\n}}\n")
     return Response(output.getvalue(), mimetype="text/x-bibtex", headers={"Content-Disposition": "attachment;filename=export.bib"})
+
+
+@routes.route("/api/collections/<int:collection_id>/export/excel")
+def export_collection_excel(collection_id: int):
+    allowed = _allowed_collection_ids()
+    if allowed is not None and collection_id not in allowed:
+        abort(403)
+
+    collection = Collection.query.get_or_404(collection_id)
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        current_app.logger.error("Excel export unavailable: openpyxl is not installed")
+        return jsonify({'ok': False, 'error': 'Экспорт в Excel недоступен: требуется openpyxl'}), 500
+
+    files = File.query.filter(File.collection_id == collection_id).order_by(File.id.asc()).all()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Files"
+
+    headers = [
+        "File",
+        "Collection Relative Path",
+        "Collection",
+        "ID",
+        "Title",
+        "Author",
+        "Year",
+        "Material Type",
+        "Advisor",
+        "Keywords",
+        "Abstract",
+        "Filename",
+        "Extension",
+        "Size (bytes)",
+        "Modified (UTC)",
+        "SHA1",
+        "Tags",
+    ]
+    ws.append(headers)
+    header_font = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = header_font
+
+    slug = (collection.slug or '').strip()
+    prefix = f"collections/{slug}/" if slug else None
+    row_count = 0
+    max_lengths = [len(h) for h in headers]
+
+    for f in files:
+        rel_path = (f.rel_path or '').replace('\\', '/')
+        if prefix and rel_path.startswith(prefix):
+            col_rel_path = rel_path[len(prefix):]
+        else:
+            col_rel_path = rel_path
+
+        display_name = (f.title or f.filename or Path(rel_path).name or f"file-{f.id}").strip()
+
+        tag_map: dict[str, list[str]] = {}
+        for t in getattr(f, 'tags', []) or []:
+            key = (getattr(t, 'key', '') or '').strip()
+            value = (getattr(t, 'value', '') or '').strip()
+            if not key or not value:
+                continue
+            tag_map.setdefault(key, []).append(value)
+        tag_repr = '; '.join(
+            f"{k}={', '.join(sorted(set(vs)))}" for k, vs in sorted(tag_map.items())
+        )
+
+        modified = None
+        if getattr(f, 'mtime', None):
+            try:
+                modified = datetime.utcfromtimestamp(float(f.mtime)).isoformat()
+            except Exception:
+                modified = str(f.mtime)
+
+        row_raw = [
+            display_name,
+            col_rel_path,
+            collection.name,
+            f.id,
+            f.title,
+            f.author,
+            f.year,
+            f.material_type,
+            f.advisor,
+            f.keywords,
+            f.abstract,
+            f.filename,
+            f.ext,
+            f.size,
+            modified,
+            f.sha1,
+            tag_repr,
+        ]
+        row = [_xlsx_safe(val) for val in row_raw]
+        ws.append(row)
+        row_idx = ws.max_row
+        link_cell = ws.cell(row=row_idx, column=1)
+        if col_rel_path:
+            safe_link = _xlsx_safe(col_rel_path)
+            link_cell.hyperlink = safe_link
+            link_cell.style = "Hyperlink"
+
+        for idx, val in enumerate(row, start=1):
+            if val is None:
+                continue
+            length = len(str(val))
+            if length > max_lengths[idx - 1]:
+                max_lengths[idx - 1] = min(length, 80)
+
+        row_count += 1
+
+    for idx, width in enumerate(max_lengths, start=1):
+        column_letter = get_column_letter(idx)
+        ws.column_dimensions[column_letter].width = width + 2
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"{slug or 'collection'}-{ts}.xlsx"
+
+    try:
+        detail = json.dumps({'files': row_count})
+    except Exception:
+        detail = None
+    _log_user_action('collection_export_excel', 'collection', collection_id, detail=detail)
+
+    return Response(
+        output.getvalue(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 @routes.route("/api/aiword/bibtex")
 def api_aiword_bibtex():

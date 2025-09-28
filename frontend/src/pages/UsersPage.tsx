@@ -10,6 +10,8 @@ type UserRow = {
   created_at?: string | null
 }
 
+type UserForm = { username: string; full_name: string; password: string; role: 'admin' | 'user' }
+
 export default function UsersPage(){
   const { user } = useAuth()
   const isAdmin = user?.role === 'admin'
@@ -17,7 +19,7 @@ export default function UsersPage(){
   const [rows, setRows] = useState<UserRow[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({ username: '', password: '', role: 'user' as 'admin' | 'user' })
+  const [form, setForm] = useState<UserForm>({ username: '', full_name: '', password: '', role: 'user' })
   const [saving, setSaving] = useState(false)
 
   const load = async () => {
@@ -54,8 +56,12 @@ export default function UsersPage(){
 
   const createUser = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
-    if (!form.username.trim() || !form.password.trim()) {
-      setError('Укажите логин и пароль')
+    if (!form.username.trim() || !form.password.trim() || !form.full_name.trim()) {
+      setError('Укажите логин, ФИО и пароль')
+      return
+    }
+    if (form.full_name.trim().length < 5) {
+      setError('ФИО должно содержать минимум 5 символов')
       return
     }
     setSaving(true)
@@ -64,12 +70,12 @@ export default function UsersPage(){
       const r = await fetch('/api/admin/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: form.username.trim(), password: form.password, role: form.role }),
+        body: JSON.stringify({ username: form.username.trim(), full_name: form.full_name.trim(), password: form.password, role: form.role }),
       })
       const data = await r.json().catch(() => ({}))
       if (r.ok && data?.ok && data.user) {
         setRows(prev => [...prev, data.user])
-        setForm({ username: '', password: '', role: 'user' })
+        setForm({ username: '', full_name: '', password: '', role: 'user' })
         toasts.push('Пользователь создан', 'success')
       } else {
         setError(data?.error || 'Не удалось создать пользователя')
@@ -145,23 +151,27 @@ export default function UsersPage(){
       <div className="card p-3">
         <div className="fw-semibold mb-2">Создать пользователя</div>
         <form className="row g-3 align-items-end" onSubmit={createUser}>
-          <div className="col-md-4">
+          <div className="col-12 col-lg-3">
             <label className="form-label">Логин</label>
             <input className="form-control" value={form.username} onChange={e=>setForm({...form, username:e.target.value})} autoComplete="off" />
           </div>
-          <div className="col-md-4">
+          <div className="col-12 col-lg-4">
+            <label className="form-label">ФИО</label>
+            <input className="form-control" value={form.full_name} onChange={e=>setForm({...form, full_name:e.target.value})} autoComplete="off" />
+          </div>
+          <div className="col-12 col-lg-3">
             <label className="form-label">Пароль</label>
             <input className="form-control" type="password" value={form.password} onChange={e=>setForm({...form, password:e.target.value})} autoComplete="new-password" />
           </div>
-          <div className="col-md-2">
+          <div className="col-6 col-lg-2">
             <label className="form-label">Роль</label>
             <select className="form-select" value={form.role} onChange={e=>setForm({...form, role: e.target.value as 'admin' | 'user'})}>
               <option value="user">Пользователь</option>
               <option value="admin">Администратор</option>
             </select>
           </div>
-          <div className="col-md-2">
-            <button className="btn btn-primary w-100" type="submit" disabled={saving}>{saving ? 'Создание…' : 'Создать'}</button>
+          <div className="col-6 col-lg-auto d-grid">
+            <button className="btn btn-primary" type="submit" disabled={saving}>{saving ? 'Создание…' : 'Создать'}</button>
           </div>
           {error && <div className="col-12"><div className="alert alert-danger py-2 m-0">{error}</div></div>}
         </form>
