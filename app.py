@@ -787,6 +787,7 @@ def _record_search_metric(query_hash: str, durations: dict[str, float], user: Us
 # ------------------- Конфигурация -------------------
 
 BASE_DIR = Path(__file__).parent
+LOGIN_BACKGROUNDS_DIR = (BASE_DIR / 'static' / 'login-backgrounds').resolve()
 # Подхватить .env, если есть рядом
 load_dotenv(BASE_DIR / ".env") if (BASE_DIR / ".env").exists() else None
 
@@ -1677,8 +1678,8 @@ DEFAULT_ADMIN_PASSWORD = (os.getenv('DEFAULT_ADMIN_PASSWORD') or '').strip()
 LEGACY_ACCESS_CODE = (os.getenv('ACCESS_CODE') or '').strip()
 SESSION_KEY = 'user_id'
 
-_PUBLIC_PREFIXES = ('/static/', '/assets/')
-_PUBLIC_PATHS = {'/favicon.ico', '/api/auth/login'}
+_PUBLIC_PREFIXES = ('/static/', '/assets/', '/login-backgrounds/')
+_PUBLIC_PATHS = {'/favicon.ico', '/api/auth/login', '/api/login-backgrounds'}
 
 def _log_user_action(user: User | None, action: str, entity: str | None = None, entity_id: int | None = None, detail: str | None = None) -> None:
     try:
@@ -4242,6 +4243,74 @@ def app_react():
 def app_react_catchall(_path: str):
     """Внутренний роутинг React: любые пути внутри /app/*."""
     return _serve_spa()
+
+
+def _collect_login_backgrounds() -> list[dict[str, str]]:
+    """Enumerate available HTML backgrounds for the login screen."""
+    entries: list[dict[str, str]] = []
+    try:
+        directory = LOGIN_BACKGROUNDS_DIR
+        if not directory.exists():
+            return entries
+        for item in sorted(directory.glob('*.html')):
+            if not item.is_file():
+                continue
+            label = item.stem.replace('_', ' ').replace('-', ' ').strip().title()
+            try:
+                text = item.read_text(encoding='utf-8', errors='ignore')
+            except Exception:
+                text = ''
+            match = re.search(r'<title[^>]*>(.*?)</title>', text, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                raw = match.group(1).strip()
+                if raw:
+                    label = re.sub(r'\s+', ' ', raw)
+            entries.append({
+                'name': item.name,
+                'label': label,
+                'url': f"/login-backgrounds/{item.name}",
+            })
+    except Exception as exc:
+        try:
+            current_app.logger.warning('login backgrounds scan failed: %s', exc)
+        except Exception:
+            pass
+    return entries
+
+
+@app.route('/api/login-backgrounds')
+def api_login_backgrounds():
+    """Expose available login background animations."""
+    return jsonify(_collect_login_backgrounds())
+
+
+@app.route('/login-backgrounds/<path:filename>')
+def login_background_file(filename: str):
+    """Serve individual login background HTML files."""
+    if '/' in filename or '\\' in filename:
+        abort(404)
+    if not filename.lower().endswith('.html'):
+        abort(404)
+    directory = LOGIN_BACKGROUNDS_DIR
+    if not directory.exists():
+        abort(404)
+    try:
+        response = send_from_directory(str(directory), filename)
+    except FileNotFoundError:
+        abort(404)
+    try:
+        # Разрешаем встраивание в iframe на этом же домене.
+        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+        csp = response.headers.get('Content-Security-Policy')
+        if csp:
+            if 'frame-ancestors' not in csp:
+                response.headers['Content-Security-Policy'] = csp.rstrip(';') + "; frame-ancestors 'self'"
+        else:
+            response.headers['Content-Security-Policy'] = "frame-ancestors 'self'"
+    except Exception:
+        pass
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 @app.route('/assets/<path:filename>')
 def vite_assets(filename):
