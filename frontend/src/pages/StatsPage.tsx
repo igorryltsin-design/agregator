@@ -20,11 +20,19 @@ type StatsResponse = {
   hours: StatKV[]
   avg_size_type: StatKV[]
   meta_presence: StatKV[]
+  meta_missing?: StatKV[]
   total_files: number
   total_size_bytes: number
   collections_counts?: StatKV[]
   collections_total_size?: [string, number][]
   largest_files?: [string, number][]
+  recent_counts?: { '7d'?: number; '30d'?: number }
+  tags_summary?: {
+    avg_per_file?: number
+    with_tags?: number
+    without_tags?: number
+    total_tags?: number
+  }
 }
 
 export default function StatsPage(){
@@ -97,6 +105,8 @@ export default function StatsPage(){
       red: '#d73a49',
     }
   }, [document.documentElement.getAttribute('data-theme')])
+
+  const numberFormatter = useMemo(() => new Intl.NumberFormat('ru-RU'), [])
 
   const commonOptions: any = useMemo(() => ({
     responsive: true,
@@ -315,11 +325,35 @@ export default function StatsPage(){
   const totalInfo = useMemo(() => {
     if (!data) return null
     const bytes = Number(data.total_size_bytes||0)
-    const nf = new Intl.NumberFormat('ru-RU')
     const units = ['Б','КБ','МБ','ГБ','ТБ']
     let v = bytes; let i = 0
     while (v >= 1024 && i < units.length-1) { v/=1024; i++ }
-    return { files: nf.format(data.total_files||0), size: `${v.toFixed(1)} ${units[i]}` }
+    return { files: numberFormatter.format(data.total_files||0), size: `${v.toFixed(1)} ${units[i]}` }
+  }, [data, numberFormatter])
+
+  const recentInfo = useMemo(() => {
+    if (!data?.recent_counts) return null
+    return {
+      '30d': numberFormatter.format(data.recent_counts['30d'] || 0),
+      '7d': numberFormatter.format(data.recent_counts['7d'] || 0),
+    }
+  }, [data, numberFormatter])
+
+  const tagsInfo = useMemo(() => {
+    const summary = data?.tags_summary
+    if (!summary) return null
+    return {
+      avg: (Number(summary.avg_per_file || 0)).toFixed(1),
+      withTags: numberFormatter.format(summary.with_tags || 0),
+      withoutTags: numberFormatter.format(summary.without_tags || 0),
+    }
+  }, [data, numberFormatter])
+
+  const metaMissing = useMemo(() => {
+    if (!data?.meta_missing) return []
+    return [...data.meta_missing]
+      .filter(([, count]) => Number(count || 0) > 0)
+      .sort((a, b) => Number(b?.[1] || 0) - Number(a?.[1] || 0))
   }, [data])
   return (
     <div className="card p-3">
@@ -364,6 +398,21 @@ export default function StatsPage(){
               <div className="card p-3 text-center kpi" aria-labelledby="kpi-size">
                 <div id="kpi-size" className="label muted">Размер</div>
                 <div className="value">{totalInfo?.size}</div>
+              </div>
+            </div>
+            <div className="col-6 col-xl-3">
+              <div className="card p-3 text-center kpi" aria-labelledby="kpi-recent">
+                <div id="kpi-recent" className="label muted">Новых за 30 дней</div>
+                <div className="value">{recentInfo?.['30d'] || '0'}</div>
+                <div className="muted" style={{ fontSize: 12 }}>За 7 дн: {recentInfo?.['7d'] || '0'}</div>
+              </div>
+            </div>
+            <div className="col-6 col-xl-3">
+              <div className="card p-3 text-center kpi" aria-labelledby="kpi-tags">
+                <div id="kpi-tags" className="label muted">Среднее тегов</div>
+                <div className="value">{tagsInfo?.avg || '0.0'}</div>
+                <div className="muted" style={{ fontSize: 12 }}>С тегами: {tagsInfo?.withTags || '0'}</div>
+                <div className="muted" style={{ fontSize: 12 }}>Без тегов: {tagsInfo?.withoutTags || '0'}</div>
               </div>
             </div>
           </div>
@@ -433,6 +482,20 @@ export default function StatsPage(){
                   <button className="btn btn-sm btn-outline-secondary" onClick={()=> exportCSV('meta_presence', data?.meta_presence || [])}>CSV</button>
                 </div>
                 <div className="chart-body"><canvas ref={refMeta}/></div>
+              </div>
+            </div>
+            <div className="col-12 col-xl-6">
+              <div className="card p-3">
+                <div className="fw-semibold mb-2">Поля без заполнения</div>
+                <div className="d-flex flex-column gap-1">
+                  {metaMissing.length === 0 && <div className="text-muted">Все данные заполнены</div>}
+                  {metaMissing.map(([label, count]) => (
+                    <div key={label} className="d-flex justify-content-between" style={{ fontSize: 13 }}>
+                      <span>{label}</span>
+                      <span className="text-muted">{numberFormatter.format(count)}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
             <div className="col-12 col-xl-6">

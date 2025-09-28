@@ -598,6 +598,7 @@ LLM_PROVIDER_OPTIONS = [
 ]
 TASK_RETENTION_WINDOW = timedelta(days=1)
 TASK_FINAL_STATUSES = ('completed', 'error', 'cancelled')
+TASK_STUCK_STATUSES = ('running', 'pending', 'queued', 'cancelling')
 
 def _row_text_for_search(f: File) -> str:
     parts = [
@@ -2322,6 +2323,7 @@ def api_admin_users():
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = (data.get('password') or '').strip()
+    full_name = (data.get('full_name') or '').strip()
     role = (data.get('role') or 'user').strip().lower()
     if role not in ('admin', 'user'):
         role = 'user'
@@ -2329,13 +2331,21 @@ def api_admin_users():
         return jsonify({'ok': False, 'error': 'Логин должен содержать минимум 3 символа'}), 400
     if len(password) < 6:
         return jsonify({'ok': False, 'error': 'Пароль должен содержать минимум 6 символов'}), 400
+    if len(full_name) < 5:
+        return jsonify({'ok': False, 'error': 'Укажите ФИО (минимум 5 символов)'}), 400
     if User.query.filter(func.lower(User.username) == username.lower()).first():
         return jsonify({'ok': False, 'error': 'Пользователь с таким логином уже существует'}), 409
-    user = User(username=username, role=role)
+    user = User(username=username, role=role, full_name=full_name)
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
-    _log_user_action(_load_current_user(), 'user_create', 'user', user.id, detail=json.dumps({'username': username, 'role': role}))
+    _log_user_action(
+        _load_current_user(),
+        'user_create',
+        'user',
+        user.id,
+        detail=json.dumps({'username': username, 'role': role, 'full_name': full_name}, ensure_ascii=False)
+    )
     return jsonify({'ok': True, 'user': _user_to_payload(user)}), 201
 
 
@@ -5309,6 +5319,41 @@ def _task_to_dict(task: TaskRecord) -> dict:
     }
 
 
+def _reset_inflight_tasks() -> int:
+    """Mark tasks that were left in non-final statuses as failed on startup."""
+    try:
+        stuck = TaskRecord.query.filter(TaskRecord.status.in_(TASK_STUCK_STATUSES)).all()
+    except Exception as exc:
+        app.logger.warning(f"[tasks] failed to load stuck tasks: {exc}")
+        return 0
+    if not stuck:
+        return 0
+    now = datetime.utcnow()
+    updated = 0
+    for task in stuck:
+        try:
+            task.status = 'error'
+            task.error = 'Прервано: перезапуск приложения'
+            if not task.finished_at:
+                task.finished_at = now
+            if not task.started_at:
+                task.started_at = task.created_at or now
+            if task.progress is None:
+                task.progress = 0.0
+            updated += 1
+        except Exception:
+            app.logger.debug('[tasks] failed to mark task #%s as interrupted', getattr(task, 'id', '?'))
+    try:
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.warning(f"[tasks] failed to commit stuck task reset: {exc}")
+        return 0
+    if updated:
+        app.logger.info(f"[tasks] reset {updated} stuck task(s) on startup")
+    return updated
+
+
 def _cleanup_old_tasks() -> None:
     cutoff = datetime.utcnow() - TASK_RETENTION_WINDOW
     try:
@@ -5982,6 +6027,14 @@ def api_stats():
     size_cnt_by_type = Counter()
     # заполненность ключевых полей
     meta_presence = Counter()
+    meta_missing = Counter()
+    # дополнительные показатели
+    tags_total = 0
+    tagless_files = 0
+    now = datetime.utcnow()
+    recent_7_cut = now - timedelta(days=7)
+    recent_30_cut = now - timedelta(days=30)
+    recent_counts = {'7d': 0, '30d': 0}
     def bucket_size(sz):
         if sz is None or sz <= 0:
             return "неизв."
@@ -6008,11 +6061,14 @@ def api_stats():
         size_buckets[bucket_size(f.size or 0)] += 1
         if f.mtime:
             try:
-                from datetime import datetime, timedelta
                 d = datetime.fromtimestamp(f.mtime)
                 months[d.strftime('%Y-%m')] += 1
                 weekdays[d.weekday()] += 1  # Понедельник=0
                 hours[d.hour] += 1
+                if d >= recent_30_cut:
+                    recent_counts['30d'] += 1
+                if d >= recent_7_cut:
+                    recent_counts['7d'] += 1
             except Exception:
                 pass
         # ключевые слова
@@ -6022,14 +6078,17 @@ def api_stats():
                 if w:
                     kw[w] += 1
         # ключи тегов
+        tag_count = 0
         try:
             for t in f.tags:
+                tag_count += 1
                 if t.key:
                     tag_keys[t.key] += 1
                 if t.value:
                     tag_values[str(t.value).strip()] += 1
         except Exception:
-            pass
+            tag_count = 0
+        tags_total += tag_count
         # средний размер по типам
         if f.material_type and (f.size or 0) > 0:
             size_sum_by_type[f.material_type] += int(f.size or 0)
@@ -6037,17 +6096,25 @@ def api_stats():
         # заполненность полей
         if f.title:
             meta_presence['Название'] += 1
+        else:
+            meta_missing['Название'] += 1
         if f.author:
             meta_presence['Автор'] += 1
+        else:
+            meta_missing['Автор'] += 1
         if f.year:
             meta_presence['Год'] += 1
+        else:
+            meta_missing['Год'] += 1
         if f.keywords:
             meta_presence['Ключевые слова'] += 1
-        try:
-            if f.tags and len(f.tags) > 0:
-                meta_presence['Теги'] += 1
-        except Exception:
-            pass
+        else:
+            meta_missing['Ключевые слова'] += 1
+        if tag_count > 0:
+            meta_presence['Теги'] += 1
+        else:
+            meta_missing['Теги'] += 1
+            tagless_files += 1
     # подготовка выходных структур
     # средний размер по типам (в МБ, округляем до десятых)
     avg_size_type = []
@@ -6099,6 +6166,13 @@ def api_stats():
     except Exception:
         pass
 
+    tags_summary = {
+        'avg_per_file': round(tags_total / total_files, 2) if total_files else 0.0,
+        'with_tags': max(total_files - tagless_files, 0),
+        'without_tags': tagless_files,
+        'total_tags': tags_total,
+    }
+
     return jsonify({
         "authors": authors.most_common(20),
         "authors_cloud": authors.most_common(100),
@@ -6114,11 +6188,17 @@ def api_stats():
         "hours": hours_list,
         "avg_size_type": avg_size_type,
         "meta_presence": sorted(meta_presence.items(), key=lambda x: x[0]),
+        "meta_missing": sorted(meta_missing.items(), key=lambda x: x[0]),
         "total_files": total_files,
         "total_size_bytes": total_size,
         "collections_counts": collections_counts,
         "collections_total_size": collections_total_size,
         "largest_files": largest_files,
+        "recent_counts": {
+            "7d": int(recent_counts['7d']),
+            "30d": int(recent_counts['30d']),
+        },
+        "tags_summary": tags_summary,
     })
 
 @app.route('/api/stats/tag-values')
@@ -6210,6 +6290,7 @@ app.register_blueprint(routes)
 
 with app.app_context():
     _ensure_search_support()
+    _reset_inflight_tasks()
 
 app.config['invalidate_facets'] = _invalidate_facets_cache
 app.config['facet_cache'] = FACET_CACHE
@@ -8548,7 +8629,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
             prompt_lines = [f"[{i+1}] id={it['file_id']} :: { (it.get('snippets') or [''])[0] }" for i, it in enumerate(top)]
             prompt = "\n".join(prompt_lines)
             sys = "Ты ранжируешь источники по релевантности к запросу. Верни JSON-массив id в порядке убывания релевантности."
-            user = f"Запрос: {query}\nИсточники:\n{prompt}\nОтвети только JSON массивом id."
+            user_prompt = f"Запрос: {query}\nИсточники:\n{prompt}\nОтвети только JSON массивом id."
             order = None
             last_error: Exception | None = None
             for choice in _llm_iter_choices('rerank'):
@@ -8561,7 +8642,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                     "model": choice.get('model') or LMSTUDIO_MODEL,
                     "messages": [
                         {"role": "system", "content": sys},
-                        {"role": "user", "content": user},
+                        {"role": "user", "content": user_prompt},
                     ],
                     "temperature": 0.0,
                     "max_tokens": 200,
