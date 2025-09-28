@@ -144,6 +144,24 @@ const extractTextForReviewFile = async (file: File): Promise<string> => {
 };
 
 const AGENT_CONTEXT_LIMIT = 6000;
+const AGG_SEARCH_CACHE_TTL_MS = 2 * 60 * 1000;
+const AGG_SEARCH_CACHE_LIMIT = 24;
+
+const formatDuration = (ms: number): string => {
+  if (ms < 1000) {
+    return `${Math.round(ms)} мс`;
+  }
+  if (ms < 60_000) {
+    const seconds = ms / 1000;
+    return seconds >= 10 ? `${Math.round(seconds)} с` : `${seconds.toFixed(1)} с`;
+  }
+  const minutes = Math.floor(ms / 60000);
+  const seconds = Math.round((ms % 60000) / 1000);
+  if (!seconds) {
+    return `${minutes} мин`;
+  }
+  return `${minutes} мин ${seconds} с`;
+};
 
 const trimForAgent = (source: string, limit: number = AGENT_CONTEXT_LIMIT) => {
   const normalized = (source || '').trim();
@@ -238,6 +256,35 @@ interface CacheEntry {
   action: string;
 }
 
+interface PlanSection {
+  title: string;
+  body: string;
+}
+
+interface CustomAgentDefinition {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  scope: 'selection' | 'document';
+  useCatalog: boolean;
+  streamToEditor: boolean;
+  applyToEditor: boolean;
+  temperature: number;
+  maxTokens: number;
+}
+
+type CustomAgentPayload = CustomAgentDefinition & { truncated?: boolean };
+
+interface CustomAgentTemplate {
+  key: string;
+  label: string;
+  description: string;
+  defaults: Partial<CustomAgentDefinition>;
+}
+
+type CustomAgentDraft = Omit<CustomAgentDefinition, 'id'>;
+
 type AgentCallOptions = {
   streamMode?: 'auto' | 'force' | 'off';
   applyToEditor?: boolean;
@@ -254,6 +301,7 @@ interface AgentPayloadShape {
   criteria?: string;
   mode?: string;
   catalog_context?: string;
+  custom_agent?: CustomAgentPayload;
 }
 
 const DEFAULT_PROJECT: Project = {
@@ -269,6 +317,117 @@ const DEFAULT_PROJECT: Project = {
 const DEFAULT_GOST_TEMPLATES: Record<string, string> = {
   "ГОСТ_Статья": `# Название статьи\n\n## Аннотация\nКраткое содержание (5–7 предложений).\n\n## Введение\nАктуальность, цель, задачи, объект/предмет.\n\n## Обзор литературы\nКлючевые источники, пробелы [@key2020].\n\n## Методы\nМодель, алгоритм, допущения.\n\n## Результаты\nОсновные находки, таблицы/рисунки.\n\n## Обсуждение\nСравнение с работами, ограничения.\n\n## Заключение\nВыводы, новизна, практическая значимость.\n\n## Список литературы\n(генерируется автоматически по [@citekey])\n`,
   "ГОСТ_Отчёт_НИР": `# Отчёт по НИР\n\n## Введение\nЦель, задачи, показатели.\n\n## Аналитический обзор\nСостояние проблемы, анализ решений [@petrov2019].\n\n## Теоретическая часть\nПостановка и формализация.\n\n## Экспериментальная часть\nПлан эксперимента, стенд, метрики.\n\n## Результаты и обсуждение\nТаблицы/графики, интерпретация.\n\n## Выводы и рекомендации\nКраткие тезисы.\n\n## Список сокращений\n…\n\n## Список литературы\n(автогенерация из BibTeX)\n`
+};
+
+const CUSTOM_AGENT_STORAGE_KEY = 'aiword-custom-agents-v1';
+
+const CUSTOM_AGENT_TEMPLATES: CustomAgentTemplate[] = [
+  {
+    key: 'blank',
+    label: 'Своя формулировка',
+    description: 'Пустой шаблон для уникальной инструкции.',
+    defaults: {
+      name: 'Своя задача',
+      description: '',
+      instructions: 'Опишите здесь ожидаемый результат и формат ответа. Например: «Сформулируй мотивационный абзац для введения и приведи 3 аргумента».' ,
+      scope: 'selection',
+      useCatalog: false,
+      streamToEditor: false,
+      applyToEditor: true,
+      temperature: 0.3,
+      maxTokens: 800,
+    },
+  },
+  {
+    key: 'style-editor',
+    label: 'Редактор стиля',
+    description: 'Переписывает выделение под заданный стиль и делает текст компактнее.',
+    defaults: {
+      name: 'Редактура стиля',
+      description: 'Исправляет громоздкие формулировки, выравнивает стиль под критерии проекта.',
+      instructions: 'Перепиши фрагмент в более ясном и компактном виде. Сохрани смысл и терминологию, убери канцеляризм, сделай предложения короче.',
+      scope: 'selection',
+      useCatalog: false,
+      streamToEditor: true,
+      applyToEditor: true,
+      temperature: 0.25,
+      maxTokens: 700,
+    },
+  },
+  {
+    key: 'insight-summary',
+    label: 'Выжимка инсайтов',
+    description: 'Берёт весь документ и делает краткий список выводов и идей.',
+    defaults: {
+      name: 'Инсайты по тексту',
+      description: 'Краткие выводы и риски по текущему документу.',
+      instructions: 'Составь список ключевых идей, рисков и рекомендаций по тексту. Используй нумерованный список, каждая мысль — до двух предложений.',
+      scope: 'document',
+      useCatalog: true,
+      streamToEditor: false,
+      applyToEditor: false,
+      temperature: 0.2,
+      maxTokens: 600,
+    },
+  },
+  {
+    key: 'translator',
+    label: 'Переводчик академического стиля',
+    description: 'Переводит выделение на английский, сохраняя терминологию.',
+    defaults: {
+      name: 'Перевод на английский',
+      description: 'Точный перевод в академическом стиле.',
+      instructions: 'Переведи фрагмент на английский язык, сохрани академический стиль и транслитерируй имена собственные при необходимости. Добавь при необходимости короткие пояснения в скобках.',
+      scope: 'selection',
+      useCatalog: false,
+      streamToEditor: true,
+      applyToEditor: true,
+      temperature: 0.2,
+      maxTokens: 700,
+    },
+  },
+];
+
+const generateCustomAgentId = () => `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+const clampTemperature = (value: number) => {
+  if (Number.isNaN(value)) return 0.3;
+  return Math.min(1, Math.max(0, value));
+};
+
+const clampTokens = (value: number) => {
+  if (Number.isNaN(value)) return 800;
+  return Math.min(2000, Math.max(200, value));
+};
+
+const toCustomAgentDraft = (overrides: Partial<CustomAgentDefinition> = {}): CustomAgentDraft => {
+  const rawName = typeof overrides.name === 'string' ? overrides.name : '';
+  const rawDescription = typeof overrides.description === 'string' ? overrides.description : '';
+  const rawInstructions = typeof overrides.instructions === 'string' ? overrides.instructions : '';
+  return {
+    name: rawName.trim() || 'Новый агент',
+    description: rawDescription,
+    instructions: rawInstructions || 'Опишите задачу агента.',
+    scope: overrides.scope === 'document' ? 'document' : 'selection',
+    useCatalog: Boolean(overrides.useCatalog),
+    streamToEditor: Boolean(overrides.streamToEditor),
+    applyToEditor: overrides.applyToEditor === false ? false : true,
+    temperature: clampTemperature(typeof overrides.temperature === 'number' ? overrides.temperature : 0.3),
+    maxTokens: clampTokens(typeof overrides.maxTokens === 'number' ? overrides.maxTokens : 800),
+  };
+};
+
+const buildCustomAgent = (overrides: Partial<CustomAgentDefinition> = {}): CustomAgentDefinition => ({
+  id: generateCustomAgentId(),
+  ...toCustomAgentDraft(overrides)
+});
+
+const normalizeCustomAgent = (input: unknown): CustomAgentDefinition | null => {
+  if (!input || typeof input !== 'object') return null;
+  const source = input as Partial<CustomAgentDefinition> & Record<string, unknown>;
+  const draft = toCustomAgentDraft(source);
+  const id = typeof source.id === 'string' && source.id ? source.id : generateCustomAgentId();
+  return { id, ...draft };
 };
 
 const CRITERIA_PROFILES: CriteriaProfile[] = [
@@ -340,6 +499,31 @@ export default function App() {
   const [criteriaProfiles, setCriteriaProfiles] = useState(CRITERIA_PROFILES);
   const [selectedCriteria, setSelectedCriteria] = useState<string>(CRITERIA_PROFILES[0].criteria);
   const [templatesMap, setTemplatesMap] = useState<Record<string, string>>({ ...DEFAULT_GOST_TEMPLATES });
+  const [customAgents, setCustomAgents] = useState<CustomAgentDefinition[]>(() => {
+    const fallback = buildCustomAgent(CUSTOM_AGENT_TEMPLATES[0]?.defaults || {});
+    if (typeof window === 'undefined') {
+      return [fallback];
+    }
+    try {
+      const raw = localStorage.getItem(CUSTOM_AGENT_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const normalized = parsed
+            .map(normalizeCustomAgent)
+            .filter((item): item is CustomAgentDefinition => Boolean(item));
+          if (normalized.length) {
+            return normalized;
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('Не удалось загрузить пользовательских агентов:', error);
+    }
+    return [fallback];
+  });
+  const [newAgentTemplate, setNewAgentTemplate] = useState<string>(CUSTOM_AGENT_TEMPLATES[0]?.key || 'blank');
+  const selectedAgentTemplate = useMemo(() => CUSTOM_AGENT_TEMPLATES.find(t => t.key === newAgentTemplate) || null, [newAgentTemplate]);
   const [selectedTemplateKey, setSelectedTemplateKey] = useState<string>("");
   const [contentHistory, setContentHistory] = useState<string[]>([]);
   const [exportToast, setExportToast] = useState<string>("");
@@ -393,6 +577,18 @@ export default function App() {
   const [aggQuery, setAggQuery] = useState<string>(() => (DEFAULT_PROJECT.title || '').slice(0, 400));
   const [aggQueryTouched, setAggQueryTouched] = useState<boolean>(false);
   const [aggProgress, setAggProgress] = useState<string[]>([]);
+  const aggSearchCacheRef = useRef<Map<string, { timestamp: number; result: AggSearchResult }>>(new Map());
+
+  const templateDefaultsByKey = (key: string): CustomAgentDraft => {
+    const template = CUSTOM_AGENT_TEMPLATES.find(t => t.key === key);
+    const defaults = template?.defaults || {};
+    return toCustomAgentDraft({
+      ...defaults,
+      useCatalog: defaults.useCatalog ?? useAgregator,
+    });
+  };
+
+  const [templateDraft, setTemplateDraft] = useState<CustomAgentDraft>(() => templateDefaultsByKey(newAgentTemplate));
 
   // Streaming LLM state
   const [useStream, setUseStream] = useState<boolean>(true);
@@ -408,6 +604,11 @@ export default function App() {
     mode: 'append' | 'replace' | 'insert';
   };
   const streamContextRef = useRef<StreamContext | null>(null);
+  const streamBufferRef = useRef<string>('');
+  const streamUpdateFrameRef = useRef<number | null>(null);
+  const editorRef = useRef<HTMLTextAreaElement | null>(null);
+  const autosaveTimerRef = useRef<number | null>(null);
+  const savingPulseTimerRef = useRef<number | null>(null);
   const reviewFileInputRef = useRef<HTMLInputElement | null>(null);
   const [workflowRunning, setWorkflowRunning] = useState<boolean>(false);
   const chainAbortRef = useRef<boolean>(false);
@@ -424,26 +625,73 @@ export default function App() {
   // Mapping for footnotes → sources list
   const [, setAggCiteMap] = useState<Map<number, AggSearchItem>>(new Map());
 
+  useEffect(() => {
+    setTemplateDraft(templateDefaultsByKey(newAgentTemplate));
+  }, [newAgentTemplate]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(CUSTOM_AGENT_STORAGE_KEY, JSON.stringify(customAgents));
+    } catch (error) {
+      console.warn('Не удалось сохранить пользовательских агентов:', error);
+    }
+  }, [customAgents]);
+
 
   // Автосохранение в localStorage
   useEffect(() => {
-    if (autoSaveEnabled) {
-      const saveData: {
-        project: Project;
-        content: string;
-        bibText: string;
-        timestamp: number;
-      } = {
-        project,
-        content,
-        bibText,
-        timestamp: Date.now()
-      };
-      localStorage.setItem('llm-writer-autosave', JSON.stringify(saveData));
-      setSavingPulse(true);
-      const t = setTimeout(() => setSavingPulse(false), 600);
-      return () => clearTimeout(t);
+    if (!autoSaveEnabled) {
+      if (autosaveTimerRef.current !== null) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+      if (savingPulseTimerRef.current !== null) {
+        window.clearTimeout(savingPulseTimerRef.current);
+        savingPulseTimerRef.current = null;
+      }
+      setSavingPulse(false);
+      return;
     }
+
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current);
+    }
+
+    const payload = {
+      project,
+      content,
+      bibText,
+      timestamp: Date.now()
+    };
+
+    autosaveTimerRef.current = window.setTimeout(() => {
+      autosaveTimerRef.current = null;
+      try {
+        localStorage.setItem('llm-writer-autosave', JSON.stringify(payload));
+        setSavingPulse(true);
+        if (savingPulseTimerRef.current !== null) {
+          window.clearTimeout(savingPulseTimerRef.current);
+        }
+        savingPulseTimerRef.current = window.setTimeout(() => {
+          savingPulseTimerRef.current = null;
+          setSavingPulse(false);
+        }, 600);
+      } catch (error) {
+        console.error('Ошибка автосохранения:', error);
+      }
+    }, 400);
+
+    return () => {
+      if (autosaveTimerRef.current !== null) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+      if (savingPulseTimerRef.current !== null) {
+        window.clearTimeout(savingPulseTimerRef.current);
+        savingPulseTimerRef.current = null;
+      }
+    };
   }, [project, content, bibText, autoSaveEnabled]);
 
   // Восстановление из localStorage при загрузке
@@ -480,46 +728,94 @@ export default function App() {
   // Persist Agregator toggle
   useEffect(()=>{ try{ localStorage.setItem('aiword-use-agregator', useAgregator ? '1':'0'); }catch{ /* storage disabled */ } }, [useAgregator]);
 
-  // Load collections when needed
-  useEffect(()=>{
-    if (!useAgregator) return;
-    fetch('/api/collections').then(r=>r.json()).then((cols: AggCollection[])=>{
-      setAggCollections(cols);
-      const pre = cols.filter(c=>c.searchable).map(c=>c.id);
-      setAggSelected(s=> (s && s.length>0) ? s : pre);
-    }).catch((error: unknown)=>{
-      console.error('Не удалось загрузить коллекции для AiWord', error);
-    });
-    // Load facet suggestions from Agregator
-    fetch('/api/facets').then(r=>r.json()).then((j)=>{
-      const rawTypes = Array.isArray(j.types) ? (j.types as unknown[]) : [];
-      const t: FacetType[] = rawTypes
-        .map((entry): FacetType | null => {
-          if (!Array.isArray(entry) || entry.length < 2) return null;
-          const [name, count] = entry as [unknown, unknown];
-          return { name: String(name ?? ''), count: Number(count ?? 0) };
-        })
-        .filter((x): x is FacetType => !!x && !!x.name);
-      setFacetTypes(t.filter(x=>x.name));
-      const tf: Record<string, FacetVal[]> = {};
-      const src = (j.tag_facets || {}) as Record<string, unknown>;
-      Object.entries(src).forEach(([key, value]) => {
-        const list = Array.isArray(value) ? (value as unknown[]) : [];
-        tf[key] = list
-          .map((entry): FacetVal | null => {
-            if (!Array.isArray(entry) || entry.length < 2) return null;
-            const [val, count] = entry as [unknown, unknown];
-            return { value: String(val ?? ''), count: Number(count ?? 0) };
-          })
-          .filter((x): x is FacetVal => !!x && !!x.value);
-      });
-      setFacetTags(tf);
-      if (Object.keys(tf).length) {
-        setFacetKey(prev => (prev ? prev : Object.keys(tf)[0]));
+  useEffect(() => {
+    return () => {
+      if (streamUpdateFrameRef.current !== null) {
+        cancelAnimationFrame(streamUpdateFrameRef.current);
+        streamUpdateFrameRef.current = null;
       }
-    }).catch((error: unknown)=>{
-      console.error('Не удалось загрузить фасеты для AiWord', error);
-    });
+    };
+  }, []);
+
+  // Load collections when needed
+  useEffect(() => {
+    if (!useAgregator) {
+      return;
+    }
+
+    const collectionsController = new AbortController();
+    const facetsController = new AbortController();
+    let disposed = false;
+
+    const handleAbort = (error: unknown, label: string) => {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return;
+      }
+      console.error(label, error);
+    };
+
+    const loadCollections = async () => {
+      try {
+        const response = await fetch('/api/collections', { signal: collectionsController.signal });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const cols = await response.json() as AggCollection[];
+        if (disposed) return;
+        setAggCollections(cols);
+        const pre = cols.filter(c => c.searchable).map(c => c.id);
+        setAggSelected((s) => (s && s.length > 0) ? s : pre);
+      } catch (error) {
+        handleAbort(error, 'Не удалось загрузить коллекции для AiWord');
+      }
+    };
+
+    const loadFacets = async () => {
+      try {
+        const response = await fetch('/api/facets', { signal: facetsController.signal });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const j = await response.json();
+        if (disposed) return;
+        const rawTypes = Array.isArray(j.types) ? (j.types as unknown[]) : [];
+        const t: FacetType[] = rawTypes
+          .map((entry): FacetType | null => {
+            if (!Array.isArray(entry) || entry.length < 2) return null;
+            const [name, count] = entry as [unknown, unknown];
+            return { name: String(name ?? ''), count: Number(count ?? 0) };
+          })
+          .filter((x): x is FacetType => !!x && !!x.name);
+        setFacetTypes(t.filter(x => x.name));
+        const tf: Record<string, FacetVal[]> = {};
+        const src = (j.tag_facets || {}) as Record<string, unknown>;
+        Object.entries(src).forEach(([key, value]) => {
+          const list = Array.isArray(value) ? (value as unknown[]) : [];
+          tf[key] = list
+            .map((entry): FacetVal | null => {
+              if (!Array.isArray(entry) || entry.length < 2) return null;
+              const [val, count] = entry as [unknown, unknown];
+              return { value: String(val ?? ''), count: Number(count ?? 0) };
+            })
+            .filter((x): x is FacetVal => !!x && !!x.value);
+        });
+        setFacetTags(tf);
+        if (Object.keys(tf).length) {
+          setFacetKey(prev => (prev ? prev : Object.keys(tf)[0]));
+        }
+      } catch (error) {
+        handleAbort(error, 'Не удалось загрузить фасеты для AiWord');
+      }
+    };
+
+    loadCollections();
+    loadFacets();
+
+    return () => {
+      disposed = true;
+      collectionsController.abort();
+      facetsController.abort();
+    };
   }, [useAgregator]);
 
   useEffect(() => {
@@ -631,7 +927,7 @@ export default function App() {
 
   // Подсказки по цитированию: триггер по [@... в редакторе
   const updateCiteSuggestions = useCallback(() => {
-    const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
+    const textarea = editorRef.current;
     if (!textarea) return;
     const pos = textarea.selectionStart ?? -1;
     if (pos < 0) { setShowCiteBox(false); return; }
@@ -668,7 +964,7 @@ export default function App() {
     setShowCiteBox(false);
     // Восстановим курсор после закрывающей скобки
     setTimeout(() => {
-      const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
+      const textarea = editorRef.current;
       if (textarea) {
         const caret = before.length + insertion.length;
         textarea.focus();
@@ -717,6 +1013,45 @@ export default function App() {
   };
 
   // Streaming version (OpenAI-compatible SSE)
+  const applyStreamUpdate = (force = false) => {
+    const ctx = streamContextRef.current;
+    if (!ctx) return;
+    const latestFull = streamBufferRef.current;
+    const update = () => {
+      const nextContent = ctx.before + latestFull + ctx.after;
+      setContent(nextContent);
+      requestAnimationFrame(() => {
+        const textarea = editorRef.current;
+        if (!textarea) return;
+        const caret = ctx.before.length + latestFull.length;
+        textarea.setSelectionRange(caret, caret);
+        if (ctx.mode === 'append') {
+          textarea.scrollTop = textarea.scrollHeight;
+        } else if (!Number.isNaN(ctx.scrollTop)) {
+          textarea.scrollTop = ctx.scrollTop;
+        }
+      });
+    };
+
+    if (force) {
+      if (streamUpdateFrameRef.current !== null) {
+        cancelAnimationFrame(streamUpdateFrameRef.current);
+        streamUpdateFrameRef.current = null;
+      }
+      update();
+      return;
+    }
+
+    if (streamUpdateFrameRef.current !== null) {
+      return;
+    }
+
+    streamUpdateFrameRef.current = window.requestAnimationFrame(() => {
+      streamUpdateFrameRef.current = null;
+      update();
+    });
+  };
+
   const callLmStudioStream = async (
     messages: { role: 'system'|'user'|'assistant'; content: string }[],
     temperature = 0.3,
@@ -729,6 +1064,11 @@ export default function App() {
     const url = `${baseUrl}/chat/completions`;
     const ctrl = new AbortController();
     setAbortCtrl(ctrl);
+    if (streamUpdateFrameRef.current !== null) {
+      cancelAnimationFrame(streamUpdateFrameRef.current);
+      streamUpdateFrameRef.current = null;
+    }
+    streamBufferRef.current = '';
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -763,29 +1103,20 @@ export default function App() {
             full += delta;
             onDelta?.(delta);
             if (injectToEditor) {
-              const ctx = streamContextRef.current;
-              if (ctx) {
-                const nextContent = ctx.before + full + ctx.after;
-                setContent(() => nextContent);
-                requestAnimationFrame(() => {
-                  const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
-                  if (!textarea) return;
-                  const caret = ctx.before.length + full.length;
-                  textarea.setSelectionRange(caret, caret);
-                  if (ctx.mode === 'append') {
-                    textarea.scrollTop = textarea.scrollHeight;
-                  } else if (!Number.isNaN(ctx.scrollTop)) {
-                    textarea.scrollTop = ctx.scrollTop;
-                  }
-                });
-              }
+              streamBufferRef.current = full;
+              applyStreamUpdate();
             }
           }
         }catch{ /* ignore malformed SSE chunk */ }
       }
-      setLiveText(full);
     }
     setAbortCtrl(null);
+    if (injectToEditor) {
+      streamBufferRef.current = full;
+      applyStreamUpdate(true);
+    } else {
+      setLiveText(full);
+    }
     return full;
   };
 
@@ -797,51 +1128,126 @@ export default function App() {
     query: string;
   }
 
-  const agregatorSearch = async (rawQuery: string, opts: { manual?: boolean } = {}): Promise<AggSearchResult> => {
+  interface AggSearchOptions {
+    manual?: boolean;
+    silent?: boolean;
+    label?: string;
+  }
+
+  const agregatorSearch = async (rawQuery: string, opts: AggSearchOptions = {}): Promise<AggSearchResult> => {
+    const { manual = false, silent = false, label } = opts;
+    const formatTitle = (base: string) => (label ? `${base} (${label})` : base);
     const normalized = (rawQuery || '').trim();
     if (!normalized) {
       return { items: [], answer: '', keywords: [], query: '' };
     }
-    if (!aggQueryTouched || opts.manual) {
-      setAggQuery(normalized);
+    if (!aggQueryTouched || manual) {
+      if (!silent) {
+        setAggQuery(normalized);
+      }
     }
-    if (opts.manual) {
+    if (manual && !silent) {
       setAggQueryTouched(true);
     }
-    setAggBusy(true);
-    setAggAnswer('');
-    setAggItems([]);
-    setAggProgress(['Запуск поиска…']);
+
+    const safeTopK = Math.max(1, Math.min(5, aggTopK));
+    const sortedCollections = Array.from(new Set(aggSelected)).sort((a, b) => a - b);
+    const typesList = (aggTypes || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const trimmedYearFrom = (aggYearFrom || '').trim();
+    const trimmedYearTo = (aggYearTo || '').trim();
+    const tagFilters = (aggTags || '').split(/\n|;|,/).map(s => s.trim()).filter(s => s.includes('='));
+
+    const cacheKey = JSON.stringify({
+      query: normalized,
+      topK: safeTopK,
+      collections: sortedCollections,
+      types: typesList,
+      yearFrom: trimmedYearFrom,
+      yearTo: trimmedYearTo,
+      tags: tagFilters,
+      deep: aggDeepSearch
+    });
+
+    const cached = aggSearchCacheRef.current.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < AGG_SEARCH_CACHE_TTL_MS) {
+      const ageSeconds = Math.round((Date.now() - cached.timestamp) / 1000);
+      if (!silent) {
+        setAggBusy(false);
+        setAggItems(cached.result.items);
+        setAggAnswer(cached.result.answer || '');
+        setAggProgress([`Результаты из кеша (${ageSeconds > 0 ? `${ageSeconds} с` : '<1 с'})`]);
+      }
+      if (cached.result.answer) {
+        addLog(formatTitle('Agregator — краткий ответ (кеш)'), cached.result.answer, true);
+      }
+      addLog(formatTitle('Agregator — кеш'), `Запрос: ${cached.result.query || normalized}\nНайдено: ${cached.result.items.length}`, true);
+      return cached.result;
+    }
+
+    if (!silent) {
+      setAggBusy(true);
+      setAggAnswer('');
+      setAggItems([]);
+      setAggProgress(['Запуск поиска…']);
+    }
     try {
-      const safeTopK = Math.max(1, Math.min(5, aggTopK));
-      const body: AiSearchRequest = { query: normalized, top_k: safeTopK, collection_ids: aggSelected, deep_search: aggDeepSearch };
-      const types = (aggTypes || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-      if (types.length) body.material_types = types;
-      if (aggYearFrom) body.year_from = aggYearFrom.trim();
-      if (aggYearTo) body.year_to = aggYearTo.trim();
-      const tags = (aggTags || '').split(/\n|;|,/).map(s => s.trim()).filter(s => s.includes('='));
-      if (tags.length) body.tag_filters = tags;
-      const r = await fetch('/api/ai-search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const body: AiSearchRequest = {
+        query: normalized,
+        top_k: safeTopK,
+        collection_ids: sortedCollections,
+        deep_search: aggDeepSearch
+      };
+      if (typesList.length) body.material_types = typesList;
+      if (trimmedYearFrom) body.year_from = trimmedYearFrom;
+      if (trimmedYearTo) body.year_to = trimmedYearTo;
+      if (tagFilters.length) body.tag_filters = tagFilters;
+
+      const r = await fetch('/api/ai-search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
       if (!r.ok) {
         const text = await r.text();
         throw new Error(text || `HTTP ${r.status}`);
       }
       const j = await r.json();
       const items = (j.items || []) as AggSearchItem[];
-      setAggItems(items);
-      setAggAnswer(j.answer || '');
-      const progress = Array.isArray(j.progress) ? j.progress : [];
-      setAggProgress(progress.length ? progress : ['Поиск завершён']);
-      addLog('Agregator — поиск', `Запрос: ${j.query}\nКлючевые слова: ${(j.keywords || []).join(', ')}\nНайдено: ${items.length}`);
-      if (j.answer) addLog('Agregator — краткий ответ', j.answer);
-      return { items, answer: j.answer, keywords: j.keywords, query: j.query };
+      const result: AggSearchResult = {
+        items,
+        answer: j.answer,
+        keywords: j.keywords,
+        query: j.query || normalized
+      };
+      if (!silent) {
+        setAggItems(items);
+        setAggAnswer(j.answer || '');
+        const progress = Array.isArray(j.progress) ? j.progress : [];
+        setAggProgress(progress.length ? progress : ['Поиск завершён']);
+      }
+      addLog(formatTitle('Agregator — поиск'), `Запрос: ${result.query}\nКлючевые слова: ${(result.keywords || []).join(', ')}\nНайдено: ${items.length}`);
+      if (result.answer) addLog(formatTitle('Agregator — краткий ответ'), result.answer);
+
+      aggSearchCacheRef.current.set(cacheKey, { timestamp: Date.now(), result });
+      if (aggSearchCacheRef.current.size > AGG_SEARCH_CACHE_LIMIT) {
+        const oldestKey = aggSearchCacheRef.current.keys().next().value;
+        if (oldestKey) {
+          aggSearchCacheRef.current.delete(oldestKey);
+        }
+      }
+
+      return result;
     } catch (error) {
       console.error('Agregator search error:', error);
-      addLog('Agregator — ошибка', error instanceof Error ? error.message : String(error));
-      setAggProgress([`Ошибка поиска: ${error instanceof Error ? error.message : String(error)}`]);
+      addLog(formatTitle('Agregator — ошибка'), error instanceof Error ? error.message : String(error));
+      if (!silent) {
+        setAggProgress([`Ошибка поиска: ${error instanceof Error ? error.message : String(error)}`]);
+      }
       return { items: [], answer: '', keywords: [], query: normalized };
     } finally {
-      setAggBusy(false);
+      if (!silent) {
+        setAggBusy(false);
+      }
     }
   };
 
@@ -855,10 +1261,12 @@ export default function App() {
   const callAgent = async (action: string, payload: AgentPayloadShape, options: AgentCallOptions = {}) => {
     const cacheKey = getCacheKey(action, payload);
     const cached = cache.get(cacheKey);
+    const customConfig = payload.custom_agent;
+    const actionLabel = action === 'custom' && customConfig ? `custom/${customConfig.name}` : action;
     
     // Проверяем кеш (действителен 1 час)
     if (cached && Date.now() - cached.timestamp < 3600000) {
-      addLog(`${action} (кеш)`, cached.output, true);
+      addLog(`${actionLabel} (кеш)`, cached.output, true);
       return { output: cached.output };
     }
 
@@ -866,8 +1274,18 @@ export default function App() {
     let streamingEnabled = useStream;
     if (streamMode === 'off') streamingEnabled = false;
     if (streamMode === 'force') streamingEnabled = true;
-    const applyToEditor = options.applyToEditor ?? true;
+    let applyToEditor = options.applyToEditor ?? true;
+    if (action === 'custom' && customConfig) {
+      if (options.streamMode === undefined && typeof customConfig.streamToEditor === 'boolean') {
+        streamingEnabled = customConfig.streamToEditor ? true : false;
+      }
+      if (options.applyToEditor === undefined && typeof customConfig.applyToEditor === 'boolean') {
+        applyToEditor = customConfig.applyToEditor;
+      }
+    }
     const injectToEditor = applyToEditor && streamingEnabled && streamToEditor;
+    const handleDelta = injectToEditor ? undefined : (d: string) => setLiveText(t => t + d);
+    const startedAt = performance.now();
 
     setStatus('working');
     try {
@@ -876,14 +1294,20 @@ export default function App() {
       const sys = buildSystemPrompt(payload.project || project);
       const providedCatalog = (payload.catalog_context || '').trim();
       let catalogContext = '';
-      if (useAgregator && (action !== 'factcheck' || !providedCatalog)) {
+      const catalogEnabled = useAgregator && (action === 'custom' ? Boolean(customConfig?.useCatalog) : true);
+      if (catalogEnabled && (action !== 'factcheck' || !providedCatalog)) {
         // Determine a meaningful query for the catalogue
         let q = '';
         if (action === 'outline') q = String(payload.topic || project.title || '').slice(0, 300);
         else if (action === 'draft') q = `${String(payload.outline_point||'Раздел')} — ${String(project.title||'').slice(0,200)}`;
         else if (action === 'improve' || action === 'summary' || action === 'questions' || action === 'thesis' || action === 'factcheck') q = (String(payload.text_md||'').replace(/\s+/g,' ').slice(0, 220)) || (project.title||'');
+        else if (action === 'custom') {
+          const base = String(payload.text_md || '').replace(/\s+/g, ' ').slice(0, 220);
+          const descr = String(customConfig?.description || '').replace(/\s+/g, ' ').slice(0, 180);
+          q = base || descr || String(project.title || '').slice(0, 220);
+        }
         if (q) {
-          const res = await agregatorSearch(q);
+          const res = await agregatorSearch(q, { label: actionLabel });
           const limit = Math.max(1, Math.min(3, aggTopK));
           const topItems = (res.items||[]).slice(0, limit);
           const lines = topItems.map((it, i) => {
@@ -899,13 +1323,13 @@ export default function App() {
           ].filter(Boolean).join('\n\n');
           if (contextBlock) {
             catalogContext = contextBlock;
-            addLog(`Agregator — контекст (${action})`, contextBlock);
+            addLog(`Agregator — контекст (${actionLabel})`, contextBlock);
           }
         }
       }
       // Capture insertion position if streaming to editor
       if (injectToEditor) {
-        const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
+        const textarea = editorRef.current;
         let start = content.length;
         let end = content.length;
         if (textarea && document.activeElement === textarea) {
@@ -933,7 +1357,7 @@ export default function App() {
         const user = `Сформируй подробный план статьи (оглавление) с краткими аннотациями к каждому пункту. Укажи ориентировочный объём в процентах по разделам.\n\nТема: ${payload.topic || project.title}\n\nОграничения/пожелания: ${payload.constraints || ''}\n\n${catalogContext ? catalogContext + '\n\nПри составлении учитывай только эти сведения из каталога.' : ''}`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 1200, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 1200, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2);
         }
@@ -941,7 +1365,7 @@ export default function App() {
         const user = `На основании контекста подготовь черновик раздела «${payload.outline_point || 'Раздел'}». Дай связный текст, 2–4 подзаголовка, списки при необходимости.\n\nКонтекст (Markdown):\n${payload.context_md || ''}\n\n${catalogContext ? catalogContext + '\n\nИспользуй сведения из каталога строго по тексту фрагментов; не выдумывай.' : ''}`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.4, 1400, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.4, 1400, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.4);
         }
@@ -949,7 +1373,7 @@ export default function App() {
         const user = `Отредактируй фрагмент по инструкции. Сохрани Markdown и структуру. Не выдумывай фактов.\n\nИнструкция: ${payload.instructions || 'Сделай яснее, компактнее, без потери смысла.'}\n\n${catalogContext ? catalogContext + '\n\nСогласуй термины и факты с каталогом.' : ''}\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || ''}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 800, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 800, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2);
         }
@@ -957,7 +1381,7 @@ export default function App() {
         const user = `Сделай редакторский отзыв: сильные/слабые стороны, риски, недостающие разделы, стилистика, корректность терминологии. В конце — чек‑лист правок.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || ''}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.1, 800, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.1, 800, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.1);
         }
@@ -966,7 +1390,7 @@ export default function App() {
         const user = `Сформулируй структурированный конспект (${scope}). Кратко, по делу, без воды. Используй маркированный список; каждую мысль делай отдельным пунктом. Не добавляй новых фактов.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || content}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 700, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 700, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2);
         }
@@ -975,7 +1399,7 @@ export default function App() {
         const user = `Составь список проверочных вопросов ${scope}. 5–8 вопросов, требующих вдумчивого ответа. Не повторяйся и не добавляй новых фактов. Формат — пронумерованный список.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || content}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 500, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 500, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2);
         }
@@ -986,7 +1410,7 @@ export default function App() {
         const user = `${contextBlock}Проверь фактические утверждения ${scope}. Для каждого сформируй пункт списка: кратко переформулированный факт, затем статус **Подтверждено**, **Требует проверки** или **Не найдено**, и короткий комментарий.\n- Используй **Подтверждено** только если есть явное совпадение в предоставленных фрагментах и укажи ссылку [#n].\n- Если данных недостаточно или совпадение неточно — ставь **Требует проверки** и поясни, каких сведений не хватает.\n- Используй **Не найдено**, если фрагменты прямо противоречат утверждению.\nЗаверши вывод кратким списком ключевых рисков или неопределённостей.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || content}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 700, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 700, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2);
         }
@@ -995,7 +1419,7 @@ export default function App() {
         const user = `Сжато изложи ${modeLabel} списком из 3–6 тезисов. Каждый тезис — одна строка в виде Markdown-списка, начинай с «- ». Сохрани ключевые факты, но убери воду и повторы. Не добавляй новых сведений.\n\nТекст:\n\u0060\u0060\u0060md\n${payload.text_md || ''}\n\u0060\u0060\u0060`;
         setLiveText('');
         if (streamingEnabled) {
-          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 600, (d)=> setLiveText(t=>t + d), injectToEditor);
+          output = await callLmStudioStream([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2, 600, handleDelta, injectToEditor);
         } else {
           output = await callLmStudio([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.2);
         }
@@ -1004,6 +1428,41 @@ export default function App() {
         const draft = await callAgent('draft', { project, outline_point: 'Черновик по плану', context_md: `${plan.output}\n\n${payload.context_md || ''}` });
         const improved = await callAgent('improve', { project, text_md: draft.output, instructions: payload.criteria });
         output = `# План\n\n${plan.output}\n\n# Черновик (с правкой по критериям)\n\n${improved.output}`;
+      } else if (action === 'custom') {
+        if (!customConfig) {
+          throw new Error('Не передана конфигурация пользовательского агента');
+        }
+        const scopeLabel = customConfig.scope === 'selection' ? 'выделенного фрагмента' : 'документа';
+        const truncatedNotice = customConfig.truncated ? `_Контекст усечён до ${AGENT_CONTEXT_LIMIT} символов._` : '';
+        const combinedCatalog = [providedCatalog, catalogContext].filter(Boolean).join('\n\n');
+        const descriptionBlock = customConfig.description ? `Описание задачи: ${customConfig.description}` : '';
+        const catalogBlock = combinedCatalog ? `Данные каталога:\n${combinedCatalog}` : '';
+        const instructionsBlock = `Задача: ${customConfig.instructions}`;
+        const scopeBlock = `Работай с ${scopeLabel}. Отвечай в Markdown.`;
+        const contextBlock = (payload.text_md || '').trim()
+          ? `Контекст (${scopeLabel}):\n\u0060\u0060\u0060md\n${payload.text_md}\n\u0060\u0060\u0060`
+          : 'Контекст отсутствует — опирайся только на инструкцию и данные каталога.';
+        const userParts = [catalogBlock, descriptionBlock, instructionsBlock, scopeBlock, contextBlock, truncatedNotice]
+          .filter(Boolean)
+          .join('\n\n');
+        const temperature = clampTemperature(customConfig.temperature);
+        const maxTokens = clampTokens(customConfig.maxTokens);
+        setLiveText('');
+        if (streamingEnabled) {
+          output = await callLmStudioStream(
+            [{ role: 'system', content: sys }, { role: 'user', content: userParts }],
+            temperature,
+            maxTokens,
+            handleDelta,
+            injectToEditor
+          );
+        } else {
+          output = await callLmStudio(
+            [{ role: 'system', content: sys }, { role: 'user', content: userParts }],
+            temperature,
+            maxTokens
+          );
+        }
       } else {
         throw new Error('Unknown action');
       }
@@ -1016,10 +1475,14 @@ export default function App() {
         input: JSON.stringify(payload),
         output,
         timestamp: Date.now(),
-        action
+        action: actionLabel
       });
       setCache(newCache);
-      
+
+      const elapsedMs = performance.now() - startedAt;
+      const usedCatalog = Boolean(catalogContext || providedCatalog);
+      addLog('Агент — завершено', `Действие: ${actionLabel}\nВремя: ${formatDuration(elapsedMs)}${usedCatalog ? '\nКонтекст: каталог' : ''}`);
+
       // Finalize streaming region to stable text
       if (applyToEditor) {
         if (injectToEditor) {
@@ -1028,7 +1491,7 @@ export default function App() {
             const nextContent = ctx.before + output + ctx.after;
             setContent(nextContent);
             requestAnimationFrame(() => {
-              const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
+              const textarea = editorRef.current;
               if (!textarea) return;
               const caret = ctx.before.length + output.length;
               textarea.focus();
@@ -1049,13 +1512,23 @@ export default function App() {
       return data;
     } catch (error) {
       setStatus('error');
+      const errMsg = error instanceof Error ? error.message : String(error);
+      addLog(`Агент — ошибка (${actionLabel})`, errMsg);
+      if (injectToEditor) {
+        streamBufferRef.current = '';
+        if (streamUpdateFrameRef.current !== null) {
+          cancelAnimationFrame(streamUpdateFrameRef.current);
+          streamUpdateFrameRef.current = null;
+        }
+      }
+      streamContextRef.current = null;
       throw error;
     }
   };
 
   // Insert helper: put text at editor caret
   const insertAtCaret = (text: string) => {
-    const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
+    const textarea = editorRef.current;
     if (!textarea) return;
     const start = textarea.selectionStart; const end = textarea.selectionEnd;
     const before = content.slice(0, start);
@@ -1139,10 +1612,69 @@ export default function App() {
     }
   };
 
+  const addCustomAgent = (draft?: Partial<CustomAgentDefinition>) => {
+    const baseDraft = draft ? toCustomAgentDraft(draft) : templateDraft;
+    const agent = buildCustomAgent({
+      ...baseDraft,
+      useCatalog: baseDraft.useCatalog ?? useAgregator,
+    });
+    setCustomAgents(prev => [...prev, agent]);
+    addLog('Свои агенты — добавлен', agent.name);
+  };
+
+  const updateTemplateDraft = (patch: Partial<CustomAgentDefinition>) => {
+    setTemplateDraft(prev => {
+      const next: CustomAgentDraft = { ...prev };
+      if (patch.name !== undefined) next.name = String(patch.name);
+      if (patch.description !== undefined) next.description = String(patch.description);
+      if (patch.instructions !== undefined) next.instructions = String(patch.instructions);
+      if (patch.scope !== undefined) next.scope = patch.scope === 'document' ? 'document' : 'selection';
+      if (patch.useCatalog !== undefined) next.useCatalog = Boolean(patch.useCatalog);
+      if (patch.streamToEditor !== undefined) next.streamToEditor = Boolean(patch.streamToEditor);
+      if (patch.applyToEditor !== undefined) next.applyToEditor = Boolean(patch.applyToEditor);
+      if (patch.temperature !== undefined) next.temperature = clampTemperature(Number(patch.temperature));
+      if (patch.maxTokens !== undefined) next.maxTokens = clampTokens(Number(patch.maxTokens));
+      return next;
+    });
+  };
+
+  const resetTemplateDraft = () => {
+    setTemplateDraft(templateDefaultsByKey(newAgentTemplate));
+  };
+
+  const updateCustomAgent = (id: string, patch: Partial<CustomAgentDefinition>) => {
+    setCustomAgents(prev => prev.map(agent => {
+      if (agent.id !== id) return agent;
+      const next: CustomAgentDefinition = { ...agent };
+      if (patch.name !== undefined) {
+        const raw = String(patch.name);
+        next.name = raw.trim() || agent.name;
+      }
+      if (patch.instructions !== undefined) {
+        next.instructions = String(patch.instructions);
+      }
+      if (patch.description !== undefined) {
+        next.description = String(patch.description);
+      }
+      const nextScope: 'selection' | 'document' = patch.scope === 'document' ? 'document' : patch.scope === 'selection' ? 'selection' : agent.scope;
+      next.scope = nextScope;
+      if (patch.useCatalog !== undefined) next.useCatalog = Boolean(patch.useCatalog);
+      if (patch.streamToEditor !== undefined) next.streamToEditor = Boolean(patch.streamToEditor);
+      if (patch.applyToEditor !== undefined) next.applyToEditor = Boolean(patch.applyToEditor);
+      if (patch.temperature !== undefined) next.temperature = clampTemperature(Number(patch.temperature));
+      if (patch.maxTokens !== undefined) next.maxTokens = clampTokens(Number(patch.maxTokens));
+      return next;
+    }));
+  };
+
+  const removeCustomAgent = (id: string) => {
+    setCustomAgents(prev => prev.filter(agent => agent.id !== id));
+  };
+
   // Функция для получения выделенного текста (работает в редакторе и просмотре)
   const getSelectedText = () => {
     if (activeTab === 'editor') {
-      const textarea = document.querySelector('#editor') as HTMLTextAreaElement;
+      const textarea = editorRef.current;
       if (!textarea) return { text: '', start: -1, end: -1 };
       const start = textarea.selectionStart;
       const end = textarea.selectionEnd;
@@ -1181,6 +1713,84 @@ export default function App() {
     }
   };
 
+  const handleRunCustomAgent = async (agent: CustomAgentDefinition) => {
+    let effectiveScope: 'selection' | 'document' = agent.scope;
+    let source = '';
+
+    if (agent.scope === 'selection') {
+      const { text } = getSelectedText();
+      source = (text || '').trim();
+      if (!source) {
+        const fallback = window.confirm('Нет выделенного текста. Использовать весь документ?');
+        if (!fallback) {
+          addLog('Свои агенты — отменено', `Агент "${agent.name}" не запущен: отсутствует выделение.`);
+          return;
+        }
+        effectiveScope = 'document';
+        source = content;
+      }
+    } else {
+      source = content;
+    }
+
+    const normalized = (source || '').trim();
+    if (!normalized) {
+      alert('Нет текста для обработки.');
+      return;
+    }
+
+    const trimmed = trimForAgent(normalized);
+    if (trimmed.truncated) {
+      addLog('Свои агенты — заметка', `Контекст для «${agent.name}» сокращён до ${AGENT_CONTEXT_LIMIT} символов (${trimmed.text.length}).`);
+    }
+
+    addLog('Свои агенты — запуск', `${agent.name} (${effectiveScope === 'selection' ? 'выделение' : 'документ'})`);
+
+    const payload: AgentPayloadShape = {
+      project,
+      text_md: trimmed.text,
+      mode: effectiveScope,
+      custom_agent: { ...agent, scope: effectiveScope, truncated: trimmed.truncated },
+    };
+
+    const shouldApplyToEditor = agent.streamToEditor ? agent.applyToEditor : false;
+    const options: AgentCallOptions = {
+      streamMode: agent.streamToEditor ? 'force' : 'off',
+      applyToEditor: shouldApplyToEditor,
+    };
+
+    try {
+      const { output } = await callAgent('custom', payload, options);
+      const finalText = (output || '').trim();
+      const note = trimmed.truncated ? `\n\n> _Контекст был усечён до ${AGENT_CONTEXT_LIMIT} символов перед отправкой агенту._` : '';
+
+      if (agent.applyToEditor) {
+        if (agent.streamToEditor) {
+          setActiveTab('editor');
+        } else {
+          const block = `## ${agent.name}\n\n${finalText}${note}`.trim();
+          setContent(prev => `${prev.trimEnd()}\n\n${block}\n`);
+          setActiveTab('editor');
+        }
+      } else {
+        addLog('Свои агенты — ответ', `${agent.name}\n${finalText || '(пусто)'}${note}`);
+      }
+      if (agent.applyToEditor) {
+        if (finalText) {
+          const snippet = finalText.length > 400 ? `${finalText.slice(0, 400)}…` : finalText;
+          addLog('Свои агенты — результат', `${agent.name}\n${snippet}`);
+        } else {
+          addLog('Свои агенты — результат', `${agent.name}\n(пустой ответ)`);
+        }
+      } else if (!finalText) {
+        addLog('Свои агенты — результат', `${agent.name}\n(пустой ответ)`);
+      }
+    } catch (error) {
+      console.error('Custom agent error:', error);
+      addLog('Свои агенты — ошибка', error instanceof Error ? error.message : String(error));
+    }
+  };
+
   const takeAggQueryFromSelection = () => {
     const { text } = getSelectedText();
     const candidate = (text || '').replace(/\s+/g, ' ').trim();
@@ -1208,7 +1818,7 @@ export default function App() {
       alert('Введите запрос для поиска по каталогу.');
       return;
     }
-    await agregatorSearch(source, { manual: true });
+    await agregatorSearch(source, { manual: true, label: 'ручной запрос' });
   };
 
   const insertAggSnippet = (item: AggSearchItem) => {
@@ -1222,27 +1832,72 @@ export default function App() {
     insertAtCaret(block);
   };
 
-  const extractSections = (planText: string, limit = 4): string[] => {
+  const parsePlanSections = (planText: string, limit = 6): PlanSection[] => {
     const lines = (planText || '').split(/\r?\n/);
-    const sections: string[] = [];
-    const seen = new Set<string>();
-    const regex = /^\s*(?:##+\s+|\d+[).\s]+|[-*]\s+)(.+)$/;
-    for (const raw of lines) {
-      const match = raw.match(regex);
-      if (!match) continue;
-      const title = match[1]?.trim();
-      if (!title) continue;
-      const normalized = title.replace(/[.:]+$/, '').trim();
-      if (!normalized || seen.has(normalized.toLowerCase())) continue;
-      seen.add(normalized.toLowerCase());
-      sections.push(normalized);
-      if (sections.length >= limit) break;
+    const sections: PlanSection[] = [];
+    const headingRegex = /^\s*(?:##+\s+|\d+[).:\s]+)(.+)$/;
+    const bulletRegex = /^\s*[-*]\s+(.+)$/;
+    let current: PlanSection | null = null;
+    let hasHeadingSyntax = false;
+
+    const pushCurrent = () => {
+      if (!current) return;
+      const title = current.title.trim().replace(/[.:]+$/, '');
+      if (!title) {
+        current = null;
+        return;
+      }
+      const body = current.body.replace(/\n{3,}/g, '\n\n').trim();
+      sections.push({ title, body });
+      current = null;
+    };
+
+    for (const rawLine of lines) {
+      const headingMatch = rawLine.match(headingRegex);
+      if (headingMatch) {
+        hasHeadingSyntax = true;
+        pushCurrent();
+        current = { title: headingMatch[1].trim(), body: '' };
+        continue;
+      }
+
+      const trimmed = rawLine.trim();
+      if (!trimmed) {
+        if (current && current.body && !current.body.endsWith('\n\n')) {
+          current.body += '\n\n';
+        }
+        continue;
+      }
+
+      const bulletMatch = !hasHeadingSyntax ? rawLine.match(bulletRegex) : null;
+      if (bulletMatch) {
+        pushCurrent();
+        current = { title: bulletMatch[1].trim(), body: '' };
+        continue;
+      }
+
+      if (current) {
+        current.body = current.body ? `${current.body}\n${trimmed}` : trimmed;
+      }
     }
-    return sections;
+
+    pushCurrent();
+
+    const unique: PlanSection[] = [];
+    const seen = new Set<string>();
+    for (const section of sections) {
+      const key = section.title.toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      unique.push(section);
+      if (unique.length >= limit) break;
+    }
+
+    return unique;
   };
 
   const handleQuickFormat = (formatter: typeof QUICK_FORMATTERS[0]) => {
-    const textarea = document.querySelector('#editor') as HTMLTextAreaElement;
+    const textarea = editorRef.current;
     if (!textarea) return;
 
     const start = textarea.selectionStart;
@@ -1252,11 +1907,13 @@ export default function App() {
     
     const newContent = content.slice(0, start) + formattedText + content.slice(end);
     setContent(newContent);
-    
+
     // Восстанавливаем фокус
     setTimeout(() => {
-      textarea.focus();
-      textarea.setSelectionRange(start, start + formattedText.length);
+      const target = editorRef.current;
+      if (!target) return;
+      target.focus();
+      target.setSelectionRange(start, start + formattedText.length);
     }, 0);
   };
 
@@ -1359,11 +2016,10 @@ export default function App() {
 
         if (activeTab === 'editor') {
           setTimeout(() => {
-            const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
-            if (textarea) {
-              textarea.focus();
-              textarea.setSelectionRange(start, start + improved.length);
-            }
+            const textarea = editorRef.current;
+            if (!textarea) return;
+            textarea.focus();
+            textarea.setSelectionRange(start, start + improved.length);
           }, 0);
         }
       }
@@ -1414,11 +2070,10 @@ export default function App() {
         setContent(newContent);
         if (activeTab === 'editor') {
           setTimeout(() => {
-            const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
-            if (textarea) {
-              textarea.focus();
-              textarea.setSelectionRange(start, start + normalized.length);
-            }
+            const textarea = editorRef.current;
+            if (!textarea) return;
+            textarea.focus();
+            textarea.setSelectionRange(start, start + normalized.length);
           }, 0);
         }
       } else {
@@ -1473,11 +2128,10 @@ export default function App() {
         const updated = content.slice(0, start) + formatted + content.slice(end);
         setContent(updated);
         setTimeout(() => {
-          const textarea = document.querySelector('#editor') as HTMLTextAreaElement | null;
-          if (textarea) {
-            textarea.focus();
-            textarea.setSelectionRange(start, start + formatted.length);
-          }
+          const textarea = editorRef.current;
+          if (!textarea) return;
+          textarea.focus();
+          textarea.setSelectionRange(start, start + formatted.length);
         }, 0);
       } else {
         setContent(prev => `${prev.trimEnd()}\n\n${formatted}\n`);
@@ -1547,7 +2201,7 @@ export default function App() {
     let catalogContext = '';
     if (useAgregator) {
       try {
-        const res = await agregatorSearch((selected || project.title || '').slice(0, 120) || project.title || 'Текст', { manual: true });
+        const res = await agregatorSearch((selected || project.title || '').slice(0, 120) || project.title || 'Текст', { manual: true, label: 'факт-чекинг' });
         const lines = (res.items || []).slice(0, 5).map((item, idx) => `[#${idx + 1}] ${item.title || `file-${item.file_id}`}: ${(item.snippets || []).join(' ')}`);
         const answer = (res.answer || '').trim();
         catalogContext = [answer ? `Краткий ответ каталога:\n${answer}` : '', lines.length ? lines.join('\n') : ''].filter(Boolean).join('\n\n');
@@ -1657,44 +2311,76 @@ export default function App() {
       addLog('Chain — план', planText);
       checkAbort();
 
-      const sectionTitles = extractSections(planText, 6);
-      for (const title of sectionTitles) {
+      let planSections = parsePlanSections(planText, 6);
+      if (!planSections.length) {
+        planSections = [{ title: topic || 'Основной раздел', body: planText || '' }];
+      }
+
+      const baseContext = trimForAgent(content || '');
+
+      for (const section of planSections) {
         checkAbort();
-        let contextMd = content;
+        const contextParts: string[] = [];
+        if (section.body) {
+          contextParts.push(`План раздела:\n${section.body}`);
+        }
+        if (baseContext.text) {
+          contextParts.push(`Исходный текст:\n${baseContext.text}`);
+        }
+        let contextMd = contextParts.join('\n\n');
+        if (contextMd && baseContext.truncated) {
+          contextMd += `\n\n> _Исходный текст усечён до ${AGENT_CONTEXT_LIMIT} символов для передачи агенту._`;
+        }
+
+        let catalogBlock = '';
         if (useAgregator) {
           try {
-            const res = await agregatorSearch(`${title} ${topic}`.slice(0, 160), { manual: true });
-            const answer = (res.answer || '').trim();
-            const limitForNotes = Math.max(1, Math.min(3, aggTopK));
-            const topItems = (res.items || []).slice(0, limitForNotes);
-            const lines = topItems.map((item, idx) => {
-              const baseTitle = item.title || `file-${item.file_id}`;
-              const rawSnippet = (item.snippets || []).join(' ');
-              const normalized = rawSnippet.replace(/\s+/g, ' ').slice(0, 240);
-              return `[#${idx + 1}] ${baseTitle}: ${normalized}${rawSnippet.length > 240 ? '…' : ''}`;
-            });
-            const snippetBlock = [answer ? `Ответ каталога\n${answer}` : '', lines.length ? lines.join('\n') : ''].filter(Boolean).join('\n\n');
-            if (snippetBlock) {
-              const note = `### ${title}\n${snippetBlock}`;
-              const existingIdx = catalogNotes.findIndex(entry => entry.startsWith(`### ${title}\n`));
-              if (existingIdx >= 0) catalogNotes[existingIdx] = note;
-              else catalogNotes.push(note);
-              addLog('Chain — каталог', `${title}\n${snippetBlock}`);
-              contextMd = `${contextMd}\n\nКаталог Agregator:\n${snippetBlock}`;
+            const querySource = [section.title, topic, section.body].filter(Boolean).join(' ');
+            const query = querySource.replace(/\s+/g, ' ').trim().slice(0, 220) || (project.title || '').slice(0, 160);
+            if (query) {
+              const res = await agregatorSearch(query, { manual: true, silent: true, label: 'цепочка' });
+              const answer = (res.answer || '').trim();
+              const limitForNotes = Math.max(1, Math.min(3, aggTopK));
+              const topItems = (res.items || []).slice(0, limitForNotes);
+              if (answer || topItems.length) {
+                const lines = topItems.map((item, idx) => {
+                  const baseTitle = item.title || `file-${item.file_id}`;
+                  const rawSnippet = (item.snippets || []).join(' ');
+                  const normalized = rawSnippet.replace(/\s+/g, ' ').slice(0, 240);
+                  return `[#${idx + 1}] ${baseTitle}: ${normalized}${rawSnippet.length > 240 ? '…' : ''}`;
+                });
+                const snippetBlock = [answer ? `Ответ каталога\n${answer}` : '', lines.length ? lines.join('\n') : ''].filter(Boolean).join('\n\n');
+                if (snippetBlock) {
+                  const note = `### ${section.title}\n${snippetBlock}`;
+                  const existingIdx = catalogNotes.findIndex(entry => entry.startsWith(`### ${section.title}\n`));
+                  if (existingIdx >= 0) catalogNotes[existingIdx] = note;
+                  else catalogNotes.push(note);
+                  addLog('Chain — каталог', `${section.title}\n${snippetBlock}`);
+                  catalogBlock = `Каталог Agregator:\n${snippetBlock}`;
+                }
+              }
             }
           } catch (error) {
             console.error('Chain aggregator error:', error);
           }
         }
-        checkAbort();
+
+        if (catalogBlock) {
+          contextMd = contextMd ? `${contextMd}\n\n${catalogBlock}` : catalogBlock;
+        }
+
+        if (!contextMd) {
+          contextMd = `Тема: ${topic}\n\n${planText}`.trim();
+        }
 
         const draftResp = await callAgent('draft', {
           project,
-          outline_point: title,
+          outline_point: section.title,
           context_md: contextMd,
         }, { streamMode: 'off', applyToEditor: false });
-        drafts.push(`## ${title}\n\n${(draftResp.output || '').trim()}`);
-        addLog('Chain — набросок', `${title}: ${(draftResp.output || '').trim().slice(0, 140)}...`);
+        const draftText = (draftResp.output || '').trim();
+        drafts.push(`## ${section.title}\n\n${draftText}`);
+        addLog('Chain — набросок', `${section.title}: ${draftText.slice(0, 160)}${draftText.length > 160 ? '…' : ''}`);
       }
       checkAbort();
 
@@ -2160,13 +2846,20 @@ export default function App() {
     return set;
   }, [content, bibDb]);
 
+  const mainTabs = useMemo(() => ([
+    { id: 'editor' as const, label: 'Редактор', icon: Edit3 },
+    { id: 'preview' as const, label: 'Предпросмотр', icon: Eye },
+    { id: 'bibliography' as const, label: missingCites.size > 0 ? `Библиография (${missingCites.size})` : 'Библиография', icon: BookMarked },
+    { id: 'logs' as const, label: 'Журнал агента', icon: MessageSquare }
+  ]), [missingCites]);
+
   return (
     <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'dark bg-gray-900' : 'bg-gray-50'}`}>
       {/* Header */}
       <header className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700 sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <div className="flex items-center gap-2">
+        <div className="w-full pl-0 pr-3 sm:pr-6 lg:pr-8" style={{ paddingLeft: 'env(safe-area-inset-left, 0px)' }}>
+          <div className="flex items-center h-16 gap-4">
+            <div className="flex items-center gap-2 flex-shrink-0">
               <span className="aiword-logo-badge">
                 <img src={aiWordLogo} alt="AIWord" className="h-10 w-auto" />
               </span>
@@ -2180,7 +2873,26 @@ export default function App() {
               )}
             </div>
             
-            <div className="flex items-center space-x-2">
+            <nav className="flex-1 flex justify-center px-2 sm:px-4 min-w-0">
+              <div className="flex items-center gap-1 px-2 py-1 bg-gray-100 dark:bg-gray-700/60 rounded-xl shadow-sm overflow-x-auto whitespace-nowrap">
+                {mainTabs.map(({ id, label, icon: Icon }) => (
+                  <button
+                    key={id}
+                    onClick={() => setActiveTab(id)}
+                    className={`flex items-center px-3 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                      activeTab === id
+                        ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/60 dark:text-blue-200'
+                        : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200/70 dark:hover:bg-gray-700/70'
+                    }`}
+                  >
+                    <Icon className="w-4 h-4 mr-1.5" />
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </nav>
+
+            <div className="flex items-center space-x-2 flex-shrink-0">
               <button
                 onClick={() => setLeftOpen(v => !v)}
                 className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors lg:hidden"
@@ -2297,8 +3009,8 @@ export default function App() {
       )}
 
       {/* Main Content */}
-      <div className="max-w-[1800px] mx-auto px-2 sm:px-4 lg:px-6 py-4">
-        {useStream && liveText && (
+      <div className="w-full py-4" style={{ paddingLeft: 'env(safe-area-inset-left, 0px)', paddingRight: 'env(safe-area-inset-right, 0px)' }}>
+        {useStream && !streamToEditor && liveText && (
           <div className="mb-3 bg-white dark:bg-gray-800 rounded-xl shadow-sm p-3 border border-gray-200 dark:border-gray-700">
             <div className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Промежуточный ответ LLM</div>
             <pre className="whitespace-pre-wrap text-sm text-gray-800 dark:text-gray-100 max-h-48 overflow-auto">{liveText}</pre>
@@ -2561,6 +3273,248 @@ export default function App() {
                   )}
                 </div>
               )}
+              <div className="mt-6 border-t border-gray-200 dark:border-gray-700 pt-4">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-gray-900 dark:text-white">Свои агенты</h3>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">Задайте инструкцию, контекст и параметры — агент сохранится и будет доступен в один клик.</p>
+                  </div>
+                <div className="flex items-center gap-2">
+                  <select
+                    className="text-xs border border-gray-300 dark:border-gray-600 rounded px-2 py-1 dark:bg-gray-700 dark:text-gray-200"
+                    value={newAgentTemplate}
+                    onChange={(e)=>setNewAgentTemplate(e.target.value)}
+                    >
+                      {CUSTOM_AGENT_TEMPLATES.map(t => (
+                        <option key={t.key} value={t.key}>{t.label}</option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => addCustomAgent()}
+                      className="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+                    >
+                      Добавить
+                    </button>
+                  </div>
+                </div>
+                <div className="mb-4 rounded-lg border border-dashed border-indigo-300 dark:border-indigo-600 bg-indigo-50/40 dark:bg-indigo-900/20 p-3">
+                  <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-3">
+                    <div>
+                      <div className="text-sm font-semibold text-gray-900 dark:text-white">
+                        Шаблон: {selectedAgentTemplate?.label || 'Своя формулировка'}
+                      </div>
+                      <div className="text-xs text-gray-600 dark:text-gray-400">
+                        {selectedAgentTemplate?.description || 'Настройте параметры и сохраните агента.'}
+                      </div>
+                    </div>
+                    <button onClick={resetTemplateDraft} className="self-start text-xs px-2 py-1 rounded border border-indigo-300 dark:border-indigo-500 text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-800/40 transition-colors">
+                      Сбросить
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3 text-xs">
+                    <label className="flex flex-col gap-1 text-gray-700 dark:text-gray-200">
+                      <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Название</span>
+                      <input
+                        value={templateDraft.name}
+                        onChange={(e)=>updateTemplateDraft({ name: e.target.value })}
+                        className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-900/60 text-gray-800 dark:text-gray-100"
+                        placeholder="Например: Анализ рисков"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-gray-700 dark:text-gray-200">
+                      <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Контекст</span>
+                      <select
+                        value={templateDraft.scope}
+                        onChange={(e)=>updateTemplateDraft({ scope: e.target.value as 'selection' | 'document' })}
+                        className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-900/60 text-gray-800 dark:text-gray-100"
+                      >
+                        <option value="selection">Только выделение</option>
+                        <option value="document">Весь документ</option>
+                      </select>
+                    </label>
+                    <label className="flex flex-col gap-1 text-gray-700 dark:text-gray-200">
+                      <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Температура</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={templateDraft.temperature}
+                        onChange={(e)=>updateTemplateDraft({ temperature: parseFloat(e.target.value) })}
+                        className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-900/60 text-gray-800 dark:text-gray-100"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-gray-700 dark:text-gray-200">
+                      <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Макс. токены</span>
+                      <input
+                        type="number"
+                        min={200}
+                        max={2000}
+                        step={50}
+                        value={templateDraft.maxTokens}
+                        onChange={(e)=>updateTemplateDraft({ maxTokens: parseInt(e.target.value, 10) })}
+                        className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-900/60 text-gray-800 dark:text-gray-100"
+                      />
+                    </label>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 mb-3">
+                    <label className="flex flex-col gap-1 text-xs text-gray-700 dark:text-gray-200">
+                      <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Описание</span>
+                      <textarea
+                        value={templateDraft.description}
+                        onChange={(e)=>updateTemplateDraft({ description: e.target.value })}
+                        rows={2}
+                        className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-900/60 text-gray-700 dark:text-gray-200"
+                        placeholder="Кратко опишите назначение агента"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-xs text-gray-700 dark:text-gray-200">
+                      <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Инструкция</span>
+                      <textarea
+                        value={templateDraft.instructions}
+                        onChange={(e)=>updateTemplateDraft({ instructions: e.target.value })}
+                        rows={4}
+                        className="border border-gray-200 dark:border-gray-600 rounded px-2 py-2 font-mono bg-white dark:bg-gray-900/60 text-gray-900 dark:text-gray-100"
+                        placeholder="Что должен сделать агент"
+                      />
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap gap-3 text-xs text-gray-700 dark:text-gray-200 mb-3">
+                    <label className="inline-flex items-center gap-1">
+                      <input type="checkbox" className="rounded" checked={templateDraft.useCatalog} onChange={(e)=>updateTemplateDraft({ useCatalog: e.target.checked })} />
+                      <span>Использовать каталог</span>
+                    </label>
+                    <label className="inline-flex items-center gap-1">
+                      <input type="checkbox" className="rounded" checked={templateDraft.applyToEditor} onChange={(e)=>updateTemplateDraft({ applyToEditor: e.target.checked })} />
+                      <span>Писать в документ</span>
+                    </label>
+                    <label className="inline-flex items-center gap-1">
+                      <input type="checkbox" className="rounded" checked={templateDraft.streamToEditor} onChange={(e)=>updateTemplateDraft({ streamToEditor: e.target.checked })} />
+                      <span>Стрим в редактор</span>
+                    </label>
+                  </div>
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-end gap-2">
+                    <small className="text-[11px] text-gray-500 dark:text-gray-400">Темп {templateDraft.temperature.toFixed(2)} · Макс {templateDraft.maxTokens}</small>
+                    <button
+                      onClick={() => addCustomAgent(templateDraft)}
+                      className="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+                    >
+                      Создать агента по шаблону
+                    </button>
+                  </div>
+                </div>
+                {customAgents.length === 0 ? (
+                  <p className="text-xs text-gray-500 dark:text-gray-400 italic">Пока нет пользовательских агентов. Выберите шаблон выше и добавьте свой сценарий.</p>
+                ) : (
+                  <div className="space-y-3">
+                    {customAgents.map(agent => (
+                      <div key={agent.id} className="border border-gray-200 dark:border-gray-600 rounded-lg p-3 bg-white dark:bg-gray-800/70">
+                        <div className="flex items-start gap-2 mb-2">
+                          <input
+                            value={agent.name}
+                            onChange={(e)=>updateCustomAgent(agent.id, { name: e.target.value })}
+                            className="flex-1 text-sm font-semibold text-gray-900 dark:text-white bg-transparent border-b border-dashed border-gray-300 dark:border-gray-500 focus:outline-none focus:border-indigo-400"
+                            placeholder="Название агента"
+                          />
+                          <button
+                            onClick={() => removeCustomAgent(agent.id)}
+                            className="p-1 text-gray-500 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-300"
+                            title="Удалить агента"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                        <textarea
+                          value={agent.description}
+                          onChange={(e)=>updateCustomAgent(agent.id, { description: e.target.value })}
+                          className="w-full text-xs border border-gray-200 dark:border-gray-600 rounded px-2 py-1 mb-2 bg-gray-50 dark:bg-gray-900/60 text-gray-700 dark:text-gray-200"
+                          rows={2}
+                          placeholder="Краткое описание задачи (необязательно)"
+                        />
+                        <textarea
+                          value={agent.instructions}
+                          onChange={(e)=>updateCustomAgent(agent.id, { instructions: e.target.value })}
+                          className="w-full text-xs border border-gray-200 dark:border-gray-600 rounded px-2 py-1 bg-gray-50 dark:bg-gray-900/60 text-gray-800 dark:text-gray-100"
+                          rows={4}
+                          placeholder="Опишите, что должен сделать агент."
+                        />
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3 text-xs text-gray-600 dark:text-gray-300">
+                          <label className="flex flex-col gap-1">
+                            <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Контекст</span>
+                            <select
+                              value={agent.scope}
+                              onChange={(e)=>updateCustomAgent(agent.id, { scope: e.target.value as 'selection' | 'document' })}
+                              className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 dark:bg-gray-800/60 dark:text-gray-100"
+                            >
+                              <option value="selection">Только выделение</option>
+                              <option value="document">Весь документ</option>
+                            </select>
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Температура</span>
+                            <input
+                              type="number"
+                              min={0}
+                              max={1}
+                              step={0.05}
+                              value={agent.temperature}
+                              onChange={(e)=>updateCustomAgent(agent.id, { temperature: parseFloat(e.target.value) })}
+                              className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 dark:bg-gray-800/60 dark:text-gray-100"
+                            />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Макс. токены</span>
+                            <input
+                              type="number"
+                              min={200}
+                              max={2000}
+                              step={50}
+                              value={agent.maxTokens}
+                              onChange={(e)=>updateCustomAgent(agent.id, { maxTokens: parseInt(e.target.value, 10) })}
+                              className="border border-gray-200 dark:border-gray-600 rounded px-2 py-1 dark:bg-gray-800/60 dark:text-gray-100"
+                            />
+                          </label>
+                          <div className="flex flex-col gap-1">
+                            <span className="uppercase tracking-wide text-[11px] text-gray-500 dark:text-gray-400">Опции</span>
+                            <div className="flex flex-wrap gap-2">
+                              <label className="inline-flex items-center gap-1">
+                                <input type="checkbox" className="rounded" checked={agent.useCatalog} onChange={(e)=>updateCustomAgent(agent.id, { useCatalog: e.target.checked })} />
+                                <span>Каталог</span>
+                              </label>
+                              <label className="inline-flex items-center gap-1">
+                                <input type="checkbox" className="rounded" checked={agent.applyToEditor} onChange={(e)=>updateCustomAgent(agent.id, { applyToEditor: e.target.checked })} />
+                                <span>Писать в документ</span>
+                              </label>
+                              <label className="inline-flex items-center gap-1">
+                                <input type="checkbox" className="rounded" checked={agent.streamToEditor} onChange={(e)=>updateCustomAgent(agent.id, { streamToEditor: e.target.checked })} />
+                                <span>Стрим в редактор</span>
+                              </label>
+                            </div>
+                          </div>
+                        </div>
+                        {agent.useCatalog && !useAgregator && (
+                          <div className="mt-2 text-[11px] text-amber-600 dark:text-amber-300">Каталог отключён — включите Agregator в правой панели, чтобы агент получил доступ к источникам.</div>
+                        )}
+                        <div className="mt-3 flex flex-wrap items-center gap-2">
+                          <button
+                            onClick={() => handleRunCustomAgent(agent)}
+                            disabled={status === 'working' || workflowRunning}
+                            className={`flex items-center px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                              status === 'working' || workflowRunning
+                                ? 'bg-gray-300 dark:bg-gray-600 text-gray-600 dark:text-gray-300 cursor-not-allowed'
+                                : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                            }`}
+                          >
+                            <Play className="w-4 h-4 mr-1" />
+                            Запустить
+                          </button>
+                          <span className="text-[11px] text-gray-500 dark:text-gray-400">Темп {agent.temperature.toFixed(2)} · Макс {agent.maxTokens}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Templates */}
@@ -2620,31 +3574,8 @@ export default function App() {
 
           {/* Main Editor Area */}
           <div onContextMenu={(e)=>{ e.preventDefault(); if(selectedTemplateKey){ setContent(prev => `${prev}\n\n${templatesMap[selectedTemplateKey]}\n\n`);} }}>
-            {/* Tabs */}
-            <div className="flex border-b border-gray-200 dark:border-gray-700 mb-3 text-sm">
-              {([
-                { id: 'editor', label: 'Редактор', icon: Edit3 },
-                { id: 'preview', label: 'Предпросмотр', icon: Eye },
-                { id: 'bibliography', label: missingCites.size>0 ? `Библиография (${missingCites.size})` : 'Библиография', icon: BookMarked },
-                { id: 'logs', label: 'Журнал агента', icon: MessageSquare }
-              ] as const).map(({ id, label, icon: Icon }) => (
-                <button
-                  key={id}
-                  onClick={() => setActiveTab(id)}
-                  className={`flex items-center px-3 py-1 font-medium border-b-2 transition-colors ${
-                    activeTab === id
-                      ? 'border-blue-500 text-blue-600 dark:text-blue-400'
-                      : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'
-                  }`}
-                >
-                  <Icon className="w-4 h-4 mr-2" />
-                  {label}
-                </button>
-              ))}
-            </div>
-
             {/* Tab Content */}
-            <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 min-h-[600px]">
+            <div className="mt-3 bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 min-h-[600px]">
               {activeTab === 'editor' && (
                 <div className="p-4">
                   <div className="mb-2 flex items-center justify-between">
@@ -2667,6 +3598,7 @@ export default function App() {
                   )}
                   <textarea
                     id="editor"
+                    ref={editorRef}
                     value={content}
                     onChange={(e) => setContent(e.target.value)}
                     onKeyDown={onEditorKeyDown}
@@ -2885,7 +3817,7 @@ export default function App() {
               )}
             </div>
             <span className="text-xs">
-              Версия 2.7.1 • Инструмент для научного письма
+              Версия 2.7.1 
             </span>
           </div>
         </div>
