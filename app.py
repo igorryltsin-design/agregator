@@ -1,17 +1,19 @@
-from logging.handlers import RotatingFileHandler
 # REST API и маршруты импорта/экспорта перенесены в `routes.py` как Blueprint.
 import os
 import re
 import json
 import hashlib
+import hmac
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 import itertools
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app
+from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app
 from functools import wraps
 from werkzeug.utils import secure_filename
 import sqlite3
@@ -70,7 +72,18 @@ def _configure_sqlite_pragmas(dbapi_connection, connection_record):
 
 import fitz  # библиотека PyMuPDF
 import requests
-from dotenv import load_dotenv
+from agregator.config import AppConfig, load_app_config
+from agregator.services import (
+    HttpSettings,
+    configure_http,
+    configure_logging,
+    get_rotating_log_handler as svc_get_rotating_log_handler,
+    get_task_queue,
+    http_request,
+    list_system_log_files as svc_list_system_log_files,
+    resolve_log_name as svc_resolve_log_name,
+    tail_log_file as svc_tail_log_file,
+)
 try:
     import docx
 except ImportError:
@@ -123,6 +136,65 @@ except Exception:
     _morph = None
 
 logger = logging.getLogger(__name__)
+
+ROLE_ADMIN = 'admin'
+ROLE_EDITOR = 'editor'
+ROLE_VIEWER = 'viewer'
+_ROLE_ALIASES = {
+    'user': ROLE_EDITOR,
+    'editor': ROLE_EDITOR,
+    'viewer': ROLE_VIEWER,
+    'admin': ROLE_ADMIN,
+}
+
+
+def _normalize_user_role(value: str | None, *, default: str = ROLE_VIEWER) -> str:
+    if not value:
+        return default
+    token = str(value).strip().lower()
+    return _ROLE_ALIASES.get(token, default if token not in _ROLE_ALIASES else token)
+
+
+def _user_role(user: User | None) -> str:
+    if not user:
+        return ROLE_VIEWER
+    return _normalize_user_role(getattr(user, 'role', None), default=ROLE_EDITOR)
+
+PIPELINE_API_KEY = (os.getenv("PIPELINE_API_KEY") or "").strip()
+
+
+def _extract_pipeline_token() -> Optional[str]:
+    header = request.headers.get('Authorization')
+    token: Optional[str] = None
+    if header:
+        lowered = header.lower()
+        if lowered.startswith('bearer '):
+            token = header[7:].strip()
+        else:
+            token = header.strip()
+    if not token:
+        token = request.headers.get('X-Agregator-Key')
+        if token:
+            token = token.strip()
+    if not token:
+        token = request.headers.get('X-Agregator-Token')
+        if token:
+            token = token.strip()
+    return token or None
+
+
+def _check_pipeline_access() -> tuple[bool, Optional[Response]]:
+    user = _load_current_user()
+    if _user_role(user) == ROLE_ADMIN:
+        return True, None
+    if PIPELINE_API_KEY:
+        token = _extract_pipeline_token()
+        if token and hmac.compare_digest(token, PIPELINE_API_KEY):
+            return True, None
+        resp = jsonify({'ok': False, 'error': 'Forbidden'})
+        resp.status_code = 403
+        return False, resp
+    return True, None
 
 
 class TimedCache:
@@ -786,131 +858,86 @@ def _record_search_metric(query_hash: str, durations: dict[str, float], user: Us
 
 # ------------------- Конфигурация -------------------
 
-BASE_DIR = Path(__file__).parent
-LOGIN_BACKGROUNDS_DIR = (BASE_DIR / 'static' / 'login-backgrounds').resolve()
-# Подхватить .env, если есть рядом
-load_dotenv(BASE_DIR / ".env") if (BASE_DIR / ".env").exists() else None
+CONFIG = load_app_config()
+def _apply_config_defaults(cfg: AppConfig) -> None:
+    global BASE_DIR, LOGIN_BACKGROUNDS_DIR, SCAN_ROOT, EXTRACT_TEXT
+    global OCR_LANGS_CFG, PDF_OCR_PAGES_CFG, ALWAYS_OCR_FIRST_PAGE_DISSERTATION
+    global DEFAULT_USE_LLM, DEFAULT_PRUNE, COLLECTIONS_IN_SEPARATE_DIRS
+    global COLLECTION_TYPE_SUBDIRS, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY
+    global LM_DEFAULT_PROVIDER, TRANSCRIBE_ENABLED, TRANSCRIBE_BACKEND
+    global TRANSCRIBE_MODEL_PATH, TRANSCRIBE_LANGUAGE, IMAGES_VISION_ENABLED
+    global KEYWORDS_TO_TAGS_ENABLED, TYPE_DETECT_FLOW, TYPE_LLM_OVERRIDE
+    global RENAME_PATTERNS, AI_RERANK_LLM, IMPORT_SUBDIR, MOVE_ON_RENAME
+    global TYPE_DIRS, DEFAULT_PROMPTS, PROMPTS, SUMMARIZE_AUDIO
+    global AUDIO_KEYWORDS_LLM, FW_CACHE_DIR, SETTINGS_STORE_PATH
+    global SEARCH_FACET_TAG_KEYS, GRAPH_FACET_TAG_KEYS, SEARCH_FACET_INCLUDE_TYPES
+    global LOG_DIR, LOG_FILE_PATH, UPLOAD_FOLDER
+    global HTTP_DEFAULT_TIMEOUT, HTTP_CONNECT_TIMEOUT, HTTP_RETRIES, HTTP_BACKOFF_FACTOR
+    global LOG_LEVEL, SENTRY_DSN, SENTRY_ENVIRONMENT
 
-def getenv_bool(name, default=False):
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+    BASE_DIR = cfg.base_dir
+    LOGIN_BACKGROUNDS_DIR = cfg.login_backgrounds_dir
+    SCAN_ROOT = cfg.scan_root
+    EXTRACT_TEXT = cfg.extract_text
+    OCR_LANGS_CFG = cfg.ocr_langs
+    PDF_OCR_PAGES_CFG = cfg.pdf_ocr_pages
+    ALWAYS_OCR_FIRST_PAGE_DISSERTATION = cfg.always_ocr_first_page_dissertation
+    DEFAULT_USE_LLM = cfg.default_use_llm
+    DEFAULT_PRUNE = cfg.default_prune
+    COLLECTIONS_IN_SEPARATE_DIRS = cfg.collections_in_separate_dirs
+    COLLECTION_TYPE_SUBDIRS = cfg.collection_type_subdirs
+    LMSTUDIO_API_BASE = cfg.lmstudio_api_base
+    LMSTUDIO_MODEL = cfg.lmstudio_model
+    LMSTUDIO_API_KEY = cfg.lmstudio_api_key
+    LM_DEFAULT_PROVIDER = cfg.lm_default_provider
+    TRANSCRIBE_ENABLED = cfg.transcribe_enabled
+    TRANSCRIBE_BACKEND = cfg.transcribe_backend
+    TRANSCRIBE_MODEL_PATH = cfg.transcribe_model_path
+    TRANSCRIBE_LANGUAGE = cfg.transcribe_language
+    IMAGES_VISION_ENABLED = cfg.images_vision_enabled
+    KEYWORDS_TO_TAGS_ENABLED = cfg.keywords_to_tags_enabled
+    TYPE_DETECT_FLOW = cfg.type_detect_flow
+    TYPE_LLM_OVERRIDE = cfg.type_llm_override
+    RENAME_PATTERNS = dict(cfg.rename_patterns)
+    AI_RERANK_LLM = cfg.ai_rerank_llm
+    IMPORT_SUBDIR = cfg.import_subdir
+    MOVE_ON_RENAME = cfg.move_on_rename
+    TYPE_DIRS = dict(cfg.type_dirs)
+    DEFAULT_PROMPTS = dict(cfg.default_prompts)
+    PROMPTS = dict(cfg.prompts)
+    SUMMARIZE_AUDIO = cfg.summarize_audio
+    AUDIO_KEYWORDS_LLM = cfg.audio_keywords_llm
+    FW_CACHE_DIR = cfg.fw_cache_dir
+    SETTINGS_STORE_PATH = cfg.settings_store_path
+    SEARCH_FACET_TAG_KEYS = list(cfg.search_facet_tag_keys) if cfg.search_facet_tag_keys is not None else None
+    GRAPH_FACET_TAG_KEYS = list(cfg.graph_facet_tag_keys) if cfg.graph_facet_tag_keys is not None else None
+    SEARCH_FACET_INCLUDE_TYPES = bool(cfg.search_facet_include_types)
+    LOG_DIR = cfg.logs_dir
+    LOG_FILE_PATH = cfg.log_file_path
+    UPLOAD_FOLDER = cfg.scan_root
+    HTTP_DEFAULT_TIMEOUT = float(cfg.http_timeout)
+    HTTP_CONNECT_TIMEOUT = float(cfg.http_connect_timeout)
+    HTTP_RETRIES = int(cfg.http_retries)
+    HTTP_BACKOFF_FACTOR = float(cfg.http_backoff_factor)
+    LOG_LEVEL = cfg.log_level
+    SENTRY_DSN = cfg.sentry_dsn
+    SENTRY_ENVIRONMENT = cfg.sentry_environment
 
-SCAN_ROOT = Path(os.getenv("SCAN_ROOT", str(BASE_DIR / "sample_library")))
-EXTRACT_TEXT = getenv_bool("EXTRACT_TEXT", True)
-OCR_LANGS_CFG = os.getenv("OCR_LANGS", "rus+eng")
-PDF_OCR_PAGES_CFG = int(os.getenv("PDF_OCR_PAGES", "5"))
-# Всегда запускать OCR для первой страницы диссертации (по умолчанию включено)
-ALWAYS_OCR_FIRST_PAGE_DISSERTATION = getenv_bool("OCR_DISS_FIRST_PAGE", True)
-DEFAULT_USE_LLM = getenv_bool("DEFAULT_USE_LLM", False)
-DEFAULT_PRUNE = getenv_bool("DEFAULT_PRUNE", True)
-COLLECTIONS_IN_SEPARATE_DIRS = getenv_bool("COLLECTIONS_IN_SEPARATE_DIRS", False)
-COLLECTION_TYPE_SUBDIRS = getenv_bool("COLLECTION_TYPE_SUBDIRS", False)
 
-LMSTUDIO_API_BASE = os.getenv("LMSTUDIO_API_BASE", "http://localhost:1234/v1")
-# Модель LLM по умолчанию
-LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "google/gemma-3n-e4b")
-LMSTUDIO_API_KEY = os.getenv("LMSTUDIO_API_KEY", "")
+_apply_config_defaults(CONFIG)
 LLM_PROVIDER_CHOICES = {'openai', 'ollama'}
-LM_DEFAULT_PROVIDER = (os.getenv("LM_PROVIDER") or "openai").strip().lower()
 if LM_DEFAULT_PROVIDER not in LLM_PROVIDER_CHOICES:
     LM_DEFAULT_PROVIDER = 'openai'
-TRANSCRIBE_ENABLED = getenv_bool("TRANSCRIBE_ENABLED", True)
-TRANSCRIBE_BACKEND = os.getenv("TRANSCRIBE_BACKEND", "faster-whisper")
-TRANSCRIBE_MODEL_PATH = os.getenv("TRANSCRIBE_MODEL_PATH", os.getenv('FASTER_WHISPER_DEFAULT_MODEL', 'small'))
-TRANSCRIBE_LANGUAGE = os.getenv("TRANSCRIBE_LANGUAGE", "ru")
-IMAGES_VISION_ENABLED = getenv_bool("IMAGES_VISION_ENABLED", False)
-KEYWORDS_TO_TAGS_ENABLED = getenv_bool("KEYWORDS_TO_TAGS_ENABLED", True)
-# Порядок шагов определения типа до применения LLM
-TYPE_DETECT_FLOW = os.getenv("TYPE_DETECT_FLOW", "extension,filename,heuristics,llm")
-TYPE_LLM_OVERRIDE = getenv_bool("TYPE_LLM_OVERRIDE", True)
-RENAME_PATTERNS = {
-    # Плейсхолдеры: {abbr} {degree} {title} {author_last} {year} {filename}
-    'dissertation': '{abbr}.{degree}.{title}.{author_last}',
-    'dissertation_abstract': '{abbr}.{degree}.{title}.{author_last}',
-    'article': 'СТ.{title}.{author_last}',
-    'textbook': 'УЧ.{title}.{author_last}',
-    'monograph': 'МОНО.{title}.{author_last}',
-    'image': 'ИЗО.{title}',
-    'audio': 'АУД.{title}',
-    'default': '{abbr}.{title}.{author_last}'
-}
-# Реранжирование на основе ИИ (расположено после определения getenv_bool)
-AI_RERANK_LLM = getenv_bool('AI_RERANK_LLM', False)
-
-# Куда сохранять загруженные файлы: подпапка внутри SCAN_ROOT
-# По умолчанию используем 'import' (можно поменять в Настройках)
-IMPORT_SUBDIR = os.getenv("IMPORT_SUBDIR", "import").strip().strip("/\\")
-
-# Перемещать ли файл в подпапку по типу при переименовании
-MOVE_ON_RENAME = getenv_bool("MOVE_ON_RENAME", True)
-
-# Карта подпапок по типам материалов (относительно SCAN_ROOT)
-TYPE_DIRS = {
-    "dissertation": "dissertations",
-    "dissertation_abstract": "dissertation_abstract",
-    "article": "articles",
-    "textbook": "textbooks",
-    "monograph": "monographs",
-    "report": "reports",
-    "patent": "patents",
-    "presentation": "presentations",
-    "proceedings": "proceedings",
-    "standard": "standards",
-    "note": "notes",
-    "document": "documents",
-    "audio": "audio",
-    "image": "images",
-    "other": "other",
-}
-
-# Промпты LLM (можно переопределить в настройках)
-DEFAULT_PROMPTS = {
-    'metadata_system': (
-        "Ты помощник по каталогизации научных материалов. "
-        "Твоя задача: определить тип материала из набора: dissertation, dissertation_abstract, article, textbook, "
-        "monograph, report, patent, presentation, proceedings, standard, note, document. "
-        "Если подходит несколько — выбери наиболее вероятный. Верни ТОЛЬКО валидный JSON без пояснений. "
-        "Ключи: material_type, title, author, year, advisor, keywords (array), novelty (string), "
-        "literature (array), organizations (array), classification (array). Если данных нет — пустые строки/массивы."
-    ),
-    'summarize_audio_system': (
-        "Ты помощник. Суммаризируй стенограмму аудио в 3–6 предложениях на русском, "
-        "выделив тему, основные тезисы и вывод."
-    ),
-    'keywords_system': (
-        "Ты извлекаешь ключевые слова из стенограммы аудио. Верни только JSON-массив строк на русском: "
-        "[\"ключ1\", \"ключ2\", ...]. Без пояснений, не более 12 слов/фраз."
-    ),
-    'ai_search_keywords_system': (
-        "Ты помощник ИИ-поиска. По заданному запросу подбери 3-8 релевантных тегов (фраз) на русском "
-        "или английском. Теги должны отражать суть запроса, быть краткими (1-3 слова) и без служебных слов. "
-        "Если в запросе есть выражения в кавычках, включи их без изменений (без кавычек). Верни строго JSON-массив строк."
-    ),
-    'vision_system': (
-        "Ты помощник по анализу изображений. Опиши изображение 2–4 предложениями на русском и верни 5–12 ключевых слов. "
-        "Верни строго JSON: {\"description\":\"...\",\"keywords\":[\"...\"]}."
-    ),
-}
-
-PROMPTS = dict(DEFAULT_PROMPTS)
-SUMMARIZE_AUDIO = getenv_bool("SUMMARIZE_AUDIO", False)
-# Упрощённое извлечение ключевых слов из аудиостенограмм через LLM (лёгкий промпт)
-AUDIO_KEYWORDS_LLM = getenv_bool("AUDIO_KEYWORDS_LLM", True)
-
-# Каталог кэша для моделей faster-whisper (когда автозагрузка по псевдониму)
-FW_CACHE_DIR = Path(os.getenv("FASTER_WHISPER_CACHE_DIR", str((Path(__file__).parent / "models" / "faster-whisper").resolve())))
 
 # ------------------- Сохранение настроек во время работы -------------------
 
-SETTINGS_STORE_PATH = BASE_DIR / 'runtime_settings.json'
+# ------------------- Сохранение настроек во время работы -------------------
 
 # ------------------- Facet configuration (search & graph) -------------------
 
-SEARCH_FACET_TAG_KEYS: list[str] | None = None
-GRAPH_FACET_TAG_KEYS: list[str] | None = None
-SEARCH_FACET_INCLUDE_TYPES: bool = True
+SEARCH_FACET_TAG_KEYS: list[str] | None = SEARCH_FACET_TAG_KEYS
+GRAPH_FACET_TAG_KEYS: list[str] | None = GRAPH_FACET_TAG_KEYS
+SEARCH_FACET_INCLUDE_TYPES: bool = SEARCH_FACET_INCLUDE_TYPES
 
 
 def _facet_config_state() -> dict:
@@ -959,6 +986,22 @@ def _runtime_settings_snapshot() -> dict:
         'GRAPH_FACET_TAG_KEYS': list(GRAPH_FACET_TAG_KEYS) if GRAPH_FACET_TAG_KEYS is not None else None,
         'SEARCH_FACET_INCLUDE_TYPES': bool(SEARCH_FACET_INCLUDE_TYPES),
     }
+
+
+def _apply_runtime_settings_to_config(app_obj: Flask) -> None:
+    app_obj.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
+    app_obj.config['IMPORT_SUBDIR'] = IMPORT_SUBDIR
+    app_obj.config['MOVE_ON_RENAME'] = MOVE_ON_RENAME
+    app_obj.config['COLLECTIONS_IN_SEPARATE_DIRS'] = COLLECTIONS_IN_SEPARATE_DIRS
+    app_obj.config['COLLECTION_TYPE_SUBDIRS'] = COLLECTION_TYPE_SUBDIRS
+    app_obj.config['TYPE_DIRS'] = dict(TYPE_DIRS)
+    app_obj.config['SEARCH_FACET_TAG_KEYS'] = (
+        list(SEARCH_FACET_TAG_KEYS) if SEARCH_FACET_TAG_KEYS is not None else None
+    )
+    app_obj.config['GRAPH_FACET_TAG_KEYS'] = (
+        list(GRAPH_FACET_TAG_KEYS) if GRAPH_FACET_TAG_KEYS is not None else None
+    )
+    app_obj.config['SEARCH_FACET_INCLUDE_TYPES'] = SEARCH_FACET_INCLUDE_TYPES
 
 
 def _save_runtime_settings_to_disk() -> None:
@@ -1101,6 +1144,7 @@ def _load_runtime_settings_from_disk() -> None:
         app_ref.config['SEARCH_FACET_TAG_KEYS'] = SEARCH_FACET_TAG_KEYS
         app_ref.config['GRAPH_FACET_TAG_KEYS'] = GRAPH_FACET_TAG_KEYS
         app_ref.config['SEARCH_FACET_INCLUDE_TYPES'] = SEARCH_FACET_INCLUDE_TYPES
+        _apply_runtime_settings_to_config(app_ref)
 
 
 # ------------------- Lightweight response helpers -------------------
@@ -1537,124 +1581,87 @@ def _ensure_faster_whisper_model(model_ref: str) -> str:
         return ''
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{BASE_DIR / 'catalogue.db'}"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JSON_AS_ASCII"] = False
-# Логирование: файл с ротацией до 100 МБ
-LOG_DIR = BASE_DIR / 'logs'
-try:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    LOG_DIR = BASE_DIR
-LOG_FILE_PATH = LOG_DIR / 'agregator.log'
-if not any(isinstance(h, RotatingFileHandler) for h in app.logger.handlers):
-    rotating_handler = RotatingFileHandler(LOG_FILE_PATH, maxBytes=100 * 1024 * 1024, backupCount=5, encoding='utf-8')
-    rotating_handler.setLevel(logging.INFO)
-    rotating_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s'))
-    app.logger.addHandler(rotating_handler)
-    logging.getLogger().setLevel(logging.INFO)
+
+
+def setup_app(config: AppConfig | None = None) -> Flask:
+    global CONFIG, LOG_DIR, LOG_FILE_PATH, UPLOAD_FOLDER
+    cfg = config or CONFIG
+    if config is not None:
+        CONFIG = cfg
+        _apply_config_defaults(cfg)
+        if LM_DEFAULT_PROVIDER not in LLM_PROVIDER_CHOICES:
+            LM_DEFAULT_PROVIDER = 'openai'
+    LOG_DIR = cfg.logs_dir
+    LOG_FILE_PATH = cfg.log_file_path
+    configure_http(
+        HttpSettings(
+            timeout=cfg.http_timeout,
+            connect_timeout=cfg.http_connect_timeout,
+            retries=cfg.http_retries,
+            backoff_factor=cfg.http_backoff_factor,
+        )
+    )
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        fallback_dir = cfg.base_dir
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        LOG_DIR = fallback_dir
+        LOG_FILE_PATH = LOG_DIR / 'agregator.log'
+    configure_logging(
+        app,
+        LOG_FILE_PATH,
+        level=LOG_LEVEL,
+        sentry_dsn=SENTRY_DSN or None,
+        sentry_environment=SENTRY_ENVIRONMENT or None,
+    )
+    # Гарантируем запуск очереди фоновых задач
+    get_task_queue().start()
+    app.secret_key = cfg.flask_secret_key
+    app.config.update(cfg.to_flask_config())
+    app.config['MAX_CONTENT_LENGTH'] = cfg.max_content_length
+    db.init_app(app)
+    try:
+        with app.app_context():
+            with db.engine.connect() as conn:
+                conn.execute(text("PRAGMA foreign_keys = 1"))
+                conn.execute(text("PRAGMA trusted_schema = 1"))
+                conn.execute(text("PRAGMA recursive_triggers = 1"))
+            db.engine.dispose()
+    except Exception as pragma_exc:
+        logger.warning('Failed to apply SQLite PRAGMA settings: %s', pragma_exc)
+    _load_runtime_settings_from_disk()
+    UPLOAD_FOLDER = SCAN_ROOT
+    _apply_runtime_settings_to_config(app)
+    if 'admin_api' not in app.blueprints:
+        app.register_blueprint(admin_bp)
+    return app
 
 
 def _get_rotating_log_handler() -> RotatingFileHandler | None:
-    for handler in app.logger.handlers:
-        if isinstance(handler, RotatingFileHandler):
-            base_filename = getattr(handler, 'baseFilename', '')
-            if Path(base_filename).resolve() == LOG_FILE_PATH.resolve():
-                return handler
-    return None
+    return svc_get_rotating_log_handler(app, LOG_FILE_PATH)
 
 
 def _list_system_log_files() -> list[dict[str, str | int | float | bool | None]]:
-    files: list[dict[str, str | int | float | bool | None]] = []
-    try:
-        base = LOG_FILE_PATH.name
-        for entry in sorted(LOG_DIR.glob(f"{base}*")):
-            if not entry.is_file():
-                continue
-            try:
-                stat = entry.stat()
-                files.append({
-                    'name': entry.name,
-                    'size': stat.st_size,
-                    'modified_at': datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    'rotated': entry.name != base,
-                })
-            except Exception:
-                continue
-    except Exception:
-        pass
+    files = []
+    for entry in svc_list_system_log_files(LOG_DIR, LOG_FILE_PATH):
+        files.append(
+            {
+                'name': entry.get('name'),
+                'size': entry.get('size'),
+                'modified_at': entry.get('modified_at'),
+                'rotated': entry.get('rotated'),
+            }
+        )
     return files
 
 
 def _tail_log_file(path: Path, max_lines: int = 200) -> list[str]:
-    if max_lines <= 0 or not path.exists() or not path.is_file():
-        return []
-    max_lines = min(max_lines, 2000)
-    chunk_size = 8192
-    buffer = b''
-    with path.open('rb') as fh:
-        fh.seek(0, os.SEEK_END)
-        file_size = fh.tell()
-        remaining = file_size
-        newlines = 0
-        while remaining > 0 and newlines <= max_lines:
-            read_size = min(chunk_size, remaining)
-            remaining -= read_size
-            fh.seek(remaining)
-            chunk = fh.read(read_size)
-            buffer = chunk + buffer
-            newlines = buffer.count(b'\n')
-        text = buffer.decode('utf-8', errors='replace')
-        lines = text.splitlines()
-        return lines[-max_lines:]
+    return svc_tail_log_file(path, max_lines=max_lines)
 
 
 def _resolve_log_name(name: str | None) -> Path | None:
-    candidate = (name or '').strip() or LOG_FILE_PATH.name
-    if candidate == 'current':
-        candidate = LOG_FILE_PATH.name
-    if not candidate.startswith(LOG_FILE_PATH.name):
-        return None
-    path = (LOG_DIR / candidate).resolve()
-    try:
-        path.relative_to(LOG_DIR.resolve())
-    except Exception:
-        return None
-    return path if path.exists() and path.is_file() else None
-# Ограничить максимальный размер загрузки (по умолчанию 50 МБ; настраивается через MAX_CONTENT_LENGTH)
-try:
-    app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_CONTENT_LENGTH', str(50 * 1024 * 1024)))
-except Exception:
-    app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
-db.init_app(app)
-
-# Применяем обязательные PRAGMA сразу для текущего соединения
-try:
-    with app.app_context():
-        with db.engine.connect() as conn:
-            conn.execute(text("PRAGMA foreign_keys = 1"))
-            conn.execute(text("PRAGMA trusted_schema = 1"))
-            conn.execute(text("PRAGMA recursive_triggers = 1"))
-        db.engine.dispose()
-except Exception as pragma_exc:
-    logger.warning('Failed to apply SQLite PRAGMA settings: %s', pragma_exc)
-
-
-# Модели описаны в models.py и импортируются выше.
-
-# Инициализация конфигурации для перемещения файлов
-# На старте используем SCAN_ROOT как корневую папку (UPLOAD_FOLDER задаётся ниже)
-app.config.setdefault('UPLOAD_FOLDER', str(SCAN_ROOT))
-app.config.setdefault('IMPORT_SUBDIR', IMPORT_SUBDIR)
-app.config.setdefault('MOVE_ON_RENAME', MOVE_ON_RENAME)
-app.config.setdefault('COLLECTIONS_IN_SEPARATE_DIRS', COLLECTIONS_IN_SEPARATE_DIRS)
-app.config.setdefault('COLLECTION_TYPE_SUBDIRS', COLLECTION_TYPE_SUBDIRS)
-app.config.setdefault('TYPE_DIRS', TYPE_DIRS)
-app.config.setdefault('SEARCH_FACET_TAG_KEYS', SEARCH_FACET_TAG_KEYS)
-app.config.setdefault('GRAPH_FACET_TAG_KEYS', GRAPH_FACET_TAG_KEYS)
-app.config.setdefault('SEARCH_FACET_INCLUDE_TYPES', SEARCH_FACET_INCLUDE_TYPES)
-
+    return svc_resolve_log_name(LOG_DIR, LOG_FILE_PATH, name)
 # ------------------- Утилиты -------------------
 
 ALLOWED_EXTS = {".pdf", ".txt", ".md", ".docx", ".rtf", ".mp3", ".wav", ".m4a", ".flac", ".ogg",
@@ -1662,20 +1669,11 @@ ALLOWED_EXTS = {".pdf", ".txt", ".md", ".docx", ".rtf", ".mp3", ".wav", ".m4a", 
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
-UPLOAD_FOLDER = BASE_DIR / "sample_library"
-app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
-
-_load_runtime_settings_from_disk()
-UPLOAD_FOLDER = SCAN_ROOT
-app.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
-app.config['COLLECTIONS_IN_SEPARATE_DIRS'] = COLLECTIONS_IN_SEPARATE_DIRS
-app.config['COLLECTION_TYPE_SUBDIRS'] = COLLECTION_TYPE_SUBDIRS
-
 # ------------------- Пользователи и доступ -------------------
 
-DEFAULT_ADMIN_USER = (os.getenv('DEFAULT_ADMIN_USER') or 'admin').strip() or 'admin'
-DEFAULT_ADMIN_PASSWORD = (os.getenv('DEFAULT_ADMIN_PASSWORD') or '').strip()
-LEGACY_ACCESS_CODE = (os.getenv('ACCESS_CODE') or '').strip()
+DEFAULT_ADMIN_USER = CONFIG.default_admin_user
+DEFAULT_ADMIN_PASSWORD = CONFIG.default_admin_password
+LEGACY_ACCESS_CODE = CONFIG.legacy_access_code
 SESSION_KEY = 'user_id'
 
 _PUBLIC_PREFIXES = ('/static/', '/assets/', '/login-backgrounds/')
@@ -1690,16 +1688,22 @@ def _log_user_action(user: User | None, action: str, entity: str | None = None, 
         db.session.rollback()
 
 def _user_to_payload(user: User) -> dict:
+    role = _normalize_user_role(getattr(user, 'role', ROLE_VIEWER), default=ROLE_EDITOR)
     return {
         'id': user.id,
         'username': user.username,
-        'role': user.role,
+        'role': role,
         'full_name': user.full_name,
         'created_at': user.created_at.isoformat() if user.created_at else None,
         'updated_at': user.updated_at.isoformat() if getattr(user, 'updated_at', None) else None,
         'aiword_access': _has_aiword_access(user),
         'can_upload': _user_can_upload(user),
         'can_import': _user_can_upload(user),
+        'permissions': {
+            'can_admin': role == ROLE_ADMIN,
+            'can_edit': role in (ROLE_ADMIN, ROLE_EDITOR),
+            'can_view': True,
+        },
     }
 
 def ensure_default_admin() -> None:
@@ -1708,7 +1712,7 @@ def ensure_default_admin() -> None:
             db.create_all()
             if User.query.count() == 0:
                 password = DEFAULT_ADMIN_PASSWORD or LEGACY_ACCESS_CODE or 'admin123'
-                user = User(username=DEFAULT_ADMIN_USER, role='admin')
+                user = User(username=DEFAULT_ADMIN_USER, role=ROLE_ADMIN)
                 user.set_password(password)
                 db.session.add(user)
                 db.session.commit()
@@ -1743,7 +1747,7 @@ def _load_current_user() -> User | None:
 def _compute_allowed_collection_ids(user: User | None):
     if not user:
         return set()
-    if getattr(user, 'role', '') == 'admin':
+    if _user_role(user) == ROLE_ADMIN:
         return None
     ids: set[int] = set()
     try:
@@ -1792,7 +1796,7 @@ def _has_collection_access(collection_id: int, write: bool = False) -> bool:
     user = _load_current_user()
     if not user:
         return False
-    if getattr(user, 'role', '') == 'admin':
+    if _user_role(user) == ROLE_ADMIN:
         return True
     allowed = getattr(g, 'allowed_collection_ids', set())
     if allowed is None or collection_id in allowed:
@@ -1849,7 +1853,7 @@ def _ensure_aiword_access() -> User:
     user = _load_current_user()
     if not user:
         abort(401)
-    if getattr(user, 'role', '') == 'admin':
+    if _user_role(user) == ROLE_ADMIN:
         return user
     allowed = _aiword_allowed_user_ids()
     if user.id in allowed:
@@ -1860,7 +1864,7 @@ def _ensure_aiword_access() -> User:
 def _has_aiword_access(user: User | None) -> bool:
     if not user:
         return False
-    if getattr(user, 'role', '') == 'admin':
+    if _user_role(user) == ROLE_ADMIN:
         return True
     try:
         return AiWordAccess.query.filter_by(user_id=user.id).first() is not None
@@ -1871,8 +1875,11 @@ def _has_aiword_access(user: User | None) -> bool:
 def _user_can_upload(user: User | None) -> bool:
     if not user:
         return False
-    if getattr(user, 'role', '') == 'admin':
+    role = _normalize_user_role(getattr(user, 'role', None), default=ROLE_EDITOR)
+    if role == ROLE_ADMIN:
         return True
+    if role == ROLE_VIEWER:
+        return False
     try:
         if Collection.query.filter(Collection.owner_id == user.id).limit(1).first():
             return True
@@ -2174,7 +2181,14 @@ def _llm_send_chat(choice: dict, messages: list[dict], *, temperature: float, ma
                 pass
         if extra_payload:
             payload.update(extra_payload)
-    response = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=_llm_timeout_pair(timeout))
+    response = http_request(
+        'POST',
+        url,
+        headers=_llm_choice_headers(choice),
+        json=payload,
+        timeout=_llm_timeout_pair(timeout),
+        logger=app.logger,
+    )
     return provider, response
 
 
@@ -2219,10 +2233,19 @@ def _access_gate():
     user = _load_current_user()
     if _is_public_path(path):
         return None
+    if path == '/api/training/problem-pipeline':
+        if request.method == 'OPTIONS':
+            return None
+        allowed, failure_response = _check_pipeline_access()
+        if allowed:
+            return None
+        return _add_pipeline_cors_headers(failure_response)
     if user:
         return None
     if path.startswith('/api/') or request.headers.get('X-Requested-With') == 'XMLHttpRequest':
-        return ("Не авторизовано", 401)
+        resp = jsonify({'ok': False, 'error': 'Не авторизовано'})
+        resp.status_code = 401
+        return _add_pipeline_cors_headers(resp)
     return redirect('/app/login')
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -2306,6 +2329,8 @@ def require_admin(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+admin_bp = Blueprint('admin_api', __name__, url_prefix='/api/admin')
+
 def _admin_count(exclude_id: int | None = None) -> int:
     q = User.query.filter(User.role == 'admin')
     if exclude_id is not None:
@@ -2315,7 +2340,7 @@ def _admin_count(exclude_id: int | None = None) -> int:
     except Exception:
         return 0
 
-@app.route('/api/admin/users', methods=['GET', 'POST'])
+@admin_bp.route('/users', methods=['GET', 'POST'])
 def api_admin_users():
     _require_admin()
     if request.method == 'GET':
@@ -2325,9 +2350,7 @@ def api_admin_users():
     username = (data.get('username') or '').strip()
     password = (data.get('password') or '').strip()
     full_name = (data.get('full_name') or '').strip()
-    role = (data.get('role') or 'user').strip().lower()
-    if role not in ('admin', 'user'):
-        role = 'user'
+    role = _normalize_user_role(data.get('role'), default=ROLE_EDITOR)
     if len(username) < 3:
         return jsonify({'ok': False, 'error': 'Логин должен содержать минимум 3 символа'}), 400
     if len(password) < 6:
@@ -2350,7 +2373,7 @@ def api_admin_users():
     return jsonify({'ok': True, 'user': _user_to_payload(user)}), 201
 
 
-@app.route('/api/admin/users/search')
+@admin_bp.route('/users/search')
 @require_admin
 def api_admin_users_search():
     q = (request.args.get('q') or '').strip()
@@ -2367,17 +2390,17 @@ def api_admin_users_search():
         'id': u.id,
         'username': u.username,
         'full_name': u.full_name,
-        'role': u.role,
+        'role': _normalize_user_role(u.role, default=ROLE_EDITOR),
     } for u in users]})
 
-@app.route('/api/admin/users/<int:user_id>', methods=['PATCH', 'DELETE'])
+@admin_bp.route('/users/<int:user_id>', methods=['PATCH', 'DELETE'])
 def api_admin_user_detail(user_id: int):
     admin = _require_admin()
     user = User.query.get_or_404(user_id)
     if request.method == 'DELETE':
         if user.id == admin.id:
             return jsonify({'ok': False, 'error': 'Нельзя удалить собственную учётную запись'}), 400
-        if user.role == 'admin' and _admin_count(exclude_id=user.id) == 0:
+        if _user_role(user) == ROLE_ADMIN and _admin_count(exclude_id=user.id) == 0:
             return jsonify({'ok': False, 'error': 'Нельзя удалить последнего администратора'}), 400
         db.session.delete(user)
         db.session.commit()
@@ -2387,9 +2410,10 @@ def api_admin_user_detail(user_id: int):
     updated = False
     new_role = data.get('role')
     if new_role is not None:
-        role = str(new_role).strip().lower()
-        if role in ('admin', 'user') and role != user.role:
-            if user.role == 'admin' and role != 'admin' and _admin_count(exclude_id=user.id) == 0:
+        role = _normalize_user_role(str(new_role), default=_user_role(user))
+        current_role = _user_role(user)
+        if role != current_role:
+            if current_role == ROLE_ADMIN and role != ROLE_ADMIN and _admin_count(exclude_id=user.id) == 0:
                 return jsonify({'ok': False, 'error': 'Должен остаться хотя бы один администратор'}), 400
             user.role = role
             updated = True
@@ -2403,7 +2427,7 @@ def api_admin_user_detail(user_id: int):
     if not updated:
         return jsonify({'ok': False, 'error': 'Нет изменений'}), 400
     db.session.commit()
-    _log_user_action(admin, 'user_update', 'user', user.id, detail=json.dumps({'role': user.role, 'password_changed': bool(new_password)}))
+    _log_user_action(admin, 'user_update', 'user', user.id, detail=json.dumps({'role': _user_role(user), 'password_changed': bool(new_password)}))
     return jsonify({'ok': True, 'user': _user_to_payload(user)})
 
 ensure_default_admin()
@@ -2515,13 +2539,75 @@ def _force_utf8(resp):
     except Exception:
         return resp
 
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    checks: dict[str, dict[str, object]] = {}
+    overall_status = 'ok'
+
+    # Проверка базы данных
+    try:
+        db.session.execute(text('SELECT 1'))
+        db.session.commit()
+        checks['database'] = {'status': 'ok'}
+    except Exception as exc:
+        db.session.rollback()
+        checks['database'] = {'status': 'error', 'detail': str(exc)}
+        overall_status = 'degraded'
+
+    # Проверка очереди задач
+    queue = get_task_queue()
+    queue_stats = queue.stats()
+    queue_status = 'ok' if queue_stats.get('started') and not queue_stats.get('shutdown') else 'warning'
+    if queue_status != 'ok':
+        overall_status = 'degraded'
+    checks['task_queue'] = {'status': queue_status, 'stats': queue_stats}
+
+    # Проверка фонового шедулера очистки кэша
+    if CACHE_CLEANUP_INTERVAL_HOURS > 0 and not _CLEANUP_THREAD_STARTED:
+        checks['cache_cleanup'] = {'status': 'warning', 'detail': 'cleanup thread not started'}
+        overall_status = 'degraded'
+    else:
+        checks['cache_cleanup'] = {'status': 'ok'}
+
+    return jsonify({'status': overall_status, 'checks': checks})
+
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    lines: list[str] = []
+    queue_stats = get_task_queue().stats()
+    lines.append(f"task_queue_queued {queue_stats.get('queued', 0)}")
+    lines.append(f"task_queue_workers {queue_stats.get('workers', 0)}")
+    lines.append(f"task_queue_started {int(bool(queue_stats.get('started')))}")
+    lines.append(f"task_queue_shutdown {int(bool(queue_stats.get('shutdown')))}")
+
+    try:
+        totals = (
+            db.session.query(TaskRecord.status, func.count(TaskRecord.id))
+            .group_by(TaskRecord.status)
+            .all()
+        )
+        for status, count in totals:
+            metric_name = f"tasks_total_status_{(status or 'unknown').replace('-', '_')}"
+            lines.append(f"{metric_name} {count}")
+        db_status = '1'
+    except Exception:
+        db.session.rollback()
+        db_status = '0'
+    lines.append(f"database_available {db_status}")
+
+    payload = "\n".join(lines) + "\n"
+    return Response(payload, mimetype='text/plain; version=0.0.4; charset=utf-8')
+
+
 # Загрузка файлов через веб-интерфейс
 @app.route("/upload", methods=["GET", "POST"])
 def upload_file():
     user = _load_current_user()
     if not user:
         abort(401)
-    is_admin = getattr(user, 'role', '') == 'admin'
+    is_admin = _user_role(user) == ROLE_ADMIN
     if request.method == "GET":
         allowed = getattr(g, 'allowed_collection_ids', set())
         cols_q = Collection.query.order_by(Collection.name.asc())
@@ -2707,7 +2793,7 @@ def import_files():
     user = _load_current_user()
     if not user:
         abort(401)
-    is_admin = getattr(user, 'role', '') == 'admin'
+    is_admin = _user_role(user) == ROLE_ADMIN
     if request.method == 'GET':
         allowed = getattr(g, 'allowed_collection_ids', set())
         q = Collection.query.order_by(Collection.name.asc())
@@ -2886,11 +2972,15 @@ def import_files():
                 pass
         else:
             paths_for_scan = [str((SCAN_ROOT / p).resolve()) for p in saved_rel_paths]
-            threading.Thread(
-                target=_run_scan_with_progress,
-                args=(extract_text, use_llm, prune, 0, paths_for_scan),
-                daemon=True
-            ).start()
+            get_task_queue().submit(
+                _run_scan_with_progress,
+                extract_text,
+                use_llm,
+                prune,
+                0,
+                paths_for_scan,
+                description="scan-import-batch",
+            )
             scan_started = True
 
     try:
@@ -5439,7 +5529,7 @@ def _cleanup_old_tasks() -> None:
         app.logger.warning(f"[tasks] cleanup failed: {exc}")
 
 
-@app.route('/api/admin/tasks', methods=['GET', 'DELETE'])
+@admin_bp.route('/tasks', methods=['GET', 'DELETE'])
 @require_admin
 def api_admin_tasks():
     if request.method == 'DELETE':
@@ -5537,7 +5627,7 @@ def api_admin_tasks():
     return jsonify({'ok': True, 'tasks': payload})
 
 
-@app.route('/api/admin/tasks/<int:task_id>', methods=['PATCH', 'DELETE'])
+@admin_bp.route('/tasks/<int:task_id>', methods=['PATCH', 'DELETE'])
 @require_admin
 def api_admin_task_detail(task_id: int):
     task = TaskRecord.query.get_or_404(task_id)
@@ -5566,7 +5656,7 @@ def api_admin_task_detail(task_id: int):
     return jsonify({'ok': True, 'task': _task_to_dict(task)})
 
 
-@app.route('/api/admin/system-logs', methods=['GET', 'DELETE'])
+@admin_bp.route('/system-logs', methods=['GET', 'DELETE'])
 @require_admin
 def api_admin_system_logs():
     if request.method == 'DELETE':
@@ -5629,7 +5719,7 @@ def api_admin_system_logs():
     return jsonify({'ok': True, 'file': selected, 'lines': lines, 'available': available_files, 'limit': limit})
 
 
-@app.route('/api/admin/system-logs/rotate', methods=['POST'])
+@admin_bp.route('/system-logs/rotate', methods=['POST'])
 @require_admin
 def api_admin_system_logs_rotate():
     handler = _get_rotating_log_handler()
@@ -5656,7 +5746,7 @@ def api_admin_system_logs_rotate():
     return jsonify({'ok': True, 'files': _list_system_log_files()})
 
 
-@app.route('/api/admin/system-logs/download', methods=['GET'])
+@admin_bp.route('/system-logs/download', methods=['GET'])
 @require_admin
 def api_admin_system_logs_download():
     name = str(request.args.get('name') or LOG_FILE_PATH.name).strip()
@@ -5666,7 +5756,7 @@ def api_admin_system_logs_download():
     return send_file(path, mimetype='text/plain', as_attachment=True, download_name=path.name, conditional=True)
 
 
-@app.route('/api/admin/actions', methods=['GET', 'DELETE'])
+@admin_bp.route('/actions', methods=['GET', 'DELETE'])
 @require_admin
 def api_admin_actions():
     if request.method == 'DELETE':
@@ -5723,7 +5813,7 @@ def api_admin_actions():
     ]})
 
 
-@app.route('/api/admin/llm-endpoints', methods=['GET', 'POST'])
+@admin_bp.route('/llm-endpoints', methods=['GET', 'POST'])
 @require_admin
 def api_admin_llm_endpoints():
     _ensure_llm_schema_once()
@@ -5779,7 +5869,7 @@ def api_admin_llm_endpoints():
     }}), 201
 
 
-@app.route('/api/admin/llm-endpoints/<int:endpoint_id>', methods=['PATCH', 'DELETE'])
+@admin_bp.route('/llm-endpoints/<int:endpoint_id>', methods=['PATCH', 'DELETE'])
 @require_admin
 def api_admin_llm_endpoint_detail(endpoint_id: int):
     _ensure_llm_schema_once()
@@ -6020,7 +6110,7 @@ def diag_transcribe():
         res["warnings"].append(f"unexpected:{e}")
     return jsonify(res), 500
 
-@app.route('/api/admin/ai-search/metrics', methods=['GET', 'DELETE'])
+@admin_bp.route('/ai-search/metrics', methods=['GET', 'DELETE'])
 @require_admin
 def api_admin_ai_metrics():
     if request.method == 'DELETE':
@@ -7597,8 +7687,14 @@ def scan_start():
         SCAN_TASK_ID = None
         SCAN_PROGRESS["task_id"] = None
     _log_user_action(_load_current_user(), 'scan_start', 'scan', SCAN_TASK_ID, detail=json.dumps(payload))
-    t = threading.Thread(target=_run_scan_with_progress, args=(extract_text, use_llm, prune, skip), daemon=True)
-    t.start()
+    get_task_queue().submit(
+        _run_scan_with_progress,
+        extract_text,
+        use_llm,
+        prune,
+        skip,
+        description="scan-full",
+    )
     return jsonify({"status": "started"})
 
 
@@ -7686,8 +7782,15 @@ def scan_collection(collection_id: int):
     except Exception:
         pass
 
-    t = threading.Thread(target=_run_scan_with_progress, args=(extract_text, use_llm, prune, 0, targets), daemon=True)
-    t.start()
+    get_task_queue().submit(
+        _run_scan_with_progress,
+        extract_text,
+        use_llm,
+        prune,
+        0,
+        targets,
+        description=f"scan-collection-{collection.id}",
+    )
     return jsonify({"status": "started", "files": len(targets), "missing": missing})
 
 @app.route("/scan/status")
@@ -8717,7 +8820,14 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                     "max_tokens": 200,
                 }
                 try:
-                    rr = requests.post(url, headers=_llm_choice_headers(choice), json=payload, timeout=60)
+                    rr = http_request(
+                        'POST',
+                        url,
+                        headers=_llm_choice_headers(choice),
+                        json=payload,
+                        timeout=(HTTP_CONNECT_TIMEOUT, max(HTTP_DEFAULT_TIMEOUT, 60)),
+                        logger=app.logger,
+                    )
                     if _llm_response_indicates_busy(rr):
                         app.logger.info(f"LLM rerank endpoint занята ({label}), переключаемся")
                         last_error = RuntimeError('busy')
@@ -8767,6 +8877,453 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         "items": results,
         "progress": progress.lines,
     }
+
+
+def _resolve_problem_score(problem: Dict[str, Any]) -> Optional[float]:
+    score_keys = (
+        'score',
+        'humanScore',
+        'human_score',
+        'remoteScore',
+        'remote_score',
+        'autoScore',
+        'auto_score',
+    )
+    for key in score_keys:
+        if key in problem:
+            value = problem.get(key)
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _split_text_for_dataset(
+    text: str,
+    *,
+    min_chars: int = 120,
+    max_chars: int = 700,
+    max_segments: int = 6,
+) -> List[str]:
+    cleaned = (text or '').strip()
+    if not cleaned:
+        return []
+
+    # Сначала пробуем разбить по пустым строкам
+    candidates = [segment.strip() for segment in re.split(r"\n\s*\n+", cleaned) if segment.strip()]
+
+    segments: List[str] = []
+    for block in candidates:
+        if len(block) <= max_chars:
+            if len(block) >= min_chars:
+                segments.append(block)
+            continue
+
+        sentences = re.split(r"(?<=[.!?])\s+", block)
+        buffer: List[str] = []
+        current = ''
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            tentative = f"{current} {sentence}".strip() if current else sentence
+            if len(tentative) > max_chars:
+                if current:
+                    segments.append(current.strip())
+                if len(sentence) >= min_chars:
+                    segments.append(sentence[:max_chars].strip())
+                current = ''
+            else:
+                current = tentative
+        if current and len(current) >= min_chars:
+            segments.append(current.strip())
+
+    if not segments:
+        if len(cleaned) >= min_chars:
+            segments = [cleaned[:max_chars]]
+
+    return segments[:max_segments]
+
+
+def _extract_pairs_from_response(raw: str) -> List[Dict[str, str]]:
+    if not raw:
+        return []
+    start = raw.find('{')
+    end = raw.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return []
+    snippet = raw[start:end + 1]
+    try:
+        payload = json.loads(snippet)
+    except json.JSONDecodeError:
+        try:
+            snippet = re.sub(r".*?(\{.*\})", r"\1", raw, flags=re.S)
+            payload = json.loads(snippet)
+        except Exception:
+            return []
+    items = payload.get('pairs')
+    if not isinstance(items, list):
+        return []
+    pairs: List[Dict[str, str]] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        question = str(entry.get('question') or '').strip()
+        answer = str(entry.get('answer') or '').strip()
+        if question and answer:
+            pairs.append({'question': question, 'answer': answer})
+    return pairs
+
+
+def _generate_pairs_from_snippet(
+    snippet: str,
+    *,
+    desired_pairs: int,
+    temperature: float,
+    max_tokens: int,
+    problem_question: Optional[str],
+) -> List[Dict[str, str]]:
+    paragraph = (snippet or '').strip()
+    if not paragraph:
+        return []
+
+    system_prompt = (
+        'Ты — помощник по подготовке данных для обучения. Отвечай на русском языке, '
+        'формируй содержательные вопросы и ответы и соблюдай формат JSON без дополнительных комментариев.'
+    )
+    intro = (
+        "Тебе дан абзац текста. Сформируй {count} пар \"вопрос-ответ\" для тонкой настройки модели. "
+        "В каждом вопросе делай акцент на фактах, причинно-следственных связях, числах или важных утверждениях из абзаца. "
+        "Не упоминай, что вопрос взят из текста. Ответ должен быть вытекающим только из абзаца.\n\n"
+    )
+    if problem_question:
+        intro += f"Проблемный пользовательский вопрос: {problem_question.strip()}\n"
+
+    user_prompt = (
+        f"{intro}Абзац:\n\"\"\"\n{paragraph}\n\"\"\"\n\n"
+        "Формат ответа:\n"
+        "{\n  \"pairs\": [\n    { \"question\": \"...\", \"answer\": \"...\" }\n  ]\n}\n"
+        f"Количество элементов в массиве должно быть ровно {desired_pairs}. Не добавляй других полей."
+    )
+
+    try:
+        raw = call_lmstudio_compose(
+            system_prompt,
+            user_prompt,
+            temperature=max(0.0, float(temperature)),
+            max_tokens=max(128, int(max_tokens)),
+        )
+    except Exception as exc:
+        app.logger.warning(f"QA generation failed: {exc}")
+        return []
+
+    pairs = _extract_pairs_from_response(raw)
+    return pairs
+
+
+def _launch_fine_tune_job(
+    dataset: Sequence[Dict[str, str]],
+    fine_tune_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    server_url = (fine_tune_config.get('server_url') or '').strip()
+    base_model_path = (fine_tune_config.get('base_model_path') or '').strip()
+    config_payload = fine_tune_config.get('config') or {}
+    if not server_url or not base_model_path or not isinstance(config_payload, dict):
+        raise ValueError('server_url, base_model_path и config обязательны для запуска дообучения')
+
+    payload: Dict[str, Any] = {
+        'base_model_path': base_model_path,
+        'dataset': [
+            {
+                'input': item['input'],
+                'output': item['output'],
+                'source': item.get('source'),
+            }
+            for item in dataset
+        ],
+        'config': config_payload,
+    }
+
+    if fine_tune_config.get('output_dir'):
+        payload['output_dir'] = fine_tune_config['output_dir']
+
+    endpoint = server_url.rstrip('/') + '/v1/fine-tunes'
+    headers = fine_tune_config.get('headers')
+    timeout = float(fine_tune_config.get('timeout', 900))
+    response = http_request(
+        'POST',
+        endpoint,
+        json=payload,
+        headers=headers,
+        timeout=(HTTP_CONNECT_TIMEOUT, max(timeout, HTTP_DEFAULT_TIMEOUT)),
+        logger=app.logger,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Fine-tune request failed: {response.status_code} {response.text[:200]}")
+    return response.json()
+
+
+def _build_dataset_from_problems(
+    payload: Dict[str, Any],
+    logs: List[str],
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    evaluation = payload.get('evaluation') or {}
+    items = evaluation.get('items') or []
+    if not isinstance(items, list) or not items:
+        raise ValueError('evaluation.items должен быть непустым списком')
+
+    generation_opts = payload.get('generation') or {}
+    search_opts = payload.get('search') or {}
+
+    score_threshold = payload.get('score_threshold', evaluation.get('quality_gate'))
+    try:
+        threshold_value = float(score_threshold) if score_threshold is not None else None
+    except (TypeError, ValueError):
+        threshold_value = None
+
+    max_questions = int(generation_opts.get('max_questions') or payload.get('max_questions') or len(items))
+    target_pairs = int(payload.get('target_pairs') or generation_opts.get('target_pairs') or generation_opts.get('total_pairs') or 20)
+    pairs_per_snippet = max(1, int(generation_opts.get('pairs_per_snippet') or 1))
+    include_reference_pair = bool(generation_opts.get('include_reference_pair', True))
+    min_paragraph_chars = max(30, int(generation_opts.get('min_paragraph_chars', 120)))
+    max_paragraph_chars = max(min_paragraph_chars, int(generation_opts.get('max_paragraph_chars', 700)))
+    llm_temperature = float(generation_opts.get('temperature', 0.2))
+    llm_max_tokens = int(generation_opts.get('max_tokens', 512))
+
+    scored_items: List[Tuple[Optional[float], int, Dict[str, Any]]] = []
+    for idx, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            continue
+        score = _resolve_problem_score(raw)
+        if threshold_value is None or (score is None) or (score <= threshold_value):
+            scored_items.append((score, idx, raw))
+
+    if not scored_items:
+        raise ValueError('Не найдено вопросов, требующих внимания — уточните порог или список')
+
+    scored_items.sort(key=lambda entry: (entry[0] if entry[0] is not None else -1.0, entry[1]))
+    selected_items = scored_items[:max(1, max_questions)]
+
+    dataset: List[Dict[str, str]] = []
+    dataset_dedup: set[Tuple[str, str]] = set()
+    processed = 0
+
+    for rank, (score, _, problem) in enumerate(selected_items, start=1):
+        question = str(problem.get('question') or '').strip()
+        reference = str(problem.get('referenceAnswer') or problem.get('reference') or '').strip()
+        logs.append(f"[problem {rank}] score={score!r} question='{question[:80]}'")
+
+        if include_reference_pair and question and reference:
+            key = (question, reference)
+            if key not in dataset_dedup:
+                dataset.append({'input': question, 'output': reference, 'source': 'evaluation'})
+                dataset_dedup.add(key)
+                logs.append(f"  добавлена пара из эталонного ответа")
+                if len(dataset) >= target_pairs:
+                    break
+
+        search_parts = [question]
+        if reference:
+            search_parts.append(reference)
+        search_query = ' '.join(part for part in search_parts if part).strip()
+        if not search_query:
+            logs.append('  пропущено: пустой поисковый запрос')
+            continue
+
+        search_payload: Dict[str, Any] = {
+            'query': search_query,
+            'top_k': search_opts.get('top_k', 5),
+            'deep_search': bool(search_opts.get('deep_search', True)),
+            'llm_snippets': False,
+            'max_candidates': search_opts.get('max_candidates', 20),
+            'max_snippets': search_opts.get('max_snippets', 3),
+            'chunk_chars': search_opts.get('chunk_chars', 5000),
+            'max_chunks': search_opts.get('max_chunks', 25),
+        }
+        if 'sources' in search_opts:
+            search_payload['sources'] = search_opts['sources']
+        if 'collection_ids' in search_opts:
+            search_payload['collection_ids'] = search_opts['collection_ids']
+        if 'material_types' in search_opts:
+            search_payload['material_types'] = search_opts['material_types']
+
+        progress_lines: List[str] = []
+        result = _ai_search_core(search_payload, progress_lines.append)
+        for line in progress_lines:
+            logs.append(f"  [search] {line}")
+
+        items_found = result.get('items') or []
+        logs.append(f"  найдено кандидатов: {len(items_found)}")
+
+        for cand_index, candidate in enumerate(items_found, start=1):
+            file_id = candidate.get('file_id')
+            if not file_id:
+                continue
+            file_obj = File.query.get(int(file_id))
+            if not file_obj:
+                continue
+
+            snippets: List[str] = []
+            for snippet in candidate.get('snippets') or []:
+                snippet = (snippet or '').strip()
+                if len(snippet) >= min_paragraph_chars:
+                    snippets.append(snippet)
+
+            if not snippets:
+                text_excerpt = _read_cached_excerpt_for_file(file_obj)
+                snippets = [
+                    chunk
+                    for chunk in _split_text_for_dataset(
+                        text_excerpt,
+                        min_chars=min_paragraph_chars,
+                        max_chars=max_paragraph_chars,
+                        max_segments=search_opts.get('max_segments', 4),
+                    )
+                ]
+
+            if not snippets:
+                continue
+
+            for sn_index, snippet in enumerate(snippets, start=1):
+                if len(dataset) >= target_pairs:
+                    break
+                pairs = _generate_pairs_from_snippet(
+                    snippet,
+                    desired_pairs=pairs_per_snippet,
+                    temperature=llm_temperature,
+                    max_tokens=llm_max_tokens,
+                    problem_question=question,
+                )
+                if not pairs:
+                    continue
+                for pair in pairs:
+                    q_text = pair['question'].strip()
+                    a_text = pair['answer'].strip()
+                    if not q_text or not a_text:
+                        continue
+                    key = (q_text, a_text)
+                    if key in dataset_dedup:
+                        continue
+                    dataset.append({
+                        'input': q_text,
+                        'output': a_text,
+                        'source': f"agregator:{file_obj.rel_path or file_obj.filename}#s{sn_index}"
+                    })
+                    dataset_dedup.add(key)
+                    logs.append(
+                        f"  добавлена пара из файла '{file_obj.rel_path or file_obj.filename}' (сниппет {sn_index})"
+                    )
+                    if len(dataset) >= target_pairs:
+                        break
+            if len(dataset) >= target_pairs:
+                break
+
+        processed += 1
+        if len(dataset) >= target_pairs:
+            break
+
+    meta = {
+        'selected_problems': len(selected_items),
+        'processed_problems': processed,
+        'target_pairs': target_pairs,
+    }
+    return dataset, meta
+
+
+def _add_pipeline_cors_headers(response: Response) -> Response:
+    origin = request.headers.get('Origin')
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        vary = response.headers.get('Vary')
+        response.headers['Vary'] = f"{vary}, Origin" if vary else 'Origin'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    else:
+        response.headers.setdefault('Access-Control-Allow-Origin', '*')
+    response.headers.setdefault('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    response.headers.setdefault('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    return response
+
+
+def _pipeline_cors_preflight() -> Response:
+    response = make_response('', 204)
+    return _add_pipeline_cors_headers(response)
+
+
+@app.route('/api/training/problem-pipeline', methods=['POST', 'OPTIONS'])
+def api_training_problem_pipeline():
+    if request.method == 'OPTIONS':
+        return _pipeline_cors_preflight()
+    allowed, failure_response = _check_pipeline_access()
+    if not allowed:
+        return _add_pipeline_cors_headers(failure_response)
+    payload = request.get_json(silent=True) or {}
+    logs: List[str] = []
+
+    try:
+        dataset, meta = _build_dataset_from_problems(payload, logs)
+    except ValueError as exc:
+        logs.append(f"Ошибка: {exc}")
+        resp = jsonify({'ok': False, 'error': str(exc), 'logs': logs})
+        resp.status_code = 400
+        return _add_pipeline_cors_headers(resp)
+    except Exception as exc:
+        app.logger.exception('problem pipeline failed')
+        logs.append(f'Неожиданная ошибка: {exc}')
+        resp = jsonify({'ok': False, 'error': 'Не удалось построить датасет', 'logs': logs})
+        resp.status_code = 500
+        return _add_pipeline_cors_headers(resp)
+
+    if not dataset:
+        logs.append('Датасет пуст — нечего отправлять на дообучение')
+        resp = jsonify({'ok': False, 'error': 'Датасет пуст', 'logs': logs, 'meta': meta})
+        resp.status_code = 400
+        return _add_pipeline_cors_headers(resp)
+
+    dry_run = bool(payload.get('dry_run'))
+    include_dataset = bool(payload.get('include_dataset'))
+    job_info: Optional[Dict[str, Any]] = None
+
+    if not dry_run and payload.get('fine_tune'):
+        try:
+            job_info = _launch_fine_tune_job(dataset, payload['fine_tune'])
+            logs.append(f"Запущено дообучение: задача {job_info.get('id')}")
+        except Exception as exc:
+            app.logger.exception('fine-tune launch failed')
+            logs.append(f"Ошибка запуска дообучения: {exc}")
+            resp = jsonify({
+                'ok': False,
+                'error': str(exc),
+                'logs': logs,
+                'meta': meta,
+                'dataset_size': len(dataset),
+            })
+            resp.status_code = 502
+            return _add_pipeline_cors_headers(resp)
+
+    preview = [
+        {
+            'input': item['input'][:160],
+            'output': item['output'][:160],
+            'source': item.get('source'),
+        }
+        for item in dataset[:3]
+    ]
+
+    response: Dict[str, Any] = {
+        'ok': True,
+        'dataset_size': len(dataset),
+        'meta': meta,
+        'logs': logs,
+        'preview': preview,
+    }
+    if job_info is not None:
+        response['fine_tune_job'] = job_info
+    if include_dataset:
+        response['dataset'] = dataset
+    elif dry_run:
+        response['dataset_preview_full'] = dataset[: min(len(dataset), 10)]
+    return _add_pipeline_cors_headers(jsonify(response))
 
 
 @app.route('/api/ai-search', methods=['POST'])
@@ -8862,6 +9419,7 @@ def _ensure_background_jobs_started():
 
 
 if __name__ == "__main__":
+    setup_app()
     with app.app_context():
         db.create_all()
         ensure_collections_schema()

@@ -1,26 +1,24 @@
-version: "3.8"
 services:
   agregator:
     build:
       context: .
       target: app
     image: agregator:local
+    platform: linux/amd64
     container_name: agregator
+    env_file:
+      - ./docker/app.env
     ports:
       - "5050:5050"
-    environment:
-      - SCAN_ROOT=/data
-      - OCR_LANGS=rus+eng
-      - PDF_OCR_PAGES=5
-      - OCR_DISS_FIRST_PAGE=1
     volumes:
       - ./library:/data
       - ./backups:/app/backups
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:5050/app > /dev/null || exit 1"]
+      test: ["CMD", "healthcheck.sh"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
 volumes: {}
