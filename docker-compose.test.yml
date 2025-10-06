@@ -1,0 +1,19 @@
+services:
+  agregator-test:
+    extends:
+      file: docker-compose.yml
+      service: agregator
+    container_name: agregator-test
+    env_file:
+      - ./docker/app.env
+      - ./docker/app.test.env
+    command: pytest -q
+    ports: []
+    volumes:
+      - ./agregator:/app/agregator
+      - ./app.py:/app/app.py
+      - ./models.py:/app/models.py
+      - ./routes.py:/app/routes.py
+      - ./tests:/app/tests
+    restart: "no"
+    healthcheck: null

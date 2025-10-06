@@ -80,6 +80,16 @@ class AppConfig:
     http_connect_timeout: float
     http_retries: int
     http_backoff_factor: float
+    llm_cache_enabled: bool
+    llm_cache_ttl_seconds: int
+    llm_cache_max_items: int
+    llm_cache_read_only: bool
+    search_cache_enabled: bool
+    search_cache_ttl_seconds: int
+    search_cache_max_items: int
+    lm_max_input_chars: int
+    lm_max_output_tokens: int
+    azure_openai_api_version: str
     log_level: str
     sentry_dsn: str
     sentry_environment: str
@@ -206,6 +216,16 @@ class AppConfig:
             http_connect_timeout=float(os.getenv("AG_HTTP_CONNECT_TIMEOUT", "10") or 10),
             http_retries=int(os.getenv("AG_HTTP_RETRIES", "3") or 3),
             http_backoff_factor=float(os.getenv("AG_HTTP_BACKOFF", "0.5") or 0.5),
+            llm_cache_enabled=_getenv_bool("LLM_CACHE_ENABLED", True),
+            llm_cache_ttl_seconds=int(os.getenv("LLM_CACHE_TTL_SECONDS", "600") or 600),
+            llm_cache_max_items=int(os.getenv("LLM_CACHE_MAX_ITEMS", "256") or 256),
+            llm_cache_read_only=_getenv_bool("LLM_CACHE_ONLY_MODE", False),
+            search_cache_enabled=_getenv_bool("SEARCH_CACHE_ENABLED", True),
+            search_cache_ttl_seconds=int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "90") or 90),
+            search_cache_max_items=int(os.getenv("SEARCH_CACHE_MAX_ITEMS", "64") or 64),
+            lm_max_input_chars=max(500, int(os.getenv("LM_MAX_INPUT_CHARS", "4000") or 4000)),
+            lm_max_output_tokens=max(16, int(os.getenv("LM_MAX_OUTPUT_TOKENS", "256") or 256)),
+            azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             sentry_dsn=os.getenv("SENTRY_DSN", ""),
             sentry_environment=os.getenv("SENTRY_ENVIRONMENT", "local"),
@@ -234,6 +254,13 @@ class AppConfig:
             "HTTP_CONNECT_TIMEOUT": self.http_connect_timeout,
             "HTTP_RETRIES": self.http_retries,
             "HTTP_BACKOFF_FACTOR": self.http_backoff_factor,
+            "LLM_CACHE_ENABLED": self.llm_cache_enabled,
+            "LLM_CACHE_TTL_SECONDS": self.llm_cache_ttl_seconds,
+            "LLM_CACHE_MAX_ITEMS": self.llm_cache_max_items,
+            "LLM_CACHE_ONLY_MODE": self.llm_cache_read_only,
+            "SEARCH_CACHE_ENABLED": self.search_cache_enabled,
+            "SEARCH_CACHE_TTL_SECONDS": self.search_cache_ttl_seconds,
+            "SEARCH_CACHE_MAX_ITEMS": self.search_cache_max_items,
             "LOG_LEVEL": self.log_level,
             "SENTRY_DSN": self.sentry_dsn,
             "SENTRY_ENVIRONMENT": self.sentry_environment,

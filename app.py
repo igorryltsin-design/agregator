@@ -13,7 +13,7 @@ from pathlib import Path
 import itertools
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app
+from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app, has_app_context
 from functools import wraps
 from werkzeug.utils import secure_filename
 import sqlite3
@@ -73,12 +73,23 @@ def _configure_sqlite_pragmas(dbapi_connection, connection_record):
 import fitz  # библиотека PyMuPDF
 import requests
 from agregator.config import AppConfig, load_app_config
+from agregator.runtime_settings import runtime_settings_store
 from agregator.services import (
     HttpSettings,
     configure_http,
+    configure_llm_cache,
+    configure_search_cache,
     configure_logging,
     get_rotating_log_handler as svc_get_rotating_log_handler,
     get_task_queue,
+    llm_cache_get,
+    llm_cache_set,
+    CachedLLMResponse,
+    FacetQueryParams,
+    FacetService,
+    SearchService,
+    search_cache_get,
+    search_cache_set,
     http_request,
     list_system_log_files as svc_list_system_log_files,
     resolve_log_name as svc_resolve_log_name,
@@ -136,6 +147,195 @@ except Exception:
     _morph = None
 
 logger = logging.getLogger(__name__)
+
+
+def _rt():
+    """Быстрый доступ к текущим runtime-настройкам."""
+    return runtime_settings_store.current
+
+
+def _lm_max_input_chars() -> int:
+    """Return current input character limit for LLM calls."""
+    try:
+        value = int(getattr(_rt(), 'lm_max_input_chars', 4000) or 4000)
+    except Exception:
+        value = 4000
+    return max(1, value)
+
+
+def _lm_max_output_tokens() -> int:
+    """Return current output token limit for LLM calls."""
+    try:
+        value = int(getattr(_rt(), 'lm_max_output_tokens', 256) or 256)
+    except Exception:
+        value = 256
+    return max(1, value)
+
+
+def _always_ocr_first_page_dissertation() -> bool:
+    """Return flag for forcing OCR on the first page of dissertations."""
+    try:
+        return bool(getattr(_rt(), 'always_ocr_first_page_dissertation', False))
+    except Exception:
+        return False
+
+
+def _refresh_runtime_globals() -> None:
+    """Expose frequently used runtime flags as module globals for legacy code."""
+    runtime = runtime_settings_store.current
+    for key, attr in _RUNTIME_ATTR_MAP.items():
+        try:
+            value = getattr(runtime, attr)
+        except Exception:
+            value = None
+        if key in {'LM_MAX_INPUT_CHARS', 'LM_MAX_OUTPUT_TOKENS'}:
+            try:
+                value = int(value)
+            except Exception:
+                value = 0
+            if value <= 0:
+                value = 4000 if key == 'LM_MAX_INPUT_CHARS' else 256
+        if key in {
+            'TRANSCRIBE_ENABLED',
+            'SUMMARIZE_AUDIO',
+            'AUDIO_KEYWORDS_LLM',
+            'IMAGES_VISION_ENABLED',
+            'KEYWORDS_TO_TAGS_ENABLED',
+            'TYPE_LLM_OVERRIDE',
+            'MOVE_ON_RENAME',
+            'COLLECTIONS_IN_SEPARATE_DIRS',
+            'COLLECTION_TYPE_SUBDIRS',
+            'DEFAULT_USE_LLM',
+            'DEFAULT_PRUNE',
+            'AI_RERANK_LLM',
+            'LLM_CACHE_ENABLED',
+            'LLM_CACHE_ONLY_MODE',
+            'SEARCH_CACHE_ENABLED',
+            'ALWAYS_OCR_FIRST_PAGE_DISSERTATION',
+            'SEARCH_FACET_INCLUDE_TYPES',
+        }:
+            value = bool(value)
+        if key == 'PROMPTS':
+            value = dict(value or {})
+        globals()[key] = value
+
+
+_RUNTIME_ATTR_MAP = {
+    'SCAN_ROOT': 'scan_root',
+    'EXTRACT_TEXT': 'extract_text',
+    'LMSTUDIO_API_BASE': 'lmstudio_api_base',
+    'LMSTUDIO_MODEL': 'lmstudio_model',
+    'LMSTUDIO_API_KEY': 'lmstudio_api_key',
+    'LM_DEFAULT_PROVIDER': 'lm_default_provider',
+    'TRANSCRIBE_ENABLED': 'transcribe_enabled',
+    'TRANSCRIBE_BACKEND': 'transcribe_backend',
+    'TRANSCRIBE_MODEL_PATH': 'transcribe_model_path',
+    'TRANSCRIBE_LANGUAGE': 'transcribe_language',
+    'SUMMARIZE_AUDIO': 'summarize_audio',
+    'AUDIO_KEYWORDS_LLM': 'audio_keywords_llm',
+    'IMAGES_VISION_ENABLED': 'images_vision_enabled',
+    'KEYWORDS_TO_TAGS_ENABLED': 'keywords_to_tags_enabled',
+    'TYPE_DETECT_FLOW': 'type_detect_flow',
+    'TYPE_LLM_OVERRIDE': 'type_llm_override',
+    'IMPORT_SUBDIR': 'import_subdir',
+    'MOVE_ON_RENAME': 'move_on_rename',
+    'COLLECTIONS_IN_SEPARATE_DIRS': 'collections_in_separate_dirs',
+    'COLLECTION_TYPE_SUBDIRS': 'collection_type_subdirs',
+    'TYPE_DIRS': 'type_dirs',
+    'DEFAULT_USE_LLM': 'default_use_llm',
+    'DEFAULT_PRUNE': 'default_prune',
+    'OCR_LANGS_CFG': 'ocr_langs_cfg',
+    'PDF_OCR_PAGES_CFG': 'pdf_ocr_pages_cfg',
+    'ALWAYS_OCR_FIRST_PAGE_DISSERTATION': 'always_ocr_first_page_dissertation',
+    'PROMPTS': 'prompts',
+    'AI_RERANK_LLM': 'ai_rerank_llm',
+    'LLM_CACHE_ENABLED': 'llm_cache_enabled',
+    'LLM_CACHE_TTL_SECONDS': 'llm_cache_ttl_seconds',
+    'LLM_CACHE_MAX_ITEMS': 'llm_cache_max_items',
+    'LLM_CACHE_ONLY_MODE': 'llm_cache_only_mode',
+    'SEARCH_CACHE_ENABLED': 'search_cache_enabled',
+    'SEARCH_CACHE_TTL_SECONDS': 'search_cache_ttl_seconds',
+    'SEARCH_CACHE_MAX_ITEMS': 'search_cache_max_items',
+    'LM_MAX_INPUT_CHARS': 'lm_max_input_chars',
+    'LM_MAX_OUTPUT_TOKENS': 'lm_max_output_tokens',
+    'AZURE_OPENAI_API_VERSION': 'azure_openai_api_version',
+    'SEARCH_FACET_TAG_KEYS': 'search_facet_tag_keys',
+    'GRAPH_FACET_TAG_KEYS': 'graph_facet_tag_keys',
+    'SEARCH_FACET_INCLUDE_TYPES': 'search_facet_include_types',
+}
+
+LM_MAX_INPUT_CHARS = 4000
+LM_MAX_OUTPUT_TOKENS = 256
+ALWAYS_OCR_FIRST_PAGE_DISSERTATION = False
+PROMPTS = {}
+
+for _GLOBAL_NAME in _RUNTIME_ATTR_MAP:
+    globals().setdefault(_GLOBAL_NAME, None)
+
+
+def _scan_root_path() -> Path:
+    return _rt().scan_root
+
+
+def _import_subdir_value() -> str:
+    return (_rt().import_subdir or '').strip()
+
+
+def _collections_in_separate_dirs() -> bool:
+    return bool(_rt().collections_in_separate_dirs)
+
+
+_RUNTIME_ATTR_MAP = {
+    'SCAN_ROOT': 'scan_root',
+    'EXTRACT_TEXT': 'extract_text',
+    'LMSTUDIO_API_BASE': 'lmstudio_api_base',
+    'LMSTUDIO_MODEL': 'lmstudio_model',
+    'LMSTUDIO_API_KEY': 'lmstudio_api_key',
+    'LM_DEFAULT_PROVIDER': 'lm_default_provider',
+    'TRANSCRIBE_ENABLED': 'transcribe_enabled',
+    'TRANSCRIBE_BACKEND': 'transcribe_backend',
+    'TRANSCRIBE_MODEL_PATH': 'transcribe_model_path',
+    'TRANSCRIBE_LANGUAGE': 'transcribe_language',
+    'SUMMARIZE_AUDIO': 'summarize_audio',
+    'AUDIO_KEYWORDS_LLM': 'audio_keywords_llm',
+    'IMAGES_VISION_ENABLED': 'images_vision_enabled',
+    'KEYWORDS_TO_TAGS_ENABLED': 'keywords_to_tags_enabled',
+    'TYPE_DETECT_FLOW': 'type_detect_flow',
+    'TYPE_LLM_OVERRIDE': 'type_llm_override',
+    'IMPORT_SUBDIR': 'import_subdir',
+    'MOVE_ON_RENAME': 'move_on_rename',
+    'COLLECTIONS_IN_SEPARATE_DIRS': 'collections_in_separate_dirs',
+    'COLLECTION_TYPE_SUBDIRS': 'collection_type_subdirs',
+    'TYPE_DIRS': 'type_dirs',
+    'DEFAULT_USE_LLM': 'default_use_llm',
+    'DEFAULT_PRUNE': 'default_prune',
+    'OCR_LANGS_CFG': 'ocr_langs_cfg',
+    'PDF_OCR_PAGES_CFG': 'pdf_ocr_pages_cfg',
+    'ALWAYS_OCR_FIRST_PAGE_DISSERTATION': 'always_ocr_first_page_dissertation',
+    'PROMPTS': 'prompts',
+    'AI_RERANK_LLM': 'ai_rerank_llm',
+    'LLM_CACHE_ENABLED': 'llm_cache_enabled',
+    'LLM_CACHE_TTL_SECONDS': 'llm_cache_ttl_seconds',
+    'LLM_CACHE_MAX_ITEMS': 'llm_cache_max_items',
+    'LLM_CACHE_ONLY_MODE': 'llm_cache_only_mode',
+    'SEARCH_CACHE_ENABLED': 'search_cache_enabled',
+    'SEARCH_CACHE_TTL_SECONDS': 'search_cache_ttl_seconds',
+    'SEARCH_CACHE_MAX_ITEMS': 'search_cache_max_items',
+    'LM_MAX_INPUT_CHARS': 'lm_max_input_chars',
+    'LM_MAX_OUTPUT_TOKENS': 'lm_max_output_tokens',
+    'AZURE_OPENAI_API_VERSION': 'azure_openai_api_version',
+    'SEARCH_FACET_TAG_KEYS': 'search_facet_tag_keys',
+    'GRAPH_FACET_TAG_KEYS': 'graph_facet_tag_keys',
+    'SEARCH_FACET_INCLUDE_TYPES': 'search_facet_include_types',
+}
+
+
+def __getattr__(name: str):
+    attr = _RUNTIME_ATTR_MAP.get(name)
+    if attr is not None:
+        return getattr(runtime_settings_store.current, attr)
+    raise AttributeError(f"module 'app' has no attribute {name!r}")
+
 
 ROLE_ADMIN = 'admin'
 ROLE_EDITOR = 'editor'
@@ -244,15 +444,115 @@ class TimedCache:
 
 
 FACET_CACHE = TimedCache(max_items=256, ttl=60)
+facet_service = FacetService(FACET_CACHE)
+search_service = SearchService(
+    db=db,
+    file_model=File,
+    tag_model=Tag,
+    cache_get=search_cache_get,
+    cache_set=search_cache_set,
+    logger=logging.getLogger('agregator.search'),
+)
+
+_FACET_CACHE_REBUILD_LOCK = threading.Lock()
+_FACET_CACHE_REBUILD_PENDING = False
 
 
 def _invalidate_facets_cache(reason: str | None = None) -> None:
     try:
-        FACET_CACHE.clear()
-        if reason:
-            logger.debug('Facet cache invalidated: %s', reason)
+        facet_service.invalidate(reason)
     except Exception:
         pass
+    try:
+        search_service.invalidate_cache(reason or 'facets')
+    except Exception:
+        pass
+    try:
+        _schedule_facet_cache_rebuild(reason)
+    except Exception:
+        pass
+
+
+def _facet_default_contexts() -> list[FacetQueryParams]:
+    cfg = current_app.config
+
+    def _normalize_keys(value):
+        if isinstance(value, (list, tuple)):
+            return [str(v) for v in value]
+        return None
+
+    search_keys = _normalize_keys(cfg.get('SEARCH_FACET_TAG_KEYS'))
+    graph_keys = _normalize_keys(cfg.get('GRAPH_FACET_TAG_KEYS'))
+    include_types = bool(cfg.get('SEARCH_FACET_INCLUDE_TYPES', True))
+    return [
+        FacetQueryParams(
+            query='',
+            material_type='',
+            context='search',
+            include_types=include_types,
+            tag_filters=[],
+            collection_filter=None,
+            allowed_scope=None,
+            allowed_keys_list=search_keys,
+            year_from='',
+            year_to='',
+            size_min='',
+            size_max='',
+            sources={'tags': True},
+            request_args=(),
+        ),
+        FacetQueryParams(
+            query='',
+            material_type='',
+            context='graph',
+            include_types=False,
+            tag_filters=[],
+            collection_filter=None,
+            allowed_scope=None,
+            allowed_keys_list=graph_keys,
+            year_from='',
+            year_to='',
+            size_min='',
+            size_max='',
+            sources={'tags': True},
+            request_args=(('context', ('graph',)),),
+        ),
+    ]
+
+
+def _schedule_facet_cache_rebuild(reason: str | None = None) -> None:
+    if not has_app_context():
+        return
+    global _FACET_CACHE_REBUILD_PENDING
+    with _FACET_CACHE_REBUILD_LOCK:
+        if _FACET_CACHE_REBUILD_PENDING:
+            return
+        _FACET_CACHE_REBUILD_PENDING = True
+
+    @copy_current_app_context
+    def _run_rebuild():
+        global _FACET_CACHE_REBUILD_PENDING
+        try:
+            contexts = _facet_default_contexts()
+            for params in contexts:
+                facet_service.get_facets(
+                    params,
+                    search_candidate_fn=_search_candidate_ids,
+                    like_filter_fn=_apply_like_filter,
+                )
+            app.logger.debug('Facet cache prewarmed%s', f" ({reason})" if reason else '')
+        except Exception as exc:
+            app.logger.warning('Facet cache prewarm failed: %s', exc)
+        finally:
+            with _FACET_CACHE_REBUILD_LOCK:
+                _FACET_CACHE_REBUILD_PENDING = False
+
+    try:
+        get_task_queue().submit(_run_rebuild, description='facet_cache_prewarm')
+    except Exception as exc:
+        app.logger.debug('Facet cache prewarm scheduling failed: %s', exc)
+        with _FACET_CACHE_REBUILD_LOCK:
+            _FACET_CACHE_REBUILD_PENDING = False
 
 
 def _current_allowed_collections() -> set[int] | None:
@@ -266,299 +566,35 @@ def _current_allowed_collections() -> set[int] | None:
 
 
 def _ensure_search_support() -> None:
-    """Create indexes, FTS tables and triggers to accelerate search."""
-    try:
-        with db.engine.begin() as conn:
-            statements = [
-                "CREATE INDEX IF NOT EXISTS idx_files_title_nocase ON files(title COLLATE NOCASE)",
-                "CREATE INDEX IF NOT EXISTS idx_files_author_nocase ON files(author COLLATE NOCASE)",
-                "CREATE INDEX IF NOT EXISTS idx_files_keywords_nocase ON files(keywords COLLATE NOCASE)",
-                "CREATE INDEX IF NOT EXISTS idx_files_filename_nocase ON files(filename COLLATE NOCASE)",
-                "CREATE INDEX IF NOT EXISTS idx_tags_key_nocase ON tags(key COLLATE NOCASE)",
-                "CREATE INDEX IF NOT EXISTS idx_tags_value_nocase ON tags(value COLLATE NOCASE)",
-            ]
-            for stmt in statements:
-                try:
-                    conn.execute(text(stmt))
-                except Exception as exc:
-                    logger.debug('Index creation failed (%s): %s', stmt, exc)
-
-            # FTS tables for files and tags
-            conn.execute(text(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-                    file_id UNINDEXED,
-                    title,
-                    author,
-                    keywords,
-                    abstract,
-                    text_excerpt,
-                    tokenize='unicode61'
-                )
-                """
-            ))
-            conn.execute(text(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS tags_fts USING fts5(
-                    tag_id UNINDEXED,
-                    file_id UNINDEXED,
-                    key,
-                    value,
-                    tokenize='unicode61'
-                )
-                """
-            ))
-
-            # Triggers for files -> files_fts
-            conn.execute(text(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_files_ai AFTER INSERT ON files BEGIN
-                    INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
-                    VALUES (new.id, new.id,
-                        coalesce(new.title,''),
-                        coalesce(new.author,''),
-                        coalesce(new.keywords,''),
-                        coalesce(new.abstract,''),
-                        coalesce(new.text_excerpt,''));
-                END;
-                """
-            ))
-            conn.execute(text(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_files_au AFTER UPDATE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid) VALUES('delete', old.id);
-                    INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
-                    VALUES (new.id, new.id,
-                        coalesce(new.title,''),
-                        coalesce(new.author,''),
-                        coalesce(new.keywords,''),
-                        coalesce(new.abstract,''),
-                        coalesce(new.text_excerpt,''));
-                END;
-                """
-            ))
-            conn.execute(text(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_files_ad AFTER DELETE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid) VALUES('delete', old.id);
-                END;
-                """
-            ))
-
-            # Triggers for tags -> tags_fts
-            conn.execute(text(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_tags_ai AFTER INSERT ON tags BEGIN
-                    INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
-                    VALUES (new.id, new.id, new.file_id, coalesce(new.key,''), coalesce(new.value,''));
-                END;
-                """
-            ))
-            conn.execute(text(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_tags_au AFTER UPDATE ON tags BEGIN
-                    INSERT INTO tags_fts(tags_fts, rowid) VALUES('delete', old.id);
-                    INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
-                    VALUES (new.id, new.id, new.file_id, coalesce(new.key,''), coalesce(new.value,''));
-                END;
-                """
-            ))
-            conn.execute(text(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_tags_ad AFTER DELETE ON tags BEGIN
-                    INSERT INTO tags_fts(tags_fts, rowid) VALUES('delete', old.id);
-                END;
-                """
-            ))
-
-            # Удаляем старые триггеры (удержание FTS переносим в код)
-            try:
-                conn.execute(text("DROP TRIGGER IF EXISTS trg_files_ai"))
-                conn.execute(text("DROP TRIGGER IF EXISTS trg_files_au"))
-                conn.execute(text("DROP TRIGGER IF EXISTS trg_files_ad"))
-                conn.execute(text("DROP TRIGGER IF EXISTS trg_tags_ai"))
-                conn.execute(text("DROP TRIGGER IF EXISTS trg_tags_au"))
-                conn.execute(text("DROP TRIGGER IF EXISTS trg_tags_ad"))
-            except Exception as exc:
-                logger.debug('drop legacy triggers failed: %s', exc)
-
-            _rebuild_files_fts(conn)
-            _rebuild_tags_fts(conn)
-    except Exception as exc:
-        logger.warning('Failed to initialize search support: %s', exc)
+    search_service.ensure_support()
 
 
 def _rebuild_files_fts(conn=None):
-    def _run(connection):
-        try:
-            connection.execute(text("DELETE FROM files_fts"))
-            connection.execute(text(
-                """
-                INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
-                SELECT id, id,
-                    coalesce(title,''),
-                    coalesce(author,''),
-                    coalesce(keywords,''),
-                    coalesce(abstract,''),
-                    coalesce(text_excerpt,'')
-                FROM files
-                """
-            ))
-        except Exception as exc:
-            logger.debug('files_fts rebuild failed: %s', exc)
-
-    if conn is not None:
-        _run(conn)
-    else:
-        with db.engine.begin() as connection:
-            _run(connection)
+    search_service.rebuild_files(connection=conn)
 
 
 def _rebuild_tags_fts(conn=None):
-    def _run(connection):
-        try:
-            connection.execute(text("DELETE FROM tags_fts"))
-            connection.execute(text(
-                """
-                INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
-                SELECT id, id, file_id, coalesce(key,''), coalesce(value,'')
-                FROM tags
-                """
-            ))
-        except Exception as exc:
-            logger.debug('tags_fts rebuild failed: %s', exc)
-
-    if conn is not None:
-        _run(conn)
-    else:
-        with db.engine.begin() as connection:
-            _run(connection)
+    search_service.rebuild_tags(connection=conn)
 
 
 def _sync_file_to_fts(file_obj: File | None):
-    if not file_obj or not getattr(file_obj, 'id', None):
-        return
-    try:
-        db.session.execute(text("DELETE FROM files_fts WHERE rowid = :rid"), {'rid': file_obj.id})
-        db.session.execute(text(
-            """
-            INSERT INTO files_fts(rowid, file_id, title, author, keywords, abstract, text_excerpt)
-            VALUES (:rid, :rid, :title, :author, :keywords, :abstract, :text_excerpt)
-            """
-        ), {
-            'rid': file_obj.id,
-            'title': file_obj.title or '',
-            'author': file_obj.author or '',
-            'keywords': file_obj.keywords or '',
-            'abstract': getattr(file_obj, 'abstract', '') or '',
-            'text_excerpt': file_obj.text_excerpt or '',
-        })
-    except Exception as exc:
-        logger.debug('sync files_fts failed for id %s: %s', getattr(file_obj, 'id', None), exc)
-    try:
-        db.session.execute(text("DELETE FROM tags_fts WHERE file_id = :file_id"), {'file_id': file_obj.id})
-        tag_rows = []
-        try:
-            tags_iter = list(file_obj.tags or [])
-        except Exception:
-            tags_iter = []
-        for tag in tags_iter:
-            if not getattr(tag, 'id', None):
-                continue
-            tag_rows.append({
-                'rowid': tag.id,
-                'tag_id': tag.id,
-                'file_id': file_obj.id,
-                'key': (tag.key or ''),
-                'value': (tag.value or ''),
-            })
-        if tag_rows:
-            db.session.execute(text(
-                """
-                INSERT INTO tags_fts(rowid, tag_id, file_id, key, value)
-                VALUES (:rowid, :tag_id, :file_id, :key, :value)
-                """
-            ), tag_rows)
-    except Exception as exc:
-        logger.debug('sync tags_fts failed for file %s: %s', getattr(file_obj, 'id', None), exc)
+    search_service.sync_file(file_obj)
 
 
 def _delete_file_from_fts(file_id: int | None):
-    if not file_id:
-        return
-    try:
-        db.session.execute(text("DELETE FROM files_fts WHERE rowid = :rid"), {'rid': file_id})
-    except Exception as exc:
-        logger.debug('delete from files_fts failed for %s: %s', file_id, exc)
-    try:
-        db.session.execute(text("DELETE FROM tags_fts WHERE file_id = :file_id"), {'file_id': file_id})
-    except Exception as exc:
-        logger.debug('delete from tags_fts failed for %s: %s', file_id, exc)
-
-
-_FTS_TOKEN_PATTERN = re.compile(r"[\w\d]+", re.UNICODE)
-
-
-def _fts_match_query(query: str) -> str | None:
-    tokens = _FTS_TOKEN_PATTERN.findall((query or '').lower())
-    cleaned = [token for token in tokens if token]
-    if not cleaned:
-        return None
-    cleaned = cleaned[:8]
-    return ' '.join(f'{token}*' for token in cleaned)
+    search_service.delete_file(file_id)
 
 
 def _search_candidate_ids(query: str, limit: int = 4000) -> list[int] | None:
-    match_expr = _fts_match_query(query)
-    if match_expr is None:
-        return []
-    ids: set[int] = set()
-    try:
-        rows = db.session.execute(
-            text("SELECT rowid FROM files_fts WHERE files_fts MATCH :match LIMIT :limit"),
-            {'match': match_expr, 'limit': limit},
-        ).fetchall()
-        ids.update(int(row[0]) for row in rows)
-    except Exception as exc:
-        logger.debug('files_fts MATCH failed: %s', exc)
-        return None
-    try:
-        rows = db.session.execute(
-            text("SELECT file_id FROM tags_fts WHERE tags_fts MATCH :match LIMIT :limit"),
-            {'match': match_expr, 'limit': limit},
-        ).fetchall()
-        ids.update(int(row[0]) for row in rows)
-    except Exception as exc:
-        logger.debug('tags_fts MATCH failed: %s', exc)
-    return list(ids)
+    return search_service.candidate_ids(query, limit=limit)
 
 
 def _apply_like_filter(base_query, query: str):
-    like = f"%{query}%"
-    filters = [
-        File.title.ilike(like),
-        File.author.ilike(like),
-        File.keywords.ilike(like),
-        File.filename.ilike(like),
-        File.text_excerpt.ilike(like),
-    ]
-    if hasattr(File, 'abstract'):
-        filters.append(File.abstract.ilike(like))
-    tag_like = exists().where(and_(
-        Tag.file_id == File.id,
-        or_(Tag.value.ilike(like), Tag.key.ilike(like))
-    ))
-    filters.append(tag_like)
-    return base_query.filter(or_(*filters))
+    return search_service.apply_like_filter(base_query, query)
 
 
 def _apply_text_search_filter(base_query, query: str):
-    candidates = _search_candidate_ids(query)
-    if candidates is None:
-        return _apply_like_filter(base_query, query)
-    if not candidates:
-        return base_query.filter(File.id == -1)
-    return base_query.filter(File.id.in_(candidates))
+    return search_service.apply_text_search_filter(base_query, query)
 
 
 class TimedCache:
@@ -665,8 +701,9 @@ LLM_PURPOSES = [
     {'id': 'default', 'label': 'По умолчанию'},
 ]
 LLM_PROVIDER_OPTIONS = [
-    {'id': 'openai', 'label': 'OpenAI-совместимый (LM Studio, OpenAI, Azure)'},
-    {'id': 'ollama', 'label': 'Ollama'},
+    {'id': 'openai', 'label': 'OpenAI-совместимый (LM Studio, OpenAI, OpenRouter)'},
+    {'id': 'azure_openai', 'label': 'Azure OpenAI'},
+    {'id': 'ollama', 'label': 'Ollama (локальные модели)'},
 ]
 TASK_RETENTION_WINDOW = timedelta(days=1)
 TASK_FINAL_STATUSES = ('completed', 'error', 'cancelled')
@@ -703,8 +740,6 @@ AI_BOOST_PHRASE = _getf('AI_BOOST_PHRASE', 3.0)
 AI_BOOST_MULTI = _getf('AI_BOOST_MULTI', 0.6)  # дополнительный бонус за каждое уникальное слово
 AI_BOOST_SNIPPET_COOCCUR = _getf('AI_BOOST_SNIPPET_COOCCUR', 0.8)
 SNIPPET_CACHE_TTL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_TTL_HOURS', '24'))
-LM_MAX_INPUT_CHARS = max(500, int(os.getenv('LM_MAX_INPUT_CHARS', '4000')))
-LM_MAX_OUTPUT_TOKENS = max(16, int(os.getenv('LM_MAX_OUTPUT_TOKENS', '256')))
 KEYWORD_IDF_MIN = float(os.getenv('KEYWORD_IDF_MIN', '1.25'))
 CACHE_CLEANUP_INTERVAL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_SWEEP_INTERVAL_HOURS', '24'))
 
@@ -859,62 +894,24 @@ def _record_search_metric(query_hash: str, durations: dict[str, float], user: Us
 # ------------------- Конфигурация -------------------
 
 CONFIG = load_app_config()
+
+
 def _apply_config_defaults(cfg: AppConfig) -> None:
-    global BASE_DIR, LOGIN_BACKGROUNDS_DIR, SCAN_ROOT, EXTRACT_TEXT
-    global OCR_LANGS_CFG, PDF_OCR_PAGES_CFG, ALWAYS_OCR_FIRST_PAGE_DISSERTATION
-    global DEFAULT_USE_LLM, DEFAULT_PRUNE, COLLECTIONS_IN_SEPARATE_DIRS
-    global COLLECTION_TYPE_SUBDIRS, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY
-    global LM_DEFAULT_PROVIDER, TRANSCRIBE_ENABLED, TRANSCRIBE_BACKEND
-    global TRANSCRIBE_MODEL_PATH, TRANSCRIBE_LANGUAGE, IMAGES_VISION_ENABLED
-    global KEYWORDS_TO_TAGS_ENABLED, TYPE_DETECT_FLOW, TYPE_LLM_OVERRIDE
-    global RENAME_PATTERNS, AI_RERANK_LLM, IMPORT_SUBDIR, MOVE_ON_RENAME
-    global TYPE_DIRS, DEFAULT_PROMPTS, PROMPTS, SUMMARIZE_AUDIO
-    global AUDIO_KEYWORDS_LLM, FW_CACHE_DIR, SETTINGS_STORE_PATH
-    global SEARCH_FACET_TAG_KEYS, GRAPH_FACET_TAG_KEYS, SEARCH_FACET_INCLUDE_TYPES
-    global LOG_DIR, LOG_FILE_PATH, UPLOAD_FOLDER
+    global BASE_DIR, LOGIN_BACKGROUNDS_DIR, RENAME_PATTERNS, DEFAULT_PROMPTS
+    global FW_CACHE_DIR, SETTINGS_STORE_PATH, LOG_DIR, LOG_FILE_PATH
     global HTTP_DEFAULT_TIMEOUT, HTTP_CONNECT_TIMEOUT, HTTP_RETRIES, HTTP_BACKOFF_FACTOR
     global LOG_LEVEL, SENTRY_DSN, SENTRY_ENVIRONMENT
 
+    runtime_settings_store.initialize(cfg)
+
     BASE_DIR = cfg.base_dir
     LOGIN_BACKGROUNDS_DIR = cfg.login_backgrounds_dir
-    SCAN_ROOT = cfg.scan_root
-    EXTRACT_TEXT = cfg.extract_text
-    OCR_LANGS_CFG = cfg.ocr_langs
-    PDF_OCR_PAGES_CFG = cfg.pdf_ocr_pages
-    ALWAYS_OCR_FIRST_PAGE_DISSERTATION = cfg.always_ocr_first_page_dissertation
-    DEFAULT_USE_LLM = cfg.default_use_llm
-    DEFAULT_PRUNE = cfg.default_prune
-    COLLECTIONS_IN_SEPARATE_DIRS = cfg.collections_in_separate_dirs
-    COLLECTION_TYPE_SUBDIRS = cfg.collection_type_subdirs
-    LMSTUDIO_API_BASE = cfg.lmstudio_api_base
-    LMSTUDIO_MODEL = cfg.lmstudio_model
-    LMSTUDIO_API_KEY = cfg.lmstudio_api_key
-    LM_DEFAULT_PROVIDER = cfg.lm_default_provider
-    TRANSCRIBE_ENABLED = cfg.transcribe_enabled
-    TRANSCRIBE_BACKEND = cfg.transcribe_backend
-    TRANSCRIBE_MODEL_PATH = cfg.transcribe_model_path
-    TRANSCRIBE_LANGUAGE = cfg.transcribe_language
-    IMAGES_VISION_ENABLED = cfg.images_vision_enabled
-    KEYWORDS_TO_TAGS_ENABLED = cfg.keywords_to_tags_enabled
-    TYPE_DETECT_FLOW = cfg.type_detect_flow
-    TYPE_LLM_OVERRIDE = cfg.type_llm_override
     RENAME_PATTERNS = dict(cfg.rename_patterns)
-    AI_RERANK_LLM = cfg.ai_rerank_llm
-    IMPORT_SUBDIR = cfg.import_subdir
-    MOVE_ON_RENAME = cfg.move_on_rename
-    TYPE_DIRS = dict(cfg.type_dirs)
     DEFAULT_PROMPTS = dict(cfg.default_prompts)
-    PROMPTS = dict(cfg.prompts)
-    SUMMARIZE_AUDIO = cfg.summarize_audio
-    AUDIO_KEYWORDS_LLM = cfg.audio_keywords_llm
     FW_CACHE_DIR = cfg.fw_cache_dir
     SETTINGS_STORE_PATH = cfg.settings_store_path
-    SEARCH_FACET_TAG_KEYS = list(cfg.search_facet_tag_keys) if cfg.search_facet_tag_keys is not None else None
-    GRAPH_FACET_TAG_KEYS = list(cfg.graph_facet_tag_keys) if cfg.graph_facet_tag_keys is not None else None
-    SEARCH_FACET_INCLUDE_TYPES = bool(cfg.search_facet_include_types)
     LOG_DIR = cfg.logs_dir
     LOG_FILE_PATH = cfg.log_file_path
-    UPLOAD_FOLDER = cfg.scan_root
     HTTP_DEFAULT_TIMEOUT = float(cfg.http_timeout)
     HTTP_CONNECT_TIMEOUT = float(cfg.http_connect_timeout)
     HTTP_RETRIES = int(cfg.http_retries)
@@ -923,11 +920,13 @@ def _apply_config_defaults(cfg: AppConfig) -> None:
     SENTRY_DSN = cfg.sentry_dsn
     SENTRY_ENVIRONMENT = cfg.sentry_environment
 
+    _refresh_runtime_globals()
+
 
 _apply_config_defaults(CONFIG)
-LLM_PROVIDER_CHOICES = {'openai', 'ollama'}
-if LM_DEFAULT_PROVIDER not in LLM_PROVIDER_CHOICES:
-    LM_DEFAULT_PROVIDER = 'openai'
+LLM_PROVIDER_CHOICES = {'openai', 'openrouter', 'azure_openai', 'ollama'}
+if runtime_settings_store.current.lm_default_provider not in LLM_PROVIDER_CHOICES:
+    runtime_settings_store.current.lm_default_provider = 'openai'
 
 # ------------------- Сохранение настроек во время работы -------------------
 
@@ -935,83 +934,17 @@ if LM_DEFAULT_PROVIDER not in LLM_PROVIDER_CHOICES:
 
 # ------------------- Facet configuration (search & graph) -------------------
 
-SEARCH_FACET_TAG_KEYS: list[str] | None = SEARCH_FACET_TAG_KEYS
-GRAPH_FACET_TAG_KEYS: list[str] | None = GRAPH_FACET_TAG_KEYS
-SEARCH_FACET_INCLUDE_TYPES: bool = SEARCH_FACET_INCLUDE_TYPES
-
-
 def _facet_config_state() -> dict:
+    runtime = _rt()
     return {
         'search': {
-            'include_types': bool(SEARCH_FACET_INCLUDE_TYPES),
-            'tag_keys': list(SEARCH_FACET_TAG_KEYS) if SEARCH_FACET_TAG_KEYS is not None else None,
+            'include_types': bool(runtime.search_facet_include_types),
+            'tag_keys': list(runtime.search_facet_tag_keys) if runtime.search_facet_tag_keys is not None else None,
         },
         'graph': {
-            'tag_keys': list(GRAPH_FACET_TAG_KEYS) if GRAPH_FACET_TAG_KEYS is not None else None,
+            'tag_keys': list(runtime.graph_facet_tag_keys) if runtime.graph_facet_tag_keys is not None else None,
         }
     }
-
-
-def _runtime_settings_snapshot() -> dict:
-    return {
-        'SCAN_ROOT': str(SCAN_ROOT),
-        'EXTRACT_TEXT': bool(EXTRACT_TEXT),
-        'LMSTUDIO_API_BASE': LMSTUDIO_API_BASE,
-        'LMSTUDIO_MODEL': LMSTUDIO_MODEL,
-        'LMSTUDIO_API_KEY': LMSTUDIO_API_KEY,
-        'LM_DEFAULT_PROVIDER': LM_DEFAULT_PROVIDER,
-        'TRANSCRIBE_ENABLED': bool(TRANSCRIBE_ENABLED),
-        'TRANSCRIBE_BACKEND': TRANSCRIBE_BACKEND,
-        'TRANSCRIBE_MODEL_PATH': TRANSCRIBE_MODEL_PATH,
-        'TRANSCRIBE_LANGUAGE': TRANSCRIBE_LANGUAGE,
-        'SUMMARIZE_AUDIO': bool(SUMMARIZE_AUDIO),
-        'AUDIO_KEYWORDS_LLM': bool(AUDIO_KEYWORDS_LLM),
-        'IMAGES_VISION_ENABLED': bool(IMAGES_VISION_ENABLED),
-        'KEYWORDS_TO_TAGS_ENABLED': bool(KEYWORDS_TO_TAGS_ENABLED),
-        'TYPE_DETECT_FLOW': TYPE_DETECT_FLOW,
-        'TYPE_LLM_OVERRIDE': bool(TYPE_LLM_OVERRIDE),
-        'IMPORT_SUBDIR': IMPORT_SUBDIR,
-        'MOVE_ON_RENAME': bool(MOVE_ON_RENAME),
-        'COLLECTIONS_IN_SEPARATE_DIRS': bool(COLLECTIONS_IN_SEPARATE_DIRS),
-        'COLLECTION_TYPE_SUBDIRS': bool(COLLECTION_TYPE_SUBDIRS),
-        'TYPE_DIRS': dict(TYPE_DIRS),
-        'DEFAULT_USE_LLM': bool(DEFAULT_USE_LLM),
-        'DEFAULT_PRUNE': bool(DEFAULT_PRUNE),
-        'OCR_LANGS_CFG': OCR_LANGS_CFG,
-        'PDF_OCR_PAGES_CFG': int(PDF_OCR_PAGES_CFG),
-        'ALWAYS_OCR_FIRST_PAGE_DISSERTATION': bool(ALWAYS_OCR_FIRST_PAGE_DISSERTATION),
-        'PROMPTS': dict(PROMPTS),
-        'AI_RERANK_LLM': bool(AI_RERANK_LLM),
-        'SEARCH_FACET_TAG_KEYS': list(SEARCH_FACET_TAG_KEYS) if SEARCH_FACET_TAG_KEYS is not None else None,
-        'GRAPH_FACET_TAG_KEYS': list(GRAPH_FACET_TAG_KEYS) if GRAPH_FACET_TAG_KEYS is not None else None,
-        'SEARCH_FACET_INCLUDE_TYPES': bool(SEARCH_FACET_INCLUDE_TYPES),
-    }
-
-
-def _apply_runtime_settings_to_config(app_obj: Flask) -> None:
-    app_obj.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
-    app_obj.config['IMPORT_SUBDIR'] = IMPORT_SUBDIR
-    app_obj.config['MOVE_ON_RENAME'] = MOVE_ON_RENAME
-    app_obj.config['COLLECTIONS_IN_SEPARATE_DIRS'] = COLLECTIONS_IN_SEPARATE_DIRS
-    app_obj.config['COLLECTION_TYPE_SUBDIRS'] = COLLECTION_TYPE_SUBDIRS
-    app_obj.config['TYPE_DIRS'] = dict(TYPE_DIRS)
-    app_obj.config['SEARCH_FACET_TAG_KEYS'] = (
-        list(SEARCH_FACET_TAG_KEYS) if SEARCH_FACET_TAG_KEYS is not None else None
-    )
-    app_obj.config['GRAPH_FACET_TAG_KEYS'] = (
-        list(GRAPH_FACET_TAG_KEYS) if GRAPH_FACET_TAG_KEYS is not None else None
-    )
-    app_obj.config['SEARCH_FACET_INCLUDE_TYPES'] = SEARCH_FACET_INCLUDE_TYPES
-
-
-def _save_runtime_settings_to_disk() -> None:
-    try:
-        SETTINGS_STORE_PATH.write_text(
-            json.dumps(_runtime_settings_snapshot(), ensure_ascii=False, indent=2),
-            encoding='utf-8'
-        )
-    except Exception as exc:
-        logger.warning("Не удалось сохранить настройки: %s", exc)
 
 
 def _load_runtime_settings_from_disk() -> None:
@@ -1022,129 +955,32 @@ def _load_runtime_settings_from_disk() -> None:
     except Exception as exc:
         logger.warning("Не удалось прочитать настройки: %s", exc)
         return
-    global SCAN_ROOT, EXTRACT_TEXT, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY, LM_DEFAULT_PROVIDER
-    global TRANSCRIBE_ENABLED, TRANSCRIBE_BACKEND, TRANSCRIBE_MODEL_PATH, TRANSCRIBE_LANGUAGE
-    global SUMMARIZE_AUDIO, AUDIO_KEYWORDS_LLM, IMAGES_VISION_ENABLED, KEYWORDS_TO_TAGS_ENABLED
-    global TYPE_DETECT_FLOW, TYPE_LLM_OVERRIDE, IMPORT_SUBDIR, MOVE_ON_RENAME
-    global COLLECTIONS_IN_SEPARATE_DIRS, COLLECTION_TYPE_SUBDIRS, TYPE_DIRS
-    global DEFAULT_USE_LLM, DEFAULT_PRUNE
-    global OCR_LANGS_CFG, PDF_OCR_PAGES_CFG, ALWAYS_OCR_FIRST_PAGE_DISSERTATION, PROMPTS, AI_RERANK_LLM
-    global SEARCH_FACET_TAG_KEYS, GRAPH_FACET_TAG_KEYS, SEARCH_FACET_INCLUDE_TYPES
-
-    if 'SCAN_ROOT' in data:
-        try:
-            SCAN_ROOT = Path(data['SCAN_ROOT'])
-            app.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
-        except Exception:
-            logger.warning('Некорректный путь SCAN_ROOT в настройках: %s', data.get('SCAN_ROOT'))
-    if 'EXTRACT_TEXT' in data:
-        EXTRACT_TEXT = bool(data['EXTRACT_TEXT'])
-    if 'LMSTUDIO_API_BASE' in data:
-        LMSTUDIO_API_BASE = str(data['LMSTUDIO_API_BASE'] or LMSTUDIO_API_BASE)
-    if 'LMSTUDIO_MODEL' in data:
-        LMSTUDIO_MODEL = str(data['LMSTUDIO_MODEL'] or LMSTUDIO_MODEL)
-    if 'LMSTUDIO_API_KEY' in data:
-        LMSTUDIO_API_KEY = str(data['LMSTUDIO_API_KEY'] or '')
-    if 'LM_DEFAULT_PROVIDER' in data:
-        candidate = str(data['LM_DEFAULT_PROVIDER'] or '').strip().lower()
-        if candidate in LLM_PROVIDER_CHOICES:
-            LM_DEFAULT_PROVIDER = candidate
-    if 'TRANSCRIBE_ENABLED' in data:
-        TRANSCRIBE_ENABLED = bool(data['TRANSCRIBE_ENABLED'])
-    if 'TRANSCRIBE_BACKEND' in data:
-        TRANSCRIBE_BACKEND = str(data['TRANSCRIBE_BACKEND'] or TRANSCRIBE_BACKEND)
-    if 'TRANSCRIBE_MODEL_PATH' in data:
-        TRANSCRIBE_MODEL_PATH = str(data['TRANSCRIBE_MODEL_PATH'] or TRANSCRIBE_MODEL_PATH)
-    if 'TRANSCRIBE_LANGUAGE' in data:
-        TRANSCRIBE_LANGUAGE = str(data['TRANSCRIBE_LANGUAGE'] or TRANSCRIBE_LANGUAGE)
-    if 'SUMMARIZE_AUDIO' in data:
-        SUMMARIZE_AUDIO = bool(data['SUMMARIZE_AUDIO'])
-    if 'AUDIO_KEYWORDS_LLM' in data:
-        AUDIO_KEYWORDS_LLM = bool(data['AUDIO_KEYWORDS_LLM'])
-    if 'IMAGES_VISION_ENABLED' in data:
-        IMAGES_VISION_ENABLED = bool(data['IMAGES_VISION_ENABLED'])
-    if 'KEYWORDS_TO_TAGS_ENABLED' in data:
-        KEYWORDS_TO_TAGS_ENABLED = bool(data['KEYWORDS_TO_TAGS_ENABLED'])
-    if 'TYPE_DETECT_FLOW' in data:
-        TYPE_DETECT_FLOW = str(data['TYPE_DETECT_FLOW'] or TYPE_DETECT_FLOW)
-    if 'TYPE_LLM_OVERRIDE' in data:
-        TYPE_LLM_OVERRIDE = bool(data['TYPE_LLM_OVERRIDE'])
-    if 'IMPORT_SUBDIR' in data:
-        IMPORT_SUBDIR = str(data['IMPORT_SUBDIR'] or '').strip().strip('/\\')
-    if 'MOVE_ON_RENAME' in data:
-        MOVE_ON_RENAME = bool(data['MOVE_ON_RENAME'])
-    if 'COLLECTIONS_IN_SEPARATE_DIRS' in data:
-        COLLECTIONS_IN_SEPARATE_DIRS = bool(data['COLLECTIONS_IN_SEPARATE_DIRS'])
-    if 'COLLECTION_TYPE_SUBDIRS' in data:
-        COLLECTION_TYPE_SUBDIRS = bool(data['COLLECTION_TYPE_SUBDIRS'])
-    if 'TYPE_DIRS' in data and isinstance(data['TYPE_DIRS'], dict):
-        TYPE_DIRS = {str(k): str(v) for k, v in data['TYPE_DIRS'].items()}
-    if 'DEFAULT_USE_LLM' in data:
-        DEFAULT_USE_LLM = bool(data['DEFAULT_USE_LLM'])
-    if 'DEFAULT_PRUNE' in data:
-        DEFAULT_PRUNE = bool(data['DEFAULT_PRUNE'])
-    if not COLLECTIONS_IN_SEPARATE_DIRS:
-        COLLECTION_TYPE_SUBDIRS = False
-    if 'COLLECTIONS_IN_SEPARATE_DIRS' in data:
-        COLLECTIONS_IN_SEPARATE_DIRS = bool(data['COLLECTIONS_IN_SEPARATE_DIRS'])
-    if 'COLLECTION_TYPE_SUBDIRS' in data:
-        COLLECTION_TYPE_SUBDIRS = bool(data['COLLECTION_TYPE_SUBDIRS'])
-    if 'TYPE_DIRS' in data and isinstance(data['TYPE_DIRS'], dict):
-        TYPE_DIRS = {str(k): str(v) for k, v in data['TYPE_DIRS'].items()}
-    if 'DEFAULT_USE_LLM' in data:
-        DEFAULT_USE_LLM = bool(data['DEFAULT_USE_LLM'])
-    if 'DEFAULT_PRUNE' in data:
-        DEFAULT_PRUNE = bool(data['DEFAULT_PRUNE'])
-    if not COLLECTIONS_IN_SEPARATE_DIRS:
-        COLLECTION_TYPE_SUBDIRS = False
-    if 'COLLECTIONS_IN_SEPARATE_DIRS' in data:
-        COLLECTIONS_IN_SEPARATE_DIRS = bool(data['COLLECTIONS_IN_SEPARATE_DIRS'])
-    if 'COLLECTION_TYPE_SUBDIRS' in data:
-        COLLECTION_TYPE_SUBDIRS = bool(data['COLLECTION_TYPE_SUBDIRS'])
-    if 'OCR_LANGS_CFG' in data:
-        OCR_LANGS_CFG = str(data['OCR_LANGS_CFG'] or OCR_LANGS_CFG)
-        os.environ['OCR_LANGS'] = OCR_LANGS_CFG
-    if 'PDF_OCR_PAGES_CFG' in data:
-        try:
-            PDF_OCR_PAGES_CFG = int(data['PDF_OCR_PAGES_CFG'])
-        except Exception:
-            pass
-        else:
-            os.environ['PDF_OCR_PAGES'] = str(PDF_OCR_PAGES_CFG)
-    if 'ALWAYS_OCR_FIRST_PAGE_DISSERTATION' in data:
-        ALWAYS_OCR_FIRST_PAGE_DISSERTATION = bool(data['ALWAYS_OCR_FIRST_PAGE_DISSERTATION'])
-        os.environ['OCR_DISS_FIRST_PAGE'] = '1' if ALWAYS_OCR_FIRST_PAGE_DISSERTATION else '0'
-    if 'PROMPTS' in data and isinstance(data['PROMPTS'], dict):
-        for key, value in data['PROMPTS'].items():
-            if isinstance(value, str):
-                PROMPTS[key] = value
-    if 'AI_RERANK_LLM' in data:
-        AI_RERANK_LLM = bool(data['AI_RERANK_LLM'])
-    if 'SEARCH_FACET_TAG_KEYS' in data:
-        raw = data.get('SEARCH_FACET_TAG_KEYS')
-        if raw is None:
-            SEARCH_FACET_TAG_KEYS = None
-        elif isinstance(raw, (list, tuple)):
-            SEARCH_FACET_TAG_KEYS = [str(v).strip() for v in raw if str(v or '').strip()]
-        else:
-            SEARCH_FACET_TAG_KEYS = []
-    if 'GRAPH_FACET_TAG_KEYS' in data:
-        raw = data.get('GRAPH_FACET_TAG_KEYS')
-        if raw is None:
-            GRAPH_FACET_TAG_KEYS = None
-        elif isinstance(raw, (list, tuple)):
-            GRAPH_FACET_TAG_KEYS = [str(v).strip() for v in raw if str(v or '').strip()]
-        else:
-            GRAPH_FACET_TAG_KEYS = []
-    if 'SEARCH_FACET_INCLUDE_TYPES' in data:
-        SEARCH_FACET_INCLUDE_TYPES = bool(data['SEARCH_FACET_INCLUDE_TYPES'])
-
+    runtime_settings_store.apply_updates(data)
+    runtime = _rt()
+    if runtime.lm_default_provider not in LLM_PROVIDER_CHOICES:
+        runtime.lm_default_provider = 'openai'
+    _refresh_runtime_globals()
+    configure_llm_cache(
+        enabled=runtime.llm_cache_enabled,
+        max_items=runtime.llm_cache_max_items,
+        ttl_seconds=runtime.llm_cache_ttl_seconds,
+    )
+    configure_search_cache(
+        enabled=runtime.search_cache_enabled,
+        max_items=runtime.search_cache_max_items,
+        ttl_seconds=runtime.search_cache_ttl_seconds,
+    )
     app_ref = globals().get('app')
     if app_ref:
-        app_ref.config['SEARCH_FACET_TAG_KEYS'] = SEARCH_FACET_TAG_KEYS
-        app_ref.config['GRAPH_FACET_TAG_KEYS'] = GRAPH_FACET_TAG_KEYS
-        app_ref.config['SEARCH_FACET_INCLUDE_TYPES'] = SEARCH_FACET_INCLUDE_TYPES
-        _apply_runtime_settings_to_config(app_ref)
+        runtime.apply_to_flask_config(app_ref)
+
+
+def _runtime_settings_snapshot() -> dict:
+    return runtime_settings_store.snapshot()
+
+
+def _apply_runtime_settings_to_config(app_obj: Flask) -> None:
+    runtime_settings_store.current.apply_to_flask_config(app_obj)
 
 
 # ------------------- Lightweight response helpers -------------------
@@ -1583,14 +1419,22 @@ def _ensure_faster_whisper_model(model_ref: str) -> str:
 app = Flask(__name__)
 
 
-def setup_app(config: AppConfig | None = None) -> Flask:
-    global CONFIG, LOG_DIR, LOG_FILE_PATH, UPLOAD_FOLDER
+def _initialize_database_structures(app_obj: Flask) -> None:
+    """Ensure ORM metadata, FTS tables and task queue state are ready."""
+    with app_obj.app_context():
+        db.create_all()
+        _ensure_search_support()
+        _reset_inflight_tasks()
+
+
+def setup_app(config: AppConfig | None = None, *, ensure_database: bool = True) -> Flask:
+    global CONFIG, LOG_DIR, LOG_FILE_PATH
     cfg = config or CONFIG
     if config is not None:
         CONFIG = cfg
         _apply_config_defaults(cfg)
-        if LM_DEFAULT_PROVIDER not in LLM_PROVIDER_CHOICES:
-            LM_DEFAULT_PROVIDER = 'openai'
+        if runtime_settings_store.current.lm_default_provider not in LLM_PROVIDER_CHOICES:
+            runtime_settings_store.current.lm_default_provider = 'openai'
     LOG_DIR = cfg.logs_dir
     LOG_FILE_PATH = cfg.log_file_path
     configure_http(
@@ -1600,6 +1444,16 @@ def setup_app(config: AppConfig | None = None) -> Flask:
             retries=cfg.http_retries,
             backoff_factor=cfg.http_backoff_factor,
         )
+    )
+    configure_llm_cache(
+        enabled=cfg.llm_cache_enabled,
+        max_items=cfg.llm_cache_max_items,
+        ttl_seconds=cfg.llm_cache_ttl_seconds,
+    )
+    configure_search_cache(
+        enabled=cfg.search_cache_enabled,
+        max_items=cfg.search_cache_max_items,
+        ttl_seconds=cfg.search_cache_ttl_seconds,
     )
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1631,10 +1485,15 @@ def setup_app(config: AppConfig | None = None) -> Flask:
     except Exception as pragma_exc:
         logger.warning('Failed to apply SQLite PRAGMA settings: %s', pragma_exc)
     _load_runtime_settings_from_disk()
-    UPLOAD_FOLDER = SCAN_ROOT
     _apply_runtime_settings_to_config(app)
     if 'admin_api' not in app.blueprints:
         app.register_blueprint(admin_bp)
+    if 'users_api' not in app.blueprints:
+        app.register_blueprint(users_bp)
+    if ensure_database:
+        _initialize_database_structures(app)
+    with app.app_context():
+        _schedule_facet_cache_rebuild('startup')
     return app
 
 
@@ -1958,13 +1817,14 @@ def _ensure_llm_pool(purpose: str | None) -> None:
                 unique: list[dict[str, str]] = []
                 seen: set[tuple] = set()
                 for ep, _purposes in candidates:
+                    provider_fallback = (_rt().lm_default_provider or 'openai')
                     entry = {
                         'id': ep.id,
                         'name': ep.name or f'endpoint-{ep.id}',
                         'base_url': (ep.base_url or base_default).rstrip('/'),
                         'model': ep.model or model_default,
                         'api_key': ep.api_key or key_default,
-                        'provider': (ep.provider or LM_DEFAULT_PROVIDER).strip().lower() or LM_DEFAULT_PROVIDER,
+                        'provider': (ep.provider or provider_fallback).strip().lower() or provider_fallback,
                     }
                     weight = max(1, int(round(float(ep.weight or 1.0))))
                     for _ in range(weight):
@@ -1980,7 +1840,7 @@ def _ensure_llm_pool(purpose: str | None) -> None:
                         'base_url': base_default,
                         'model': model_default,
                         'api_key': key_default,
-                        'provider': LM_DEFAULT_PROVIDER,
+                        'provider': (_rt().lm_default_provider or 'openai'),
                     }
                     pool = [default_entry]
                     unique = [default_entry]
@@ -1998,7 +1858,7 @@ def _ensure_llm_pool(purpose: str | None) -> None:
             'base_url': base_default,
             'model': model_default,
             'api_key': key_default,
-            'provider': LM_DEFAULT_PROVIDER,
+            'provider': (_rt().lm_default_provider or 'openai'),
         }
         LLM_ENDPOINT_POOLS[desired] = [default_entry]
         LLM_ENDPOINT_UNIQUE[desired] = [default_entry]
@@ -2034,7 +1894,7 @@ def _llm_iter_choices(purpose: str | None):
             'base_url': (LMSTUDIO_API_BASE or '').rstrip('/'),
             'model': LMSTUDIO_MODEL,
             'api_key': LMSTUDIO_API_KEY,
-            'provider': LM_DEFAULT_PROVIDER,
+            'provider': (_rt().lm_default_provider or 'openai'),
         }
         return
     rotation = LLM_ROUND_ROBIN.get(desired)
@@ -2072,8 +1932,15 @@ def _llm_choice_label(choice: dict) -> str:
 
 def _llm_choice_provider(choice: dict) -> str:
     provider = str(choice.get('provider') or '').strip().lower()
+    aliases = {
+        'azure': 'azure_openai',
+        'azure-openai': 'azure_openai',
+    }
+    provider = aliases.get(provider, provider)
     if provider not in LLM_PROVIDER_CHOICES:
-        provider = LM_DEFAULT_PROVIDER
+        provider = runtime_settings_store.current.lm_default_provider
+    if provider not in LLM_PROVIDER_CHOICES:
+        provider = 'openai'
     return provider
 
 
@@ -2118,6 +1985,15 @@ def _llm_choice_url(choice: dict) -> str:
         if re.search(r"/api/(chat|generate)$", base):
             return base
         return f"{base}/api/chat"
+    if provider == 'azure_openai':
+        url = base
+        if not re.search(r"/chat/completions(?:\?|$)", url):
+            url = f"{url}/chat/completions"
+        if 'api-version=' not in url:
+            api_version = choice.get('api_version') or AZURE_OPENAI_API_VERSION
+            sep = '&' if '?' in url else '?'
+            url = f"{url}{sep}api-version={api_version}"
+        return url
     if base.endswith('/chat/completions'):
         return base
     if base.endswith('/v1'):
@@ -2129,7 +2005,11 @@ def _llm_choice_headers(choice: dict) -> dict:
     headers = {"Content-Type": "application/json"}
     key = choice.get('api_key')
     if key:
-        headers["Authorization"] = f"Bearer {key}"
+        provider = _llm_choice_provider(choice)
+        if provider == 'azure_openai':
+            headers["api-key"] = key
+        else:
+            headers["Authorization"] = f"Bearer {key}"
     return headers
 
 
@@ -2144,7 +2024,18 @@ def _llm_timeout_pair(total_timeout: int | float | None) -> tuple[float, float]:
     return connect, read
 
 
-def _llm_send_chat(choice: dict, messages: list[dict], *, temperature: float, max_tokens: int | None, top_p: float = 1.0, timeout: int = 120, extra_payload: dict | None = None):
+def _llm_send_chat(
+    choice: dict,
+    messages: list[dict],
+    *,
+    temperature: float,
+    max_tokens: int | None,
+    top_p: float = 1.0,
+    timeout: int = 120,
+    extra_payload: dict | None = None,
+    cache_bucket: str | None = None,
+    cache_only: bool | None = None,
+):
     provider = _llm_choice_provider(choice)
     url = _llm_choice_url(choice)
     if not url:
@@ -2181,6 +2072,25 @@ def _llm_send_chat(choice: dict, messages: list[dict], *, temperature: float, ma
                 pass
         if extra_payload:
             payload.update(extra_payload)
+    cache_enabled = bool(LLM_CACHE_ENABLED)
+    cache_only = LLM_CACHE_ONLY_MODE if cache_only is None else bool(cache_only)
+    cache_key: str | None = None
+    if cache_enabled:
+        cache_key_material = {
+            'bucket': cache_bucket or (choice.get('name') or provider),
+            'provider': provider,
+            'url': url,
+            'model': model,
+            'payload': payload,
+        }
+        cache_key = hashlib.sha256(json.dumps(cache_key_material, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+        cached_resp = llm_cache_get(cache_key)
+        if cached_resp is not None:
+            cached_resp.headers.setdefault('X-LLM-Cache', 'hit')
+            return provider, cached_resp
+        if cache_only:
+            raise RuntimeError('llm_cache_only_mode')
+
     response = http_request(
         'POST',
         url,
@@ -2189,6 +2099,35 @@ def _llm_send_chat(choice: dict, messages: list[dict], *, temperature: float, ma
         timeout=_llm_timeout_pair(timeout),
         logger=app.logger,
     )
+
+    if response is None:
+        raise RuntimeError('llm_response_none')
+
+    if response.status_code >= 400:
+        try:
+            preview = (response.text or '')[:200]
+            app.logger.warning(
+                "LLM HTTP %s (%s): %s",
+                response.status_code,
+                _llm_choice_label(choice),
+                preview,
+            )
+        except Exception:
+            pass
+
+    if cache_enabled and cache_key and response.status_code < 400:
+        try:
+            json_payload = response.json()
+        except Exception:
+            json_payload = None
+        cached = CachedLLMResponse(
+            status_code=response.status_code,
+            data=json_payload,
+            text=response.text,
+            headers=dict(response.headers or {}),
+        )
+        cached.headers.setdefault('X-LLM-Cache', 'store')
+        llm_cache_set(cache_key, cached)
     return provider, response
 
 
@@ -2330,6 +2269,7 @@ def require_admin(fn):
     return wrapper
 
 admin_bp = Blueprint('admin_api', __name__, url_prefix='/api/admin')
+users_bp = Blueprint('users_api', __name__, url_prefix='/api/users')
 
 def _admin_count(exclude_id: int | None = None) -> int:
     q = User.query.filter(User.role == 'admin')
@@ -2340,8 +2280,8 @@ def _admin_count(exclude_id: int | None = None) -> int:
     except Exception:
         return 0
 
-@admin_bp.route('/users', methods=['GET', 'POST'])
-def api_admin_users():
+@users_bp.route('/', methods=['GET', 'POST'])
+def api_users_collection():
     _require_admin()
     if request.method == 'GET':
         users = User.query.order_by(func.lower(User.username)).all()
@@ -2373,9 +2313,9 @@ def api_admin_users():
     return jsonify({'ok': True, 'user': _user_to_payload(user)}), 201
 
 
-@admin_bp.route('/users/search')
+@users_bp.route('/search')
 @require_admin
-def api_admin_users_search():
+def api_users_search():
     q = (request.args.get('q') or '').strip()
     try:
         limit = min(max(int(request.args.get('limit', '20')), 1), 50)
@@ -2393,8 +2333,19 @@ def api_admin_users_search():
         'role': _normalize_user_role(u.role, default=ROLE_EDITOR),
     } for u in users]})
 
-@admin_bp.route('/users/<int:user_id>', methods=['PATCH', 'DELETE'])
-def api_admin_user_detail(user_id: int):
+
+@users_bp.route('/roles', methods=['GET'])
+@require_admin
+def api_users_roles():
+    roles = [
+        {'id': ROLE_ADMIN, 'label': 'Администратор'},
+        {'id': ROLE_EDITOR, 'label': 'Редактор'},
+        {'id': ROLE_VIEWER, 'label': 'Наблюдатель'},
+    ]
+    return jsonify({'ok': True, 'roles': roles})
+
+@users_bp.route('/<int:user_id>', methods=['PATCH', 'DELETE'])
+def api_users_detail(user_id: int):
     admin = _require_admin()
     user = User.query.get_or_404(user_id)
     if request.method == 'DELETE':
@@ -2430,7 +2381,21 @@ def api_admin_user_detail(user_id: int):
     _log_user_action(admin, 'user_update', 'user', user.id, detail=json.dumps({'role': _user_role(user), 'password_changed': bool(new_password)}))
     return jsonify({'ok': True, 'user': _user_to_payload(user)})
 
-ensure_default_admin()
+
+@admin_bp.route('/users', methods=['GET', 'POST'])
+def api_admin_users():
+    return api_users_collection()
+
+
+@admin_bp.route('/users/search')
+@require_admin
+def api_admin_users_search():
+    return api_users_search()
+
+
+@admin_bp.route('/users/<int:user_id>', methods=['PATCH', 'DELETE'])
+def api_admin_user_detail(user_id: int):
+    return api_users_detail(user_id)
 
 # ------------------- Инициализация и миграции коллекций -------------------
 def _slugify(s: str) -> str:
@@ -2626,19 +2591,171 @@ def upload_file():
     if not file or not file.filename:
         return json_error("Файл не выбран", 400)
 
-    col_id = request.form.get('collection_id')
-    new_col = (request.form.get('new_collection') or '').strip()
-    col: Collection | None = None
+    try:
+        collection = _resolve_upload_collection(user, request.form, is_admin)
+    except PermissionError:
+        abort(403)
+    except ValueError as exc:
+        return json_error(str(exc), 400)
+    except Exception as exc:
+        return json_error(f"Не удалось подготовить коллекцию: {exc}", 500)
+
+    try:
+        save_result = _save_upload_to_disk(file)
+    except ValueError as exc:
+        return json_error(str(exc), 415)
+    except Exception as exc:
+        return json_error(f"Не удалось сохранить файл: {exc}", 500)
+
+    try:
+        import_result = _import_file_record(
+            save_result['path'],
+            save_result['rel_path'],
+            collection,
+            user_id=user.id if user else None,
+            generate_metadata=True,
+        )
+    except Exception as exc:
+        return json_error(f"Ошибка обработки файла: {exc}", 500)
+
+    try:
+        _log_user_action(
+            _load_current_user(),
+            'file_upload',
+            'file',
+            import_result.get('file_id'),
+            detail=json.dumps({'filename': import_result.get('preview', {}).get('filename'), 'collection_id': getattr(collection, 'id', None)}),
+        )
+    except Exception:
+        pass
+    return jsonify({
+        "status": "ok",
+        "file_id": import_result.get('file_id'),
+        "rel_path": import_result.get('rel_path'),
+        "preview": import_result.get('preview'),
+    })
+
+
+@app.route('/api/import/jobs', methods=['POST'])
+def api_import_jobs_create():
+    user = _load_current_user()
+    if not user:
+        abort(401)
+    if not _user_can_upload(user):
+        abort(403)
+
+    file = request.files.get('file')
+    if not file or not file.filename:
+        return json_error('Файл не выбран', 400)
+
+    is_admin = _user_role(user) == ROLE_ADMIN
+    try:
+        collection = _resolve_upload_collection(user, request.form, is_admin)
+    except PermissionError:
+        abort(403)
+    except ValueError as exc:
+        return json_error(str(exc), 400)
+    except Exception as exc:
+        return json_error(f"Не удалось подготовить коллекцию: {exc}", 500)
+
+    try:
+        save_result = _save_upload_to_disk(file)
+    except ValueError as exc:
+        return json_error(str(exc), 415)
+    except Exception as exc:
+        return json_error(f"Не удалось сохранить файл: {exc}", 500)
+
+    initial_preview = _build_initial_preview(save_result, collection)
+    payload = {
+        'kind': 'import_file',
+        'submitted_by': user.id,
+        'collection_id': getattr(collection, 'id', None),
+        'filename': save_result.get('filename'),
+        'rel_path': save_result.get('rel_path'),
+        'initial_preview': initial_preview,
+    }
+    try:
+        task = TaskRecord(name='import_file', status='queued', payload=json.dumps(payload, ensure_ascii=False), progress=0.0)
+        db.session.add(task)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return json_error(f"Не удалось создать задачу импорта: {exc}", 500)
+
+    spec = {
+        'path': str(save_result['path']),
+        'rel_path': save_result['rel_path'],
+        'collection_id': getattr(collection, 'id', None),
+        'user_id': user.id,
+        'filename': save_result.get('filename'),
+    }
+    _enqueue_import_job(task.id, spec, description=save_result.get('filename'))
+    return jsonify({'ok': True, 'task_id': task.id, 'initial_preview': initial_preview})
+
+
+def _task_payload_json(task: TaskRecord) -> dict:
+    if not task.payload:
+        return {}
+    try:
+        return json.loads(task.payload)
+    except Exception:
+        return {}
+
+
+@app.route('/api/import/jobs', methods=['GET'])
+def api_import_jobs_list():
+    user = _load_current_user()
+    if not user:
+        abort(401)
+    role = _user_role(user)
+    tasks_query = TaskRecord.query.filter(TaskRecord.name == 'import_file').order_by(TaskRecord.created_at.desc())
+    tasks = tasks_query.limit(50 if role == ROLE_ADMIN else 20).all()
+    items = []
+    for task in tasks:
+        payload = _task_payload_json(task)
+        if role != ROLE_ADMIN and payload.get('submitted_by') not in (user.id, None):
+            continue
+        info = _task_to_dict(task)
+        info['payload_json'] = payload
+        items.append(info)
+    return jsonify({'ok': True, 'tasks': items})
+
+
+@app.route('/api/import/jobs/<int:task_id>', methods=['GET'])
+def api_import_jobs_status(task_id: int):
+    user = _load_current_user()
+    if not user:
+        abort(401)
+    task = TaskRecord.query.get_or_404(task_id)
+    payload = _task_payload_json(task)
+    if _user_role(user) != ROLE_ADMIN and payload.get('submitted_by') != user.id:
+        abort(403)
+    info = _task_to_dict(task)
+    info['payload_json'] = payload
+    return jsonify({'ok': True, 'task': info})
+
+
+def _resolve_upload_collection(user: User | None, form, is_admin: bool) -> Collection | None:
     allowed = getattr(g, 'allowed_collection_ids', set())
+    col: Collection | None = None
+    new_col = (form.get('new_collection') or '').strip()
+    col_id = form.get('collection_id')
+
     try:
         if new_col:
             slug = _slugify(new_col)
             col = Collection.query.filter((Collection.slug == slug) | (Collection.name == new_col)).first()
             if not col:
-                requested_private = str(request.form.get('private', '')).lower() in ('1','true','yes','on')
+                requested_private = str(form.get('private', '')).lower() in ('1', 'true', 'yes', 'on')
                 is_private_flag = requested_private or not is_admin
-                col = Collection(name=new_col, slug=slug, searchable=True, graphable=True,
-                                 owner_id=user.id, is_private=is_private_flag)
+                col = Collection(
+                    name=new_col,
+                    slug=slug,
+                    searchable=True,
+                    graphable=True,
+                    owner_id=user.id if user else None,
+                    is_private=is_private_flag,
+                )
                 db.session.add(col)
                 db.session.commit()
                 if user:
@@ -2660,9 +2777,10 @@ def upload_file():
                 col = Collection.query.get(int(col_id))
             except Exception:
                 col = None
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return json_error(f"Не удалось создать коллекцию: {e}", 500)
+        raise
+
     if not col and user:
         try:
             col = Collection.query.filter_by(owner_id=user.id, is_private=True).first()
@@ -2670,70 +2788,283 @@ def upload_file():
             col = None
     if not col:
         col = Collection.query.filter_by(slug='base').first() or Collection.query.first()
+
     if col:
         if allowed is not None and col.id not in allowed:
-            allowed = None  # позволяем перейти к проверке права записи
-        if not _has_collection_access(col.id, write=True):
-            abort(403)
+            if not _has_collection_access(col.id, write=True):
+                raise PermissionError('Недостаточно прав для загрузки в коллекцию')
+        else:
+            if not _has_collection_access(col.id, write=True):
+                raise PermissionError('Недостаточно прав для загрузки в коллекцию')
+    return col
 
-    safe_name = secure_filename(file.filename)
+
+def _save_upload_to_disk(file_storage) -> dict:
+    safe_name = secure_filename(file_storage.filename or '')
     ext = Path(safe_name).suffix.lower()
     if ext not in ALLOWED_EXTS:
-        return json_error(f"Недопустимый тип файла: {ext}", 415)
+        raise ValueError(f"Недопустимый тип файла: {ext}")
 
-    base_dir = SCAN_ROOT / IMPORT_SUBDIR if (IMPORT_SUBDIR or '').strip() else SCAN_ROOT
+    scan_root = _scan_root_path()
+    subdir = _import_subdir_value()
+    base_dir = scan_root / subdir if subdir else scan_root
     base_dir.mkdir(parents=True, exist_ok=True)
-    save_path = base_dir / safe_name
-    i = 1
-    orig_name = Path(safe_name).stem
-    while save_path.exists():
-        save_path = base_dir / f"{orig_name}_{i}{ext}"
-        i += 1
-    try:
-        file.save(save_path)
-    except Exception as e:
-        return json_error(f"Не удалось сохранить файл: {e}", 500)
+    target = base_dir / safe_name
+    stem = Path(safe_name).stem
+    counter = 1
+    while target.exists():
+        target = base_dir / f"{stem}_{counter}{ext}"
+        counter += 1
+    file_storage.save(target)
 
     try:
-        rel_path = str(save_path.relative_to(SCAN_ROOT))
+        rel_path = str(target.relative_to(scan_root))
     except Exception:
-        rel_path = save_path.name
+        rel_path = target.name
+
+    stat = target.stat()
+    return {
+        'path': target,
+        'rel_path': rel_path,
+        'ext': ext,
+        'size': stat.st_size,
+        'filename': target.name,
+    }
+
+
+def _build_initial_preview(save_result: dict, collection: Collection | None) -> dict:
+    return {
+        'filename': save_result.get('filename'),
+        'ext': save_result.get('ext'),
+        'size': int(save_result.get('size', 0) or 0),
+        'collection_id': getattr(collection, 'id', None),
+        'collection_name': getattr(collection, 'name', None) if collection else None,
+    }
+
+
+def _guess_language(text: str) -> str | None:
+    if not text:
+        return None
+    cyr = sum(1 for ch in text if 'а' <= ch.lower() <= 'я' or ch.lower() == 'ё')
+    lat = sum(1 for ch in text if 'a' <= ch.lower() <= 'z')
+    total = cyr + lat
+    if total < 20:
+        return None
+    return 'ru' if cyr >= lat else 'en'
+
+
+def _extract_text_sample(path: Path, ext: str, limit: int = 6000) -> str:
+    ext = ext.lower()
+    try:
+        if ext in {'.txt', '.md'}:
+            return path.read_text(encoding='utf-8', errors='ignore')[:limit]
+        if ext == '.pdf':
+            return extract_text_pdf(path, limit_chars=limit)
+        if ext == '.docx':
+            return extract_text_docx(path, limit_chars=limit)
+        if ext == '.rtf':
+            return extract_text_rtf(path, limit_chars=limit)
+        if ext == '.epub':
+            return extract_text_epub(path, limit_chars=limit)
+        if ext == '.djvu':
+            return extract_text_djvu(path, limit_chars=limit)
+    except Exception:
+        return ''
+    return ''
+
+
+def _import_file_record(
+    save_path: Path,
+    rel_path: str,
+    collection: Collection | None,
+    user_id: int | None = None,
+    *,
+    generate_metadata: bool = True,
+) -> dict:
+    ext = save_path.suffix.lower()
+    size = save_path.stat().st_size
+    mtime = save_path.stat().st_mtime
     try:
         sha1 = sha1_of_file(save_path)
     except Exception:
         sha1 = None
 
-    try:
-        fobj = File.query.filter_by(path=str(save_path)).first()
-        if not fobj:
-            fobj = File(
-                path=str(save_path),
-                rel_path=rel_path,
-                filename=Path(save_path).stem,
-                ext=Path(save_path).suffix.lower(),
-                size=save_path.stat().st_size,
-                mtime=save_path.stat().st_mtime,
-                sha1=sha1,
-                collection_id=(col.id if col else None),
-            )
-            db.session.add(fobj)
-        else:
-            if col:
-                fobj.collection_id = col.id
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        return json_error(f"Ошибка записи в базу: {e}", 500)
+    fobj = File.query.filter_by(path=str(save_path)).first()
+    if not fobj:
+        fobj = File(path=str(save_path))
+        db.session.add(fobj)
+
+    fobj.rel_path = rel_path
+    fobj.filename = save_path.stem
+    fobj.ext = ext
+    fobj.size = size
+    fobj.mtime = mtime
+    fobj.sha1 = sha1
+    if collection:
+        fobj.collection_id = collection.id
 
     try:
-        _log_user_action(_load_current_user(), 'file_upload', 'file', fobj.id if fobj else None, detail=json.dumps({'filename': fobj.filename, 'collection_id': fobj.collection_id}))
+        db.session.flush()
+    except Exception as exc:
+        db.session.rollback()
+        raise exc
+
+    text_sample = _extract_text_sample(save_path, ext)
+    if text_sample:
+        fobj.text_excerpt = text_sample[:4000]
+
+    metadata_summary: dict[str, object] | None = None
+    if generate_metadata:
+        metadata = None
+        sample_for_llm = text_sample or ''
+        if not sample_for_llm and ext in AUDIO_EXTS:
+            sample_for_llm = ''
+        if sample_for_llm:
+            try:
+                metadata = call_lmstudio_for_metadata(sample_for_llm[:15000], save_path.name)
+            except Exception as exc:
+                logger.debug('LLM metadata generation failed for %s: %s', save_path.name, exc)
+        if isinstance(metadata, dict) and metadata:
+            metadata_summary = metadata
+            mt_meta = normalize_material_type(metadata.get("material_type"))
+            if ext in AUDIO_EXTS:
+                fobj.material_type = 'audio'
+            elif ext in IMAGE_EXTS:
+                fobj.material_type = 'image'
+            elif TYPE_LLM_OVERRIDE and mt_meta:
+                fobj.material_type = mt_meta
+            title_meta = (metadata.get('title') or '').strip()
+            if title_meta:
+                fobj.title = title_meta
+            author_meta = _normalize_author(metadata.get('author'))
+            if author_meta:
+                fobj.author = author_meta
+            year_meta = _normalize_year(metadata.get('year'))
+            if year_meta:
+                fobj.year = year_meta
+            advisor = metadata.get('advisor')
+            if advisor:
+                advisor_str = str(advisor).strip()
+                if advisor_str:
+                    fobj.advisor = advisor_str
+            kws = metadata.get('keywords') or []
+            if isinstance(kws, list) and kws:
+                fobj.keywords = ", ".join([str(x) for x in kws][:50])
+            try:
+                db.session.flush()
+                if metadata.get('novelty'):
+                    upsert_tag(fobj, 'научная новизна', str(metadata['novelty']))
+                for extra_key in ('literature', 'organizations', 'classification'):
+                    extra_val = metadata.get(extra_key)
+                    if isinstance(extra_val, list) and extra_val:
+                        upsert_tag(fobj, extra_key, "; ".join([str(x) for x in extra_val]))
+            except Exception:
+                db.session.rollback()
+                db.session.add(fobj)
+
+    try:
+        _sync_file_to_fts(fobj)
+    except Exception as exc:
+        logger.debug('FTS sync failed for file %s: %s', getattr(fobj, 'id', None), exc)
+    _invalidate_facets_cache('import')
+    db.session.commit()
+
+    language = _guess_language(fobj.text_excerpt or '') if getattr(fobj, 'text_excerpt', None) else None
+
+    preview = {
+        'filename': save_path.name,
+        'ext': ext,
+        'size': size,
+        'collection_id': getattr(collection, 'id', None),
+        'collection_name': getattr(collection, 'name', None) if collection else None,
+        'title': fobj.title,
+        'author': fobj.author,
+        'material_type': fobj.material_type,
+        'language': language,
+        'text_excerpt': (fobj.text_excerpt or '')[:400],
+    }
+    if metadata_summary:
+        preview['metadata'] = metadata_summary
+
+    return {
+        'file_id': fobj.id,
+        'rel_path': rel_path,
+        'preview': preview,
+    }
+
+
+def _enqueue_import_job(task_id: int, spec: dict, description: str | None = None) -> None:
+    @copy_current_app_context
+    def _runner():
+        _run_import_job(task_id, spec)
+
+    get_task_queue().submit(_runner, description=description or f"import-{spec.get('filename', '')}")
+
+
+def _run_import_job(task_id: int, spec: dict) -> None:
+    task = TaskRecord.query.get(task_id)
+    if not task:
+        return
+    try:
+        task.status = 'running'
+        task.started_at = datetime.utcnow()
+        task.progress = 0.05
+        db.session.commit()
     except Exception:
-        pass
-    return jsonify({
-        "status": "ok",
-        "file_id": fobj.id if fobj else None,
-        "rel_path": rel_path,
-    })
+        db.session.rollback()
+
+    path = Path(spec.get('path'))
+    rel_path = spec.get('rel_path')
+    collection = _get_collection_instance(spec.get('collection_id'))
+    user_id = spec.get('user_id')
+
+    try:
+        if not path.exists():
+            raise FileNotFoundError(f"Файл {path} недоступен")
+        info = _import_file_record(path, rel_path, collection, user_id=user_id, generate_metadata=True)
+        payload = {
+            'kind': 'import_file',
+            'submitted_by': user_id,
+            'collection_id': getattr(collection, 'id', None),
+            'filename': spec.get('filename'),
+            'rel_path': rel_path,
+            'result': info,
+        }
+        task = TaskRecord.query.get(task_id)
+        if task:
+            task.status = 'completed'
+            task.progress = 1.0
+            task.finished_at = datetime.utcnow()
+            task.payload = json.dumps(payload, ensure_ascii=False)
+            db.session.commit()
+        if user_id:
+            try:
+                actor = User.query.get(user_id)
+                if actor:
+                    _log_user_action(actor, 'file_import_async', 'file', info.get('file_id'), detail=json.dumps({'filename': spec.get('filename'), 'collection_id': getattr(collection, 'id', None)}))
+            except Exception:
+                pass
+    except Exception as exc:
+        db.session.rollback()
+        task = TaskRecord.query.get(task_id)
+        if task:
+            task.status = 'error'
+            task.error = str(exc)
+            task.finished_at = datetime.utcnow()
+            payload = {
+                'kind': 'import_file',
+                'submitted_by': user_id,
+                'collection_id': getattr(collection, 'id', None),
+                'filename': spec.get('filename'),
+                'rel_path': rel_path,
+                'error': str(exc),
+            }
+            try:
+                task.payload = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                task.payload = None
+            db.session.commit()
+        app.logger.warning('Import job %s failed: %s', task_id, exc)
 
 # Утилита: безопасная относительная дорожка (для загрузки папок)
 def _sanitize_relpath(p: str) -> str:
@@ -2770,13 +3101,13 @@ def _collection_dir_slug(col: Collection | None) -> str:
 
 
 def _collection_root_dir(col: Collection | None, *, ensure: bool = True) -> Path:
-    root = Path(SCAN_ROOT)
-    if not COLLECTIONS_IN_SEPARATE_DIRS or col is None:
+    root = _scan_root_path()
+    if not _collections_in_separate_dirs() or col is None:
         if ensure:
             root.mkdir(parents=True, exist_ok=True)
         return root
     slug = _collection_dir_slug(col) or f"collection-{col.id or 'unknown'}"
-    target = Path(SCAN_ROOT) / 'collections' / slug
+    target = root / 'collections' / slug
     if ensure:
         target.mkdir(parents=True, exist_ok=True)
     return target
@@ -2784,7 +3115,7 @@ def _collection_root_dir(col: Collection | None, *, ensure: bool = True) -> Path
 
 def _import_base_dir_for_collection(col: Collection | None) -> Path:
     base_root = _collection_root_dir(col)
-    sub = IMPORT_SUBDIR.strip()
+    sub = _import_subdir_value()
     return (base_root / sub) if sub else base_root
 
 @app.route('/import', methods=['GET', 'POST'])
@@ -2794,6 +3125,7 @@ def import_files():
     if not user:
         abort(401)
     is_admin = _user_role(user) == ROLE_ADMIN
+    scan_root = _scan_root_path()
     if request.method == 'GET':
         allowed = getattr(g, 'allowed_collection_ids', set())
         q = Collection.query.order_by(Collection.name.asc())
@@ -2926,7 +3258,7 @@ def import_files():
                     pass
 
             try:
-                relp = str(dest.relative_to(SCAN_ROOT))
+                relp = str(dest.relative_to(scan_root))
             except Exception:
                 relp = dest.name
             fobj = File.query.filter_by(path=str(dest)).first()
@@ -2971,7 +3303,7 @@ def import_files():
             except Exception:
                 pass
         else:
-            paths_for_scan = [str((SCAN_ROOT / p).resolve()) for p in saved_rel_paths]
+            paths_for_scan = [str((scan_root / p).resolve()) for p in saved_rel_paths]
             get_task_queue().submit(
                 _run_scan_with_progress,
                 extract_text,
@@ -3514,7 +3846,7 @@ def transcribe_audio(fp: Path, limit_chars=40000,
 
 def call_lmstudio_summarize(text: str, filename: str) -> str:
     text = (text or "")[: int(os.getenv("SUMMARY_TEXT_LIMIT", "12000"))]
-    text = text[:LM_MAX_INPUT_CHARS]
+    text = text[:_lm_max_input_chars()]
     if not text:
         return ""
     system = PROMPTS.get('summarize_audio_system') or DEFAULT_PROMPTS.get('summarize_audio_system', '')
@@ -3533,8 +3865,9 @@ def call_lmstudio_summarize(text: str, filename: str) -> str:
                 choice,
                 messages,
                 temperature=0.2,
-                max_tokens=min(400, LM_MAX_OUTPUT_TOKENS),
+                max_tokens=min(400, _lm_max_output_tokens()),
                 timeout=120,
+                cache_bucket='summary',
             )
             if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM summary endpoint занята ({label}), переключаемся")
@@ -3545,15 +3878,28 @@ def call_lmstudio_summarize(text: str, filename: str) -> str:
             content = _llm_extract_content(_provider, data)
             if content:
                 return content
+            try:
+                preview = (response.text or '')[:200]
+                app.logger.warning(
+                    "LLM summary empty content (%s, provider=%s): %s",
+                    label,
+                    provider_name,
+                    preview,
+                )
+            except Exception:
+                pass
         except ValueError as ve:
             last_error = ve
             app.logger.warning(f"Суммаризация не удалась ({label}): {ve}")
             continue
         except Exception as e:
             last_error = e
-            app.logger.warning(f"Суммаризация не удалась ({label}, {provider_name}): {e}")
+            if isinstance(e, RuntimeError) and str(e) == 'llm_cache_only_mode':
+                app.logger.info(f"Суммаризация пропущена (режим cache-only, {label})")
+            else:
+                app.logger.warning(f"Суммаризация не удалась ({label}, {provider_name}): {e}")
             continue
-    if last_error and str(last_error) != 'busy':
+    if last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
         app.logger.warning(f"Суммаризация не удалась: {last_error}")
     return ""
 
@@ -3572,8 +3918,9 @@ def call_lmstudio_compose(system: str, user: str, *, temperature: float = 0.2, m
                 choice,
                 messages,
                 temperature=float(temperature),
-                max_tokens=min(int(max_tokens), LM_MAX_OUTPUT_TOKENS),
+                max_tokens=min(int(max_tokens), _lm_max_output_tokens()),
                 timeout=120,
+                cache_bucket='compose',
             )
             if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM compose endpoint занята ({label}), переключаемся")
@@ -3590,8 +3937,11 @@ def call_lmstudio_compose(system: str, user: str, *, temperature: float = 0.2, m
             continue
         except Exception as e:
             last_error = e
-            app.logger.warning(f"LM compose не удался ({label}, {provider_name}): {e}")
-    if last_error and str(last_error) != 'busy':
+            if isinstance(e, RuntimeError) and str(e) == 'llm_cache_only_mode':
+                app.logger.info(f"Compose-запрос пропущен (режим cache-only, {label})")
+            else:
+                app.logger.warning(f"LM compose не удался ({label}, {provider_name}): {e}")
+    if last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
         app.logger.warning(f"LLM compose failed: {last_error}")
     return ""
 def call_lmstudio_keywords(text: str, filename: str):
@@ -3600,7 +3950,7 @@ def call_lmstudio_keywords(text: str, filename: str):
     if not text:
         return []
     text = text[:int(os.getenv("KWS_TEXT_LIMIT", "8000"))]
-    text = text[:LM_MAX_INPUT_CHARS]
+    text = text[:_lm_max_input_chars()]
     is_query = str(filename or '').strip().lower() == 'ai-search'
     if is_query:
         system = PROMPTS.get('ai_search_keywords_system') or DEFAULT_PROMPTS.get('ai_search_keywords_system', '')
@@ -3626,8 +3976,9 @@ def call_lmstudio_keywords(text: str, filename: str):
                 choice,
                 messages,
                 temperature=0.0,
-                max_tokens=min(200, LM_MAX_OUTPUT_TOKENS),
+                max_tokens=min(200, _lm_max_output_tokens()),
                 timeout=90,
+                cache_bucket='keywords_query' if is_query else 'keywords_transcript',
             )
             if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM keywords endpoint занята ({label}), переключаемся")
@@ -3660,8 +4011,11 @@ def call_lmstudio_keywords(text: str, filename: str):
             continue
         except Exception as e:
             last_error = e
-            app.logger.warning(f"Извлечение ключевых слов (LLM) не удалось ({label}, {provider_name}): {e}")
-    if last_error and str(last_error) != 'busy':
+            if isinstance(e, RuntimeError) and str(e) == 'llm_cache_only_mode':
+                app.logger.info(f"Извлечение ключевых слов пропущено (cache-only, {label})")
+            else:
+                app.logger.warning(f"Извлечение ключевых слов (LLM) не удалось ({label}, {provider_name}): {e}")
+    if last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
         app.logger.warning(f"Извлечение ключевых слов (LLM) не удалось: {last_error}")
     return []
 
@@ -3715,7 +4069,7 @@ def call_lmstudio_vision(image_path: Path, filename: str):
     for choice in _llm_iter_choices('vision'):
         label = _llm_choice_label(choice)
         provider = _llm_choice_provider(choice)
-        if provider != 'openai':
+        if provider not in ('openai', 'openrouter', 'azure_openai'):
             app.logger.info(f"LLM vision endpoint пропускается ({label}): провайдер {provider} не поддерживается")
             continue
         messages = [
@@ -3729,6 +4083,7 @@ def call_lmstudio_vision(image_path: Path, filename: str):
                 temperature=0.2,
                 max_tokens=500,
                 timeout=180,
+                cache_bucket='vision',
             )
             if _llm_response_indicates_busy(response):
                 app.logger.info(f"LLM vision endpoint занята ({label}), переключаемся")
@@ -3775,8 +4130,11 @@ def call_lmstudio_vision(image_path: Path, filename: str):
             continue
         except Exception as e:
             last_error = e
-            app.logger.warning(f"Визуальное распознавание не удалось ({label}): {e}")
-    if last_error and str(last_error) != 'busy':
+            if isinstance(e, RuntimeError) and str(e) == 'llm_cache_only_mode':
+                app.logger.info(f"Визуальное распознавание пропущено (cache-only, {label})")
+            else:
+                app.logger.warning(f"Визуальное распознавание не удалось ({label}): {e}")
+    if last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
         app.logger.warning(f"Визуальное распознавание не удалось: {last_error}")
     return {}
 
@@ -3786,7 +4144,7 @@ def call_lmstudio_for_metadata(text: str, filename: str):
     Возвращает dict. Терпимо относится к не-JSON ответам: пытается вытащить из ```json ...``` блока.
     """
     text = (text or "")[: int(os.getenv("LLM_TEXT_LIMIT", "15000"))]
-    text = text[:LM_MAX_INPUT_CHARS]
+    text = text[:_lm_max_input_chars()]
 
     system = PROMPTS.get('metadata_system') or DEFAULT_PROMPTS.get('metadata_system', '')
 
@@ -3810,8 +4168,9 @@ def call_lmstudio_for_metadata(text: str, filename: str):
                     choice,
                     messages,
                     temperature=0.0,
-                    max_tokens=min(800, LM_MAX_OUTPUT_TOKENS),
+                    max_tokens=min(800, _lm_max_output_tokens()),
                     timeout=120,
+                    cache_bucket='metadata',
                 )
                 if _llm_response_indicates_busy(response):
                     app.logger.info(f"LLM metadata endpoint занята ({label}), переключаемся")
@@ -3842,6 +4201,13 @@ def call_lmstudio_for_metadata(text: str, filename: str):
                         app.logger.warning("Не удалось разобрать JSON‑фрагмент из ответа LLM")
                 app.logger.warning(f"LLM вернул не‑JSON контент ({label}, первые 300 символов): {content[:300]}")
                 return {}
+            except RuntimeError as e:
+                last_error = e
+                if str(e) == 'llm_cache_only_mode':
+                    app.logger.info(f"LLM metadata пропущено (cache-only, {label})")
+                else:
+                    app.logger.warning(f"LLM metadata unexpected runtime error ({label}, {provider_name}): {e}")
+                break
             except requests.exceptions.RequestException as e:
                 last_error = e
                 app.logger.warning(f"Исключение при запросе к LLM ({label}, {provider_name}, попытка {attempt}): {e}")
@@ -3872,7 +4238,7 @@ def call_lmstudio_for_metadata(text: str, filename: str):
                 break
         if busy:
             continue
-    if last_error and str(last_error) != 'busy':
+    if last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
         app.logger.warning(f"Метаданные через LLM не получены: {last_error}")
     return {}
 
@@ -3912,6 +4278,10 @@ def _upsert_keyword_tags(file_obj: File):
                 continue
             seen.add(wl)
             upsert_tag(file_obj, 'ключевое слово', w)
+        try:
+            search_service.sync_file(file_obj)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -4725,20 +5095,12 @@ def api_voice_search():
 def api_settings():
     """JSON API для чтения/изменения основных настроек UI/сканирования."""
     _require_admin()
-    global SCAN_ROOT, EXTRACT_TEXT, LMSTUDIO_API_BASE, LMSTUDIO_MODEL, LMSTUDIO_API_KEY, LM_DEFAULT_PROVIDER
-    global TRANSCRIBE_ENABLED, TRANSCRIBE_BACKEND, TRANSCRIBE_MODEL_PATH, TRANSCRIBE_LANGUAGE
-    global SUMMARIZE_AUDIO, AUDIO_KEYWORDS_LLM, IMAGES_VISION_ENABLED
-    global KEYWORDS_TO_TAGS_ENABLED, TYPE_DETECT_FLOW, TYPE_LLM_OVERRIDE
-    global IMPORT_SUBDIR, MOVE_ON_RENAME, TYPE_DIRS, DEFAULT_USE_LLM, DEFAULT_PRUNE
-    global OCR_LANGS_CFG, PDF_OCR_PAGES_CFG, ALWAYS_OCR_FIRST_PAGE_DISSERTATION
-    global PROMPTS, AI_RERANK_LLM, COLLECTIONS_IN_SEPARATE_DIRS, COLLECTION_TYPE_SUBDIRS
-    provider_default = globals().get('LM_DEFAULT_PROVIDER', 'openai')
+    runtime = _rt()
+    provider_default = runtime.lm_default_provider or 'openai'
     if request.method == 'GET':
         _ensure_llm_schema_once()
-        # включаем коллекции для интерфейса React
         try:
             cols = Collection.query.order_by(Collection.name.asc()).all()
-            # количество на коллекцию (все файлы, без фильтра searchable)
             counts = {}
             try:
                 rows = db.session.query(File.collection_id, func.count(File.id)).group_by(File.collection_id).all()
@@ -4780,106 +5142,162 @@ def api_settings():
         except Exception:
             ai_users = []
         return jsonify({
-            'scan_root': str(SCAN_ROOT),
-            'extract_text': bool(EXTRACT_TEXT),
-            'lm_base': LMSTUDIO_API_BASE,
-            'lm_model': LMSTUDIO_MODEL,
-            'lm_key': LMSTUDIO_API_KEY,
+            'scan_root': str(runtime.scan_root),
+            'extract_text': bool(runtime.extract_text),
+            'lm_base': runtime.lmstudio_api_base,
+            'lm_model': runtime.lmstudio_model,
+            'lm_key': runtime.lmstudio_api_key,
             'lm_provider': provider_default,
-            'transcribe_enabled': bool(TRANSCRIBE_ENABLED),
-            'transcribe_backend': TRANSCRIBE_BACKEND,
-            'transcribe_model': TRANSCRIBE_MODEL_PATH,
-            'transcribe_language': TRANSCRIBE_LANGUAGE,
-            'summarize_audio': bool(SUMMARIZE_AUDIO),
-            'audio_keywords_llm': bool(AUDIO_KEYWORDS_LLM),
-            'vision_images': bool(IMAGES_VISION_ENABLED),
-            'kw_to_tags': bool(KEYWORDS_TO_TAGS_ENABLED),
-            'type_detect_flow': TYPE_DETECT_FLOW,
-            'type_llm_override': bool(TYPE_LLM_OVERRIDE),
-            'import_subdir': IMPORT_SUBDIR,
-            'move_on_rename': bool(MOVE_ON_RENAME),
-            'collections_in_dirs': bool(COLLECTIONS_IN_SEPARATE_DIRS),
-            'collection_type_subdirs': bool(COLLECTION_TYPE_SUBDIRS),
-            'type_dirs': TYPE_DIRS,
-            'ocr_langs': OCR_LANGS_CFG,
-            'pdf_ocr_pages': int(PDF_OCR_PAGES_CFG),
-        'prompts': PROMPTS,
-        'prompt_defaults': dict(DEFAULT_PROMPTS),
-            'ai_rerank_llm': bool(AI_RERANK_LLM),
-            'ocr_first_page_dissertation': bool(ALWAYS_OCR_FIRST_PAGE_DISSERTATION),
+            'transcribe_enabled': bool(runtime.transcribe_enabled),
+            'transcribe_backend': runtime.transcribe_backend,
+            'transcribe_model': runtime.transcribe_model_path,
+            'transcribe_language': runtime.transcribe_language,
+            'summarize_audio': bool(runtime.summarize_audio),
+            'audio_keywords_llm': bool(runtime.audio_keywords_llm),
+            'vision_images': bool(runtime.images_vision_enabled),
+            'kw_to_tags': bool(runtime.keywords_to_tags_enabled),
+            'type_detect_flow': runtime.type_detect_flow,
+            'type_llm_override': bool(runtime.type_llm_override),
+            'import_subdir': runtime.import_subdir,
+            'move_on_rename': bool(runtime.move_on_rename),
+            'collections_in_dirs': bool(runtime.collections_in_separate_dirs),
+            'collection_type_subdirs': bool(runtime.collection_type_subdirs),
+            'type_dirs': runtime.type_dirs,
+            'ocr_langs': runtime.ocr_langs_cfg,
+            'pdf_ocr_pages': int(runtime.pdf_ocr_pages_cfg),
+            'prompts': runtime.prompts,
+            'prompt_defaults': dict(DEFAULT_PROMPTS),
+            'ai_rerank_llm': bool(runtime.ai_rerank_llm),
+            'ocr_first_page_dissertation': bool(runtime.always_ocr_first_page_dissertation),
+            'llm_cache_enabled': bool(runtime.llm_cache_enabled),
+            'llm_cache_ttl_seconds': int(runtime.llm_cache_ttl_seconds),
+            'llm_cache_max_items': int(runtime.llm_cache_max_items),
+            'llm_cache_only_mode': bool(runtime.llm_cache_only_mode),
+            'search_cache_enabled': bool(runtime.search_cache_enabled),
+            'search_cache_ttl_seconds': int(runtime.search_cache_ttl_seconds),
+            'search_cache_max_items': int(runtime.search_cache_max_items),
+            'lm_max_input_chars': int(runtime.lm_max_input_chars),
+            'lm_max_output_tokens': int(runtime.lm_max_output_tokens),
+            'azure_openai_api_version': runtime.azure_openai_api_version,
             'collections': collections,
             'llm_endpoints': llm_items,
             'llm_purposes': LLM_PURPOSES,
             'llm_providers': LLM_PROVIDER_OPTIONS,
             'aiword_users': ai_users,
-            'default_use_llm': bool(DEFAULT_USE_LLM),
-            'default_prune': bool(DEFAULT_PRUNE),
+            'default_use_llm': bool(runtime.default_use_llm),
+            'default_prune': bool(runtime.default_prune),
         })
+
     data = request.json or {}
-    prev_base = (LMSTUDIO_API_BASE or '').strip()
-    prev_model = (LMSTUDIO_MODEL or '').strip()
-    prev_key = (LMSTUDIO_API_KEY or '').strip()
-    prev_provider = provider_default
-    SCAN_ROOT = Path(data.get('scan_root') or SCAN_ROOT)
-    app.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
-    EXTRACT_TEXT = bool(data.get('extract_text', EXTRACT_TEXT))
-    LMSTUDIO_API_BASE = (data.get('lm_base') or LMSTUDIO_API_BASE or '').strip()
-    LMSTUDIO_MODEL = (data.get('lm_model') or LMSTUDIO_MODEL or '').strip()
-    LMSTUDIO_API_KEY = (data.get('lm_key') or LMSTUDIO_API_KEY or '').strip()
-    if ((LMSTUDIO_API_BASE or '').strip() != prev_base or
-        (LMSTUDIO_MODEL or '').strip() != prev_model or
-        (LMSTUDIO_API_KEY or '').strip() != prev_key):
+    before = runtime_settings_store.snapshot()
+    update_payload = {}
+
+    def _set(key: str, value):
+        update_payload[key] = value
+
+    if 'scan_root' in data:
+        value = data.get('scan_root') or str(runtime.scan_root)
+        _set('SCAN_ROOT', str(value))
+    if 'extract_text' in data:
+        _set('EXTRACT_TEXT', data.get('extract_text'))
+    if 'lm_base' in data:
+        _set('LMSTUDIO_API_BASE', data.get('lm_base'))
+    if 'lm_model' in data:
+        _set('LMSTUDIO_MODEL', data.get('lm_model'))
+    if 'lm_key' in data:
+        _set('LMSTUDIO_API_KEY', data.get('lm_key'))
+    if 'lm_provider' in data:
+        candidate = (data.get('lm_provider') or '').strip().lower()
+        if candidate not in LLM_PROVIDER_CHOICES:
+            candidate = runtime.lm_default_provider if runtime.lm_default_provider in LLM_PROVIDER_CHOICES else 'openai'
+        _set('LM_DEFAULT_PROVIDER', candidate)
+    if 'transcribe_enabled' in data:
+        _set('TRANSCRIBE_ENABLED', data.get('transcribe_enabled'))
+    if 'transcribe_backend' in data:
+        _set('TRANSCRIBE_BACKEND', data.get('transcribe_backend'))
+    if 'transcribe_model' in data:
+        _set('TRANSCRIBE_MODEL_PATH', data.get('transcribe_model'))
+    if 'transcribe_language' in data:
+        _set('TRANSCRIBE_LANGUAGE', data.get('transcribe_language'))
+    if 'summarize_audio' in data:
+        _set('SUMMARIZE_AUDIO', data.get('summarize_audio'))
+    if 'audio_keywords_llm' in data:
+        _set('AUDIO_KEYWORDS_LLM', data.get('audio_keywords_llm'))
+    if 'vision_images' in data:
+        _set('IMAGES_VISION_ENABLED', data.get('vision_images'))
+    if 'kw_to_tags' in data:
+        _set('KEYWORDS_TO_TAGS_ENABLED', data.get('kw_to_tags'))
+    if 'type_detect_flow' in data:
+        _set('TYPE_DETECT_FLOW', data.get('type_detect_flow'))
+    if 'type_llm_override' in data:
+        _set('TYPE_LLM_OVERRIDE', data.get('type_llm_override'))
+    if 'import_subdir' in data:
+        value = data.get('import_subdir') or runtime.import_subdir
+        _set('IMPORT_SUBDIR', value)
+    if 'move_on_rename' in data:
+        _set('MOVE_ON_RENAME', data.get('move_on_rename'))
+    if 'collections_in_dirs' in data:
+        _set('COLLECTIONS_IN_SEPARATE_DIRS', data.get('collections_in_dirs'))
+    if 'collection_type_subdirs' in data:
+        _set('COLLECTION_TYPE_SUBDIRS', data.get('collection_type_subdirs'))
+    if 'type_dirs' in data and isinstance(data.get('type_dirs'), dict):
+        _set('TYPE_DIRS', data.get('type_dirs'))
+    if 'default_use_llm' in data:
+        _set('DEFAULT_USE_LLM', data.get('default_use_llm'))
+    if 'default_prune' in data:
+        _set('DEFAULT_PRUNE', data.get('default_prune'))
+    if 'ocr_langs' in data:
+        _set('OCR_LANGS_CFG', data.get('ocr_langs'))
+    if 'pdf_ocr_pages' in data:
+        _set('PDF_OCR_PAGES_CFG', data.get('pdf_ocr_pages'))
+    if 'ocr_first_page_dissertation' in data:
+        _set('ALWAYS_OCR_FIRST_PAGE_DISSERTATION', data.get('ocr_first_page_dissertation'))
+    if 'prompts' in data and isinstance(data.get('prompts'), dict):
+        _set('PROMPTS', data.get('prompts'))
+    if 'ai_rerank_llm' in data:
+        _set('AI_RERANK_LLM', data.get('ai_rerank_llm'))
+    if 'llm_cache_enabled' in data:
+        _set('LLM_CACHE_ENABLED', data.get('llm_cache_enabled'))
+    if 'llm_cache_ttl_seconds' in data:
+        _set('LLM_CACHE_TTL_SECONDS', data.get('llm_cache_ttl_seconds'))
+    if 'llm_cache_max_items' in data:
+        _set('LLM_CACHE_MAX_ITEMS', data.get('llm_cache_max_items'))
+    if 'llm_cache_only_mode' in data:
+        _set('LLM_CACHE_ONLY_MODE', data.get('llm_cache_only_mode'))
+    if 'search_cache_enabled' in data:
+        _set('SEARCH_CACHE_ENABLED', data.get('search_cache_enabled'))
+    if 'search_cache_ttl_seconds' in data:
+        _set('SEARCH_CACHE_TTL_SECONDS', data.get('search_cache_ttl_seconds'))
+    if 'search_cache_max_items' in data:
+        _set('SEARCH_CACHE_MAX_ITEMS', data.get('search_cache_max_items'))
+    if 'lm_max_input_chars' in data:
+        _set('LM_MAX_INPUT_CHARS', data.get('lm_max_input_chars'))
+    if 'lm_max_output_tokens' in data:
+        _set('LM_MAX_OUTPUT_TOKENS', data.get('lm_max_output_tokens'))
+    if 'azure_openai_api_version' in data:
+        _set('AZURE_OPENAI_API_VERSION', data.get('azure_openai_api_version'))
+
+    if update_payload:
+        runtime_settings_store.apply_updates(update_payload)
+        _refresh_runtime_globals()
+    after = runtime_settings_store.snapshot()
+    runtime = _rt()
+
+    if any(before.get(key) != after.get(key) for key in ('LMSTUDIO_API_BASE', 'LMSTUDIO_MODEL', 'LMSTUDIO_API_KEY', 'LM_DEFAULT_PROVIDER')):
         _invalidate_llm_cache()
-    provider_candidate = (data.get('lm_provider') or LM_DEFAULT_PROVIDER or '').strip().lower()
-    if provider_candidate in LLM_PROVIDER_CHOICES:
-        LM_DEFAULT_PROVIDER = provider_candidate
-    elif prev_provider in LLM_PROVIDER_CHOICES:
-        LM_DEFAULT_PROVIDER = prev_provider
-    else:
-        LM_DEFAULT_PROVIDER = 'openai'
-    if LM_DEFAULT_PROVIDER != prev_provider:
-        _invalidate_llm_cache()
-    TRANSCRIBE_ENABLED = bool(data.get('transcribe_enabled', TRANSCRIBE_ENABLED))
-    TRANSCRIBE_BACKEND = data.get('transcribe_backend') or TRANSCRIBE_BACKEND
-    TRANSCRIBE_MODEL_PATH = data.get('transcribe_model') or TRANSCRIBE_MODEL_PATH
-    TRANSCRIBE_LANGUAGE = data.get('transcribe_language') or TRANSCRIBE_LANGUAGE
-    SUMMARIZE_AUDIO = bool(data.get('summarize_audio', SUMMARIZE_AUDIO))
-    AUDIO_KEYWORDS_LLM = bool(data.get('audio_keywords_llm', AUDIO_KEYWORDS_LLM))
-    IMAGES_VISION_ENABLED = bool(data.get('vision_images', IMAGES_VISION_ENABLED))
-    KEYWORDS_TO_TAGS_ENABLED = bool(data.get('kw_to_tags', KEYWORDS_TO_TAGS_ENABLED))
-    TYPE_DETECT_FLOW = data.get('type_detect_flow') or TYPE_DETECT_FLOW
-    TYPE_LLM_OVERRIDE = bool(data.get('type_llm_override', TYPE_LLM_OVERRIDE))
-    IMPORT_SUBDIR = data.get('import_subdir') or IMPORT_SUBDIR
-    MOVE_ON_RENAME = bool(data.get('move_on_rename', MOVE_ON_RENAME))
-    COLLECTIONS_IN_SEPARATE_DIRS = bool(data.get('collections_in_dirs', COLLECTIONS_IN_SEPARATE_DIRS))
-    COLLECTION_TYPE_SUBDIRS = bool(data.get('collection_type_subdirs', COLLECTION_TYPE_SUBDIRS))
-    TYPE_DIRS = data.get('type_dirs') or TYPE_DIRS
-    if not COLLECTIONS_IN_SEPARATE_DIRS:
-        COLLECTION_TYPE_SUBDIRS = False
-    DEFAULT_USE_LLM = bool(data.get('default_use_llm', DEFAULT_USE_LLM))
-    DEFAULT_PRUNE = bool(data.get('default_prune', DEFAULT_PRUNE))
-    app.config['UPLOAD_FOLDER'] = str(SCAN_ROOT)
-    app.config['IMPORT_SUBDIR'] = IMPORT_SUBDIR
-    app.config['MOVE_ON_RENAME'] = MOVE_ON_RENAME
-    app.config['COLLECTIONS_IN_SEPARATE_DIRS'] = COLLECTIONS_IN_SEPARATE_DIRS
-    app.config['COLLECTION_TYPE_SUBDIRS'] = COLLECTION_TYPE_SUBDIRS
-    app.config['TYPE_DIRS'] = TYPE_DIRS
-    # Настройки OCR (по возможности подменяем на лету)
-    ocr_langs = data.get('ocr_langs')
-    if ocr_langs is not None:
-        OCR_LANGS_CFG = str(ocr_langs)
-        os.environ['OCR_LANGS'] = OCR_LANGS_CFG
-    try:
-        pdf_pages = int(data.get('pdf_ocr_pages', PDF_OCR_PAGES_CFG))
-        PDF_OCR_PAGES_CFG = pdf_pages
-        os.environ['PDF_OCR_PAGES'] = str(pdf_pages)
-    except Exception:
-        pass
-    try:
-        ALWAYS_OCR_FIRST_PAGE_DISSERTATION = bool(data.get('ocr_first_page_dissertation', ALWAYS_OCR_FIRST_PAGE_DISSERTATION))
-        os.environ['OCR_DISS_FIRST_PAGE'] = '1' if ALWAYS_OCR_FIRST_PAGE_DISSERTATION else '0'
-    except Exception:
-        pass
+
+    configure_llm_cache(
+        enabled=runtime.llm_cache_enabled,
+        max_items=runtime.llm_cache_max_items,
+        ttl_seconds=runtime.llm_cache_ttl_seconds,
+    )
+    configure_search_cache(
+        enabled=runtime.search_cache_enabled,
+        max_items=runtime.search_cache_max_items,
+        ttl_seconds=runtime.search_cache_ttl_seconds,
+    )
+    runtime.apply_to_flask_config(app)
+
     collections_payload = data.get('collections')
     if isinstance(collections_payload, list):
         try:
@@ -4899,19 +5317,7 @@ def api_settings():
         except Exception as exc:
             db.session.rollback()
             app.logger.warning('Не удалось обновить коллекции в настройках: %s', exc)
-    # обновление промптов
-    try:
-        pr = data.get('prompts')
-        if isinstance(pr, dict):
-            for k, v in pr.items():
-                if isinstance(v, str):
-                    PROMPTS[k] = v
-    except Exception:
-        pass
-    try:
-        AI_RERANK_LLM = bool(data.get('ai_rerank_llm', AI_RERANK_LLM))
-    except Exception:
-        pass
+
     aiword_payload = data.get('aiword_users')
     if aiword_payload is not None:
         try:
@@ -4940,65 +5346,9 @@ def api_settings():
                 pass
         except Exception:
             db.session.rollback()
+
     _save_runtime_settings_to_disk()
     return jsonify({'ok': True})
-
-def _facet_key_options(limit: int = 200) -> list[dict]:
-    options: dict[str, dict] = {}
-    try:
-        rows = db.session.query(Tag.key, func.count(Tag.id)) \
-            .group_by(Tag.key) \
-            .order_by(func.count(Tag.id).desc()) \
-            .limit(limit).all()
-    except Exception:
-        rows = []
-    for key, count in rows:
-        skey = str(key or '').strip()
-        if not skey:
-            continue
-        options[skey] = {'key': skey, 'count': int(count or 0), 'samples': []}
-    # Добавляем автора по данным файлов, чтобы всегда был доступен для графа
-    try:
-        author_count = db.session.query(func.count(File.id)) \
-            .filter(File.author.isnot(None)) \
-            .filter(File.author != '') \
-            .scalar()
-    except Exception:
-        author_count = None
-    if 'author' not in options:
-        options['author'] = {'key': 'author', 'count': int(author_count or 0), 'samples': []}
-    try:
-        schema_keys = db.session.query(TagSchema.key).distinct().all()
-    except Exception:
-        schema_keys = []
-    for (schema_key,) in schema_keys:
-        skey = str(schema_key or '').strip()
-        if not skey or skey in options:
-            continue
-        options[skey] = {'key': skey, 'count': 0, 'samples': []}
-    keys = list(options.keys())
-    if keys:
-        try:
-            sample_rows = db.session.query(Tag.key, Tag.value, func.count(Tag.id)) \
-                .filter(Tag.key.in_(keys)) \
-                .group_by(Tag.key, Tag.value) \
-                .order_by(Tag.key.asc(), func.count(Tag.id).desc()) \
-                .limit(max(len(keys) * 6, 120)).all()
-        except Exception:
-            sample_rows = []
-        sample_map: dict[str, list[str]] = {k: [] for k in keys}
-        for key, value, _cnt in sample_rows:
-            skey = str(key or '').strip()
-            sval = str(value or '').strip()
-            if not skey or not sval:
-                continue
-            bucket = sample_map.setdefault(skey, [])
-            if len(bucket) >= 5 or sval in bucket:
-                continue
-            bucket.append(sval)
-        for key, meta in options.items():
-            meta['samples'] = sample_map.get(key, [])
-    return sorted(options.values(), key=lambda item: item['count'], reverse=True)
 
 
 @app.route('/api/facet-config', methods=['GET', 'POST'])
@@ -5009,7 +5359,7 @@ def api_facet_config():
         return {
             'ok': True,
             'config': _facet_config_state(),
-            'options': _facet_key_options()
+            'options': facet_service.key_options()
         }
 
     if request.method == 'GET':
@@ -5027,17 +5377,19 @@ def api_facet_config():
             return cleaned
         return []
 
-    global SEARCH_FACET_TAG_KEYS, GRAPH_FACET_TAG_KEYS, SEARCH_FACET_INCLUDE_TYPES
-    include_types = bool(search_payload.get('include_types', SEARCH_FACET_INCLUDE_TYPES))
+    runtime = _rt()
+    include_types = bool(search_payload.get('include_types', runtime.search_facet_include_types))
     search_keys = _parse_keys(search_payload.get('tag_keys'))
     graph_keys = _parse_keys(graph_payload.get('tag_keys'))
 
-    SEARCH_FACET_INCLUDE_TYPES = include_types
-    SEARCH_FACET_TAG_KEYS = search_keys
-    GRAPH_FACET_TAG_KEYS = graph_keys
-    current_app.config['SEARCH_FACET_INCLUDE_TYPES'] = SEARCH_FACET_INCLUDE_TYPES
-    current_app.config['SEARCH_FACET_TAG_KEYS'] = SEARCH_FACET_TAG_KEYS
-    current_app.config['GRAPH_FACET_TAG_KEYS'] = GRAPH_FACET_TAG_KEYS
+    runtime_settings_store.apply_updates({
+        'SEARCH_FACET_INCLUDE_TYPES': include_types,
+        'SEARCH_FACET_TAG_KEYS': search_keys,
+        'GRAPH_FACET_TAG_KEYS': graph_keys,
+    })
+    _refresh_runtime_globals()
+    runtime = _rt()
+    runtime.apply_to_flask_config(current_app)
     _save_runtime_settings_to_disk()
     try:
         detail = json.dumps({
@@ -5047,6 +5399,7 @@ def api_facet_config():
         _log_user_action(admin, 'facet_config_update', 'facet_config', None, detail)
     except Exception:
         pass
+    facet_service.invalidate('facet_config_update')
     return jsonify(_payload())
 
 
@@ -5067,7 +5420,6 @@ def api_facets():
         allowed_keys_list = None
     else:
         allowed_keys_list = []
-    allowed_keys_set = set(allowed_keys_list or []) if allowed_keys_list is not None else None
     include_types = bool(current_app.config.get('SEARCH_FACET_INCLUDE_TYPES', True)) if context == 'search' else False
 
     year_from = (request.args.get('year_from') or '').strip()
@@ -5077,118 +5429,29 @@ def api_facets():
     collection_filter = _parse_collection_param(request.args.get('collection_id'))
     allowed_scope = _current_allowed_collections()
 
-    def build_payload() -> dict:
-        base_query = _apply_file_access_filter(File.query)
-        try:
-            base_query = base_query.join(Collection, File.collection_id == Collection.id).filter(Collection.searchable == True)
-        except Exception:
-            pass
-        if collection_filter is not None:
-            base_query = base_query.filter(File.collection_id == collection_filter)
-        if material_type:
-            base_query = base_query.filter(File.material_type == material_type)
+    request_args_tuple = tuple(sorted((key, tuple(request.args.getlist(key))) for key in request.args))
+    params = FacetQueryParams(
+        query=q,
+        material_type=material_type,
+        context=context,
+        include_types=include_types,
+        tag_filters=tag_filters,
+        collection_filter=collection_filter,
+        allowed_scope=allowed_scope,
+        allowed_keys_list=allowed_keys_list,
+        year_from=year_from,
+        year_to=year_to,
+        size_min=size_min,
+        size_max=size_max,
+        sources={'tags': True},
+        request_args=request_args_tuple,
+    )
 
-        filtered_query = base_query
-        if q:
-            candidates = _search_candidate_ids(q, limit=6000)
-            if candidates is None:
-                filtered_query = _apply_like_filter(filtered_query, q)
-            elif not candidates:
-                return {
-                    'types': [] if include_types else [],
-                    'tag_facets': {},
-                    'include_types': include_types,
-                    'allowed_keys': allowed_keys_list,
-                    'context': context,
-                }
-            else:
-                filtered_query = filtered_query.filter(File.id.in_(candidates))
-        if year_from:
-            filtered_query = filtered_query.filter(File.year >= year_from)
-        if year_to:
-            filtered_query = filtered_query.filter(File.year <= year_to)
-        if size_min:
-            try:
-                filtered_query = filtered_query.filter(File.size >= int(size_min))
-            except Exception:
-                pass
-        if size_max:
-            try:
-                filtered_query = filtered_query.filter(File.size <= int(size_max))
-            except Exception:
-                pass
-
-        filtered_query = filtered_query.distinct()
-
-        types_facet: list[list] = []
-        if include_types:
-            ids_for_types = filtered_query.with_entities(File.id).subquery()
-            types = db.session.query(File.material_type, func.count(File.id)) \
-                .filter(File.id.in_(ids_for_types)) \
-                .group_by(File.material_type).all()
-            types_facet = [[mt, cnt] for (mt, cnt) in types]
-
-        base_ids_subq = filtered_query.with_entities(File.id).subquery()
-        base_keys = [row[0] for row in db.session.query(Tag.key).filter(Tag.file_id.in_(base_ids_subq)).distinct().all()]
-        selected: dict[str, list[str]] = {}
-        for tf in tag_filters:
-            if '=' in tf:
-                k, v = tf.split('=', 1)
-                selected.setdefault(k, []).append(v)
-                if k not in base_keys:
-                    base_keys.append(k)
-
-        if allowed_keys_set is not None:
-            base_keys = [k for k in base_keys if k in allowed_keys_set or k in selected]
-        for key in selected:
-            if key not in base_keys:
-                base_keys.append(key)
-
-        tag_facets: dict[str, list[list]] = {}
-        for key in base_keys:
-            if allowed_keys_set is not None and key not in allowed_keys_set and key not in selected:
-                continue
-            qk = filtered_query
-            for tf in tag_filters:
-                if '=' not in tf:
-                    continue
-                k, v = tf.split('=', 1)
-                if k == key:
-                    continue
-                tk = aliased(Tag)
-                qk = qk.join(tk, tk.file_id == File.id).filter(and_(tk.key == k, tk.value.ilike(f'%{v}%')))
-            ids_subq = qk.with_entities(File.id).distinct().subquery()
-            rows = db.session.query(Tag.value, func.count(Tag.id)) \
-                .filter(and_(Tag.file_id.in_(ids_subq), Tag.key == key)) \
-                .group_by(Tag.value) \
-                .order_by(func.count(Tag.id).desc()) \
-                .all()
-            tag_facets[key] = [[val, cnt] for (val, cnt) in rows]
-            if key in selected:
-                present_vals = {val for (val, _c) in tag_facets[key]}
-                for v in selected[key]:
-                    if v not in present_vals:
-                        tag_facets[key].append([v, 0])
-
-        return {
-            'types': types_facet,
-            'tag_facets': tag_facets,
-            'include_types': include_types,
-            'allowed_keys': allowed_keys_list,
-            'context': context,
-        }
-
-    cache_key = None
-    if context == 'search':
-        args_tuple = tuple((k, tuple(v)) for k, v in sorted((item for item in request.args.lists() if item[0] != 'commit')))
-        scope_key = None if allowed_scope is None else tuple(sorted(allowed_scope))
-        allowed_key_tuple = None if allowed_keys_list is None else tuple(sorted(allowed_keys_list))
-        cache_key = ('facets-v2', args_tuple, scope_key, include_types, allowed_key_tuple)
-
-    if cache_key is not None:
-        payload = FACET_CACHE.get_or_set(cache_key, build_payload)
-    else:
-        payload = build_payload()
+    payload = facet_service.get_facets(
+        params,
+        search_candidate_fn=_search_candidate_ids,
+        like_filter_fn=_apply_like_filter,
+    )
     return jsonify(payload)
 
     base_query = _apply_file_access_filter(File.query)
@@ -5465,12 +5728,19 @@ def import_db():
 
 
 def _task_to_dict(task: TaskRecord) -> dict:
+    payload_json = {}
+    if task.payload:
+        try:
+            payload_json = json.loads(task.payload)
+        except Exception:
+            payload_json = {}
     return {
         'id': task.id,
         'name': task.name,
         'status': task.status,
         'progress': float(task.progress or 0.0),
         'payload': task.payload,
+        'payload_json': payload_json,
         'created_at': task.created_at.isoformat() if task.created_at else None,
         'started_at': task.started_at.isoformat() if task.started_at else None,
         'finished_at': task.finished_at.isoformat() if task.finished_at else None,
@@ -5828,7 +6098,7 @@ def api_admin_llm_endpoints():
                 'weight': float(ep.weight or 0.0),
                 'purpose': ep.purpose,
                 'purposes': _llm_parse_purposes(ep.purpose),
-                'provider': (ep.provider or LM_DEFAULT_PROVIDER),
+                'provider': (ep.provider or _rt().lm_default_provider),
                 'created_at': ep.created_at.isoformat() if ep.created_at else None,
             }
             for ep in eps
@@ -5837,7 +6107,7 @@ def api_admin_llm_endpoints():
     name = (data.get('name') or '').strip()
     base_url = (data.get('base_url') or '').strip()
     model = (data.get('model') or '').strip()
-    provider = (data.get('provider') or LM_DEFAULT_PROVIDER).strip().lower()
+    provider = (data.get('provider') or _rt().lm_default_provider or 'openai').strip().lower()
     if provider not in LLM_PROVIDER_CHOICES:
         return jsonify({'ok': False, 'error': 'некорректный провайдер LLM'}), 400
     if not name or not base_url or not model:
@@ -6030,7 +6300,7 @@ def diag_transcribe():
         if q_path:
             pp = Path(q_path)
             if not pp.is_absolute():
-                root = Path(SCAN_ROOT)
+                root = _scan_root_path()
                 # Пробуем типовые варианты, чтобы избежать дублирования корневой папки в пути
                 candidates = [
                     root / q_path,
@@ -6447,12 +6717,10 @@ def init_db():
 from routes import routes
 app.register_blueprint(routes)
 
-with app.app_context():
-    _ensure_search_support()
-    _reset_inflight_tasks()
-
 app.config['invalidate_facets'] = _invalidate_facets_cache
 app.config['facet_cache'] = FACET_CACHE
+app.config['facet_service'] = facet_service
+app.config['search_service'] = search_service
 
 # ------------------- Single-file Refresh API -------------------
 @app.route("/api/files/<int:file_id>/refresh", methods=["POST"])
@@ -6529,7 +6797,10 @@ def api_file_refresh(file_id):
         text_excerpt = ""
         _log(f"extract: start for {p.name}")
         if ext == ".pdf":
-            force = ALWAYS_OCR_FIRST_PAGE_DISSERTATION and (((f.material_type or '').lower() in ('dissertation','dissertation_abstract')) or looks_like_dissertation_filename(filename))
+            force = _always_ocr_first_page_dissertation() and (
+                ((f.material_type or '').lower() in ('dissertation', 'dissertation_abstract'))
+                or looks_like_dissertation_filename(filename)
+            )
             text_excerpt = extract_text_pdf(p, limit_chars=40000, force_ocr_first_page=force)
         elif ext == ".docx":
             text_excerpt = extract_text_docx(p, limit_chars=40000)
@@ -6891,7 +7162,7 @@ def _determine_target_dir_for_file(file_obj: File, current_path: Path, material_
             return base_root / fallback_sub
         return base_root
     if MOVE_ON_RENAME:
-        return Path(SCAN_ROOT) / fallback_sub
+            return _scan_root_path() / fallback_sub
     return current_path.parent
 
 
@@ -6922,7 +7193,7 @@ def _rename_file_record(file_obj: File, base_name: str | None = None) -> Path:
                 pass
     file_obj.path = str(p_new)
     try:
-        file_obj.rel_path = str(p_new.relative_to(Path(SCAN_ROOT)))
+        file_obj.rel_path = str(p_new.relative_to(_scan_root_path()))
     except Exception:
         file_obj.rel_path = p_new.name
     file_obj.filename = p_new.stem
@@ -7247,7 +7518,7 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 "history": [],
             })
             _scan_log("Начало сканирования")
-            root = Path(SCAN_ROOT)
+            root = _scan_root_path()
             # определяем набор для сканирования: явные цели или полный корневой обход
             if targets:
                 try:
@@ -7483,7 +7754,14 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                     if not llm_text and ext in {'.pdf','.docx','.rtf','.epub','.djvu'}:
                         try:
                             if ext == '.pdf':
-                                llm_text = extract_text_pdf(path, limit_chars=12000, force_ocr_first_page=(ALWAYS_OCR_FIRST_PAGE_DISSERTATION and looks_like_dissertation_filename(filename)))
+                                llm_text = extract_text_pdf(
+                                    path,
+                                    limit_chars=12000,
+                                    force_ocr_first_page=(
+                                        _always_ocr_first_page_dissertation()
+                                        and looks_like_dissertation_filename(filename)
+                                    ),
+                                )
                             elif ext == '.docx':
                                 llm_text = extract_text_docx(path, limit_chars=12000)
                             elif ext == '.rtf':
@@ -7724,7 +8002,7 @@ def scan_collection(collection_id: int):
             fallback = None
             if file_obj.rel_path:
                 try:
-                    fallback = (Path(SCAN_ROOT) / Path(file_obj.rel_path)).resolve()
+                    fallback = (_scan_root_path() / Path(file_obj.rel_path)).resolve()
                 except Exception:
                     fallback = None
             if fallback and fallback.exists():
@@ -8746,7 +9024,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 snippet_text = ""
                 error_logged = False
                 try:
-                    snippet_text = (call_lmstudio_compose(system, user_msg, temperature=0.0, max_tokens=min(180, LM_MAX_OUTPUT_TOKENS)) or '').strip()
+                    snippet_text = (call_lmstudio_compose(system, user_msg, temperature=0.0, max_tokens=min(180, _lm_max_output_tokens())) or '').strip()
                 except Exception as exc:
                     error_logged = True
                     progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — ошибка: {exc}")
@@ -8781,7 +9059,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 "Ссылайся на источники квадратными скобками [n] там, где берешь факт. Не упоминай слова 'стенограмма' или подобные."
             )
             user_msg = f"Вопрос: {query}\nФрагменты:\n" + "\n".join(lines)
-            answer = (call_lmstudio_compose(system, user_msg, temperature=0.1, max_tokens=min(350, LM_MAX_OUTPUT_TOKENS)) or "").strip()
+            answer = (call_lmstudio_compose(system, user_msg, temperature=0.1, max_tokens=min(350, _lm_max_output_tokens())) or "").strip()
             if answer:
                 progress.add(f"LLM ответ готов ({len(answer)} символов)")
             else:
@@ -8795,7 +9073,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
             stage_start = time.monotonic()
 
     # Необязательно: лёгкое реранжирование топ-15 через LLM с контекстом сниппетов
-    if AI_RERANK_LLM and results:
+    if _rt().ai_rerank_llm and results:
         try:
             top = results[:15]
             prompt_lines = [f"[{i+1}] id={it['file_id']} :: { (it.get('snippets') or [''])[0] }" for i, it in enumerate(top)]
@@ -8845,9 +9123,12 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                         break
                 except Exception as e:
                     last_error = e
-                    app.logger.warning(f"LLM rerank failed ({label}): {e}")
+                    if isinstance(e, RuntimeError) and str(e) == 'llm_cache_only_mode':
+                        app.logger.info(f"LLM rerank пропущен (cache-only, {label})")
+                    else:
+                        app.logger.warning(f"LLM rerank failed ({label}): {e}")
                     continue
-            if order is None and last_error and str(last_error) != 'busy':
+            if order is None and last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
                 app.logger.warning(f"LLM rerank failed: {last_error}")
             if isinstance(order, list) and all(isinstance(x, int) for x in order):
                 pos = {int(fid): i for i, fid in enumerate(order)}
@@ -9421,7 +9702,7 @@ def _ensure_background_jobs_started():
 if __name__ == "__main__":
     setup_app()
     with app.app_context():
-        db.create_all()
         ensure_collections_schema()
         ensure_llm_schema()
+        ensure_default_admin()
     app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False, threaded=True)

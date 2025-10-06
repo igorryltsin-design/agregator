@@ -2,15 +2,19 @@ import React, { useEffect, useState } from 'react'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
 
+type RoleId = 'admin' | 'editor' | 'viewer'
+
 type UserRow = {
   id: number
   username: string
-  role: 'admin' | 'user'
+  role: RoleId
   full_name?: string | null
   created_at?: string | null
 }
 
-type UserForm = { username: string; full_name: string; password: string; role: 'admin' | 'user' }
+type UserForm = { username: string; full_name: string; password: string; role: RoleId }
+
+type RoleOption = { id: RoleId; label: string }
 
 export default function UsersPage(){
   const { user } = useAuth()
@@ -19,15 +23,20 @@ export default function UsersPage(){
   const [rows, setRows] = useState<UserRow[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [form, setForm] = useState<UserForm>({ username: '', full_name: '', password: '', role: 'user' })
+  const [form, setForm] = useState<UserForm>({ username: '', full_name: '', password: '', role: 'editor' })
   const [saving, setSaving] = useState(false)
+  const [roleOptions, setRoleOptions] = useState<RoleOption[]>([
+    { id: 'admin', label: 'Администратор' },
+    { id: 'editor', label: 'Редактор' },
+    { id: 'viewer', label: 'Наблюдатель' },
+  ])
 
   const load = async () => {
     if (!isAdmin) return
     setLoading(true)
     setError('')
     try {
-      const r = await fetch('/api/admin/users')
+      const r = await fetch('/api/users')
       if (r.status === 403) {
         setError('Недостаточно прав для просмотра пользователей')
         setRows([])
@@ -49,6 +58,29 @@ export default function UsersPage(){
   }
 
   useEffect(() => { load() }, [isAdmin])
+  useEffect(() => {
+    if (!roleOptions.some(opt => opt.id === form.role)) {
+      setForm(prev => ({ ...prev, role: roleOptions[0]?.id ?? 'editor' }))
+    }
+  }, [roleOptions, form.role])
+  useEffect(() => {
+    if (!isAdmin) return
+    (async () => {
+      try {
+        const r = await fetch('/api/users/roles')
+        if (!r.ok) return
+        const data = await r.json().catch(() => ({}))
+        if (Array.isArray(data?.roles)) {
+          const opts: RoleOption[] = data.roles
+            .map((item: any) => ({ id: item.id as RoleId, label: item.label || item.id }))
+            .filter(opt => opt.id)
+          if (opts.length) setRoleOptions(opts)
+        }
+      } catch {
+        /* noop */
+      }
+    })()
+  }, [isAdmin])
 
   if (!isAdmin) {
     return <div className="card p-3">Недостаточно прав.</div>
@@ -67,7 +99,7 @@ export default function UsersPage(){
     setSaving(true)
     setError('')
     try {
-      const r = await fetch('/api/admin/users', {
+      const r = await fetch('/api/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: form.username.trim(), full_name: form.full_name.trim(), password: form.password, role: form.role }),
@@ -75,7 +107,7 @@ export default function UsersPage(){
       const data = await r.json().catch(() => ({}))
       if (r.ok && data?.ok && data.user) {
         setRows(prev => [...prev, data.user])
-        setForm({ username: '', full_name: '', password: '', role: 'user' })
+        setForm({ username: '', full_name: '', password: '', role: roleOptions[0]?.id ?? 'editor' })
         toasts.push('Пользователь создан', 'success')
       } else {
         setError(data?.error || 'Не удалось создать пользователя')
@@ -87,9 +119,9 @@ export default function UsersPage(){
     }
   }
 
-  const changeRole = async (id: number, role: 'admin' | 'user') => {
+  const changeRole = async (id: number, role: RoleId) => {
     try {
-      const r = await fetch(`/api/admin/users/${id}`, {
+      const r = await fetch(`/api/users/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ role }),
@@ -114,7 +146,7 @@ export default function UsersPage(){
       return
     }
     try {
-      const r = await fetch(`/api/admin/users/${id}`, {
+      const r = await fetch(`/api/users/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: pw }),
@@ -133,7 +165,7 @@ export default function UsersPage(){
   const removeUser = async (id: number, username: string) => {
     if (!confirm(`Удалить пользователя ${username}?`)) return
     try {
-      const r = await fetch(`/api/admin/users/${id}`, { method: 'DELETE' })
+      const r = await fetch(`/api/users/${id}`, { method: 'DELETE' })
       if (r.ok) {
         setRows(prev => prev.filter(u => u.id !== id))
         toasts.push('Пользователь удалён', 'success')
@@ -165,9 +197,10 @@ export default function UsersPage(){
           </div>
           <div className="col-6 col-lg-2">
             <label className="form-label">Роль</label>
-            <select className="form-select" value={form.role} onChange={e=>setForm({...form, role: e.target.value as 'admin' | 'user'})}>
-              <option value="user">Пользователь</option>
-              <option value="admin">Администратор</option>
+            <select className="form-select" value={form.role} onChange={e=>setForm({...form, role: e.target.value as RoleId})}>
+              {roleOptions.map(opt => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
             </select>
           </div>
           <div className="col-6 col-lg-auto d-grid">
@@ -198,9 +231,15 @@ export default function UsersPage(){
                     <td>{u.username}</td>
                     <td>{u.full_name || '—'}</td>
                     <td>
-                      <select className="form-select form-select-sm" value={u.role} onChange={e=>changeRole(u.id, e.target.value as 'admin' | 'user')} disabled={u.id === user.id}>
-                        <option value="user">Пользователь</option>
-                        <option value="admin">Администратор</option>
+                      <select
+                        className="form-select form-select-sm"
+                        value={u.role}
+                        onChange={e=>changeRole(u.id, e.target.value as RoleId)}
+                        disabled={u.id === user.id}
+                      >
+                        {roleOptions.map(opt => (
+                          <option key={opt.id} value={opt.id}>{opt.label}</option>
+                        ))}
                       </select>
                     </td>
                     <td>{u.created_at ? new Date(u.created_at).toLocaleString() : '—'}</td>

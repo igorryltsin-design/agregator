@@ -92,7 +92,7 @@ export default function ProfilePage(){
           <div className="card p-3 h-100">
             <div className="fw-semibold mb-2">Учётная запись</div>
             <div className="mb-1"><span className="text-muted">Логин:</span> {user.username}</div>
-            <div className="mb-1"><span className="text-muted">Роль:</span> {user.role === 'admin' ? 'Администратор' : 'Пользователь'}</div>
+            <div className="mb-1"><span className="text-muted">Роль:</span> {user.role === 'admin' ? 'Администратор' : user.role === 'editor' ? 'Редактор' : 'Наблюдатель'}</div>
             <div className="mb-3"><span className="text-muted">Создан:</span> {created}</div>
             <div className="mb-3">
               <label className="form-label">ФИО</label>
