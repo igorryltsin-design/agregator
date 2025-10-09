@@ -20,6 +20,7 @@ export default function GraphPage() {
   const [limit, setLimit] = useState(600)
   const [hideSingletons, setHideSingletons] = useState(true)
   const [selection, setSelection] = useState<{id:string,label:string,type:string,degree:number}|null>(null)
+  const [hasGraphData, setHasGraphData] = useState(false)
   const [search, setSearch] = useState('')
   const [smartSearch, setSmartSearch] = useState(true)
   const [yearFrom, setYearFrom] = useState('')
@@ -37,6 +38,7 @@ export default function GraphPage() {
     const run = async () => {
       setLoading(true)
       setError(null)
+      setHasGraphData(false)
       try {
         const qs = new URLSearchParams()
         qs.set('keys', keys.join(','))
@@ -58,6 +60,7 @@ export default function GraphPage() {
           nodesFiltered = nodesFiltered.filter(n => (n.label||'').toLowerCase().includes(s))
         }
         const nodes = new DataSet(nodesFiltered.map(n => ({ ...n, color: (n as any).type?.startsWith('tag:') ? '#1f6feb' : '#2ea043' })))
+        setHasGraphData(nodesFiltered.length > 0)
         const nodeSet = new Set(nodes.getIds() as string[])
         const edges = new DataSet(data.edges.filter(e => nodeSet.has(e.from) && nodeSet.has(e.to)).map(e => ({ ...e, arrows: 'to', color: '#8b949e' })))
         const network = new Network(containerRef.current as HTMLDivElement, { nodes, edges }, {
@@ -211,11 +214,24 @@ export default function GraphPage() {
       </div>
       <div className="col-12 col-lg-9">
         {view === 'graph' && (
-          <div className="card p-3">
+          <div className="card p-3 position-relative">
             <div className="fw-semibold mb-2">Граф (файл → теги: {selectedKeyLabels.join(', ') || '—'})</div>
-            {loading && <div>Загрузка…</div>}
-            {error && <div className="text-danger">{error}</div>}
-            <div ref={containerRef} style={{ height: '80vh', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 6 }} />
+            {error && <div className="text-danger mb-2">{error}</div>}
+            {!loading && !error && !hasGraphData && (
+              <div className="text-secondary mb-2">Нет связей для выбранных параметров. Попробуйте добавить больше тегов или снизить фильтры.</div>
+            )}
+            <div
+              ref={containerRef}
+              style={{ height: '80vh', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 6, opacity: loading ? 0 : 1, transition: 'opacity 0.2s ease' }}
+              aria-hidden={loading}
+            />
+            {loading && (
+              <div
+                className="skeleton"
+                style={{ position: 'absolute', inset: 16, borderRadius: 12 }}
+                aria-label="Загружаем граф"
+              />
+            )}
           </div>
         )}
         {selection && (

@@ -3,6 +3,7 @@ import { Link, Outlet, useLocation, useNavigate, useSearchParams } from 'react-r
 import { useToasts } from '../ui/Toasts'
 import { useAuth } from '../ui/Auth'
 import VoiceSearchButton from '../ui/VoiceSearchButton'
+import ProgressPanel, { ProgressBullet } from '../ui/ProgressPanel'
 import agregatorLogo from '../../logo/agregator.png'
 import aiWordLogo from '../../logo/AIWord.png'
 
@@ -25,6 +26,42 @@ export default function App() {
   const [scanMin, setScanMin] = useState(false)
   const [scanRunning, setScanRunning] = useState(false)
   const [scanStat, setScanStat] = useState<any>(null)
+  const scanMetrics = useMemo(() => {
+    if (!scanStat) return null
+    const processed = Number(scanStat.processed || 0)
+    const total = Number(scanStat.total || 0)
+    const added = Number(scanStat.added || 0)
+    const updated = Number(scanStat.updated || 0)
+    const current = scanStat.current ? String(scanStat.current) : ''
+    const etaSeconds = Number(scanStat.eta_seconds || 0)
+    const percent = total > 0 ? Math.min(100, Math.round((processed * 100) / total)) : 0
+    const fmt = (s: number) => {
+      const hh = Math.floor(s / 3600)
+      const mm = Math.floor((s % 3600) / 60)
+      const ss = Math.floor(s % 60)
+      return `${hh.toString().padStart(2, '0')}:${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`
+    }
+    const etaText = etaSeconds > 0 ? `, ETA: ${fmt(etaSeconds)}` : ''
+    return {
+      percent,
+      summary: total > 0 ? `Обработано ${processed}/${total} (${percent}%)` : 'Прогресс недоступен',
+      detail: `Добавлено ${added}, обновлено ${updated}${etaText}`,
+      current,
+    }
+  }, [scanStat])
+  const scanScopeCaption = useMemo(() => {
+    if (!scanStat?.scope?.label) return undefined
+    const count = typeof scanStat.scope.count === 'number' ? ` · файлов: ${scanStat.scope.count}` : ''
+    return `Область: ${scanStat.scope.label}${count}`
+  }, [scanStat])
+  const scanBullets = useMemo<ProgressBullet[]>(() => {
+    if (!scanMetrics) return []
+    const items: ProgressBullet[] = [{ id: 'detail', text: scanMetrics.detail }]
+    if (scanMetrics.current) {
+      items.push({ id: 'current', text: `Текущий файл: ${scanMetrics.current}` })
+    }
+    return items
+  }, [scanMetrics])
   const [showHelp, setShowHelp] = useState(false)
   const toasts = useToasts()
   const isAdmin = user?.role === 'admin'
@@ -237,7 +274,7 @@ export default function App() {
               type="button"
               onClick={() => commitSearch(searchDraft, true)}
               aria-label="Выполнить поиск"
-              title="Выполнить поиск"
+              data-tooltip="Выполнить поиск"
             >
               <span className="icon-glyph" aria-hidden="true">🔍</span>
             </button>
@@ -249,7 +286,7 @@ export default function App() {
               type="button"
               onClick={() => setShowHelp(true)}
               aria-label="Справка по Agregator"
-              title="Справка по Agregator"
+              data-tooltip="Справка"
             >
               <span className="icon-glyph" aria-hidden="true">❔</span>
             </button>
@@ -258,18 +295,18 @@ export default function App() {
               type="button"
               onClick={()=> setTheme(t => t==='dark'?'light':'dark')}
               aria-label="Переключить тему"
-              title="Переключить тему"
+              data-tooltip={theme==='dark' ? 'Светлая тема' : 'Тёмная тема'}
             >
               <span className="icon-glyph" aria-hidden="true">{theme==='dark'?'🌙':'☀️'}</span>
             </button>
-            <Link className={iconButtonClass} to="graph" aria-label="Граф" title="Граф">
+            <Link className={iconButtonClass} to="graph" aria-label="Граф" data-tooltip="Граф">
               <span className="icon-glyph" aria-hidden="true">🕸️</span>
             </Link>
-            <Link className={iconButtonClass} to="stats" aria-label="Статистика" title="Статистика">
+            <Link className={iconButtonClass} to="stats" aria-label="Статистика" data-tooltip="Статистика">
               <span className="icon-glyph" aria-hidden="true">📊</span>
             </Link>
             {canImport && (
-              <Link className={iconButtonClass} to="ingest" aria-label="Импорт" title="Импорт">
+              <Link className={iconButtonClass} to="ingest" aria-label="Импорт" data-tooltip="Импорт">
                 <span className="icon-glyph" aria-hidden="true">📥</span>
               </Link>
             )}
@@ -295,11 +332,11 @@ export default function App() {
                 )}
               </div>
             )}
-            <Link className={iconButtonClass} to="profile" aria-label="Профиль" title="Профиль">
+            <Link className={iconButtonClass} to="profile" aria-label="Профиль" data-tooltip="Профиль">
               <span className="icon-glyph" aria-hidden="true">👤</span>
             </Link>
             <span className="badge bg-secondary text-uppercase" style={{ letterSpacing: 0.3 }}>{user.role === 'admin' ? 'Админ' : 'Пользователь'}</span>
-            <button className={iconButtonClass} type="button" onClick={handleLogout} aria-label="Выйти" title="Выйти">
+            <button className={iconButtonClass} type="button" onClick={handleLogout} aria-label="Выйти" data-tooltip="Выйти">
               <span className="icon-glyph" aria-hidden="true">🚪</span>
             </button>
             {canUseAiword && (
@@ -309,6 +346,7 @@ export default function App() {
                 target="_blank"
                 rel="noopener"
                 aria-label="AIWord"
+                data-tooltip="AIWord"
               >
                 <span className="aiword-logo-badge aiword-logo-badge--nav">
                   <img src={aiWordLogo} alt="AIWord" />
@@ -421,59 +459,42 @@ export default function App() {
       </div>
 
       {scanOpen && (
-        <div role="dialog" aria-modal="false" style={{position:'fixed', right:16, bottom:16, width: scanMin? 320 : 420, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:12, boxShadow:'var(--card-shadow)', overflow:'hidden', zIndex:1600}}>
-          <div className="d-flex align-items-center justify-content-between" style={{padding:'8px 12px', borderBottom:'1px solid var(--border)'}}>
-            <div className="d-grid">
-              <div>{scanRunning ? 'Сканирование…' : 'Сканер остановлен'}</div>
-              {scanStat?.scope?.label && (
-                <div className="muted" style={{fontSize:12}}>
-                  Область: {scanStat.scope.label}{typeof scanStat.scope.count === 'number' ? ` · файлов: ${scanStat.scope.count}` : ''}
+        <div role="dialog" aria-modal="false" style={{ position: 'fixed', right: 16, bottom: 16, width: scanMin ? 320 : 420, zIndex: 1600 }}>
+          {scanMin ? (
+            <div className="card p-3" style={{ boxShadow: 'var(--card-shadow)' }}>
+              <div className="d-flex align-items-start justify-content-between gap-3">
+                <div className="d-grid gap-1">
+                  <div>{scanRunning ? 'Сканирование…' : 'Сканер остановлен'}</div>
+                  {scanScopeCaption && <div className="muted" style={{ fontSize: 12 }}>{scanScopeCaption}</div>}
+                  {scanMetrics && <div className="muted" style={{ fontSize: 12 }}>{scanMetrics.summary}</div>}
                 </div>
-              )}
-              {scanStat && (
-                <div className="muted" style={{fontSize:12}}>
-                  {(() => {
-                    const p = Number(scanStat.processed||0)
-                    const t = Number(scanStat.total||0)
-                    const a = Number(scanStat.added||0)
-                    const u = Number(scanStat.updated||0)
-                    const cur = scanStat.current || ''
-                    const eta = Number(scanStat.eta_seconds||0)
-                    const pct = t>0 ? Math.min(100, Math.round(p*100/t)) : 0
-                    const fmt = (s: number) => {
-                      const hh = Math.floor(s/3600)
-                      const mm = Math.floor((s%3600)/60)
-                      const ss = Math.floor(s%60)
-                      return `${hh.toString().padStart(2,'0')}:${mm.toString().padStart(2,'0')}:${ss.toString().padStart(2,'0')}`
-                    }
-                    return `Прогресс: ${p}/${t} (${pct}%), добавлено ${a}, обновлено ${u}${cur? `, текущий: ${cur}` : ''}${eta? `, ETA: ${fmt(eta)}` : ''}`
-                  })()}
+                <div className="btn-group btn-group-sm">
+                  <button className="btn btn-outline-secondary" onClick={() => setScanMin(false)}>Развернуть</button>
+                  <button className="btn btn-outline-secondary" onClick={() => setScanOpen(false)}>Закрыть</button>
                 </div>
-              )}
-            </div>
-            <div className="btn-group">
-              <button className="btn btn-sm btn-outline-secondary" onClick={()=>setScanMin(v=>!v)}>{scanMin? 'Развернуть':'Свернуть'}</button>
-              <button className="btn btn-sm btn-outline-secondary" onClick={()=>setScanOpen(false)}>Закрыть</button>
-            </div>
-          </div>
-          {scanStat && !scanMin && (
-            <div style={{padding:'12px'}}>
-              <div style={{height:6, background:'var(--border)', borderRadius:6, overflow:'hidden', marginBottom:8}}>
-                {(() => {
-                  const p = Number(scanStat.processed||0)
-                  const t = Number(scanStat.total||0)
-                  const pct = t>0 ? Math.min(100, Math.round(p*100/t)) : 0
-                  return <div style={{width:`${pct}%`, height:'100%', background:'var(--accent)'}} />
-                })()}
               </div>
-              {scanStat?.current && <div className="muted" style={{fontSize:12}}>Текущий файл: {scanStat.current}</div>}
             </div>
-          )}
-          {!scanMin && isAdmin && (
-            <div className="d-flex gap-2" style={{padding:'0 12px 12px 12px'}}>
-              <button className="btn btn-sm btn-outline-secondary" disabled={scanRunning} onClick={startScan}>Запустить</button>
-              <button className="btn btn-sm btn-outline-secondary" disabled={!scanRunning} onClick={cancelScan}>Остановить</button>
-            </div>
+          ) : (
+            <ProgressPanel
+              title={scanRunning ? 'Сканирование…' : 'Сканер остановлен'}
+              caption={scanScopeCaption}
+              progress={scanMetrics ? { percent: scanMetrics.percent, label: scanMetrics.summary } : undefined}
+              bullets={scanBullets}
+              footer={isAdmin ? (
+                <div className="d-flex gap-2">
+                  <button className="btn btn-sm btn-outline-secondary" disabled={scanRunning} onClick={startScan}>Запустить</button>
+                  <button className="btn btn-sm btn-outline-secondary" disabled={!scanRunning} onClick={cancelScan}>Остановить</button>
+                </div>
+              ) : undefined}
+              actions={
+                <div className="btn-group btn-group-sm">
+                  <button className="btn btn-outline-secondary" onClick={() => setScanMin(true)}>Свернуть</button>
+                  <button className="btn btn-outline-secondary" onClick={() => setScanOpen(false)}>Закрыть</button>
+                </div>
+              }
+              className="mb-0"
+              style={{ boxShadow: 'var(--card-shadow)' }}
+            />
           )}
         </div>
       )}

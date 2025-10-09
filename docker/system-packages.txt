@@ -1,0 +1,5 @@
+tesseract-ocr
+tesseract-ocr-rus
+ffmpeg
+libmagic1
+curl

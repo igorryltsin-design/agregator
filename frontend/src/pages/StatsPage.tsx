@@ -385,7 +385,7 @@ export default function StatsPage(){
         </div>
       )}
       {error && <div className="text-danger">{error}</div>}
-      {!loading && data && (
+      {!loading && data && data.total_files > 0 && (
         <>
           <div className="row g-3">
             <div className="col-6 col-xl-3">
@@ -605,6 +605,11 @@ export default function StatsPage(){
             </div>
           </div>
         </>
+      )}
+      {!loading && data && data.total_files === 0 && (
+        <div className="mt-3 text-center text-secondary">
+          Нет данных для отображения. Добавьте файлы в каталог, чтобы увидеть статистику.
+        </div>
       )}
     </div>
   )

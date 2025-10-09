@@ -116,10 +116,13 @@ a:hover, a:focus { color: var(--primary); }
   top: 0;
   z-index: 1200;
   transition: background 0.3s ease, border-color 0.3s ease;
+  overflow: visible;
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
 }
 
 .btn.icon-only {
-  padding: 0.35rem 0.55rem;
+  padding: 0.25rem 0.45rem;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -130,8 +133,8 @@ a:hover, a:focus { color: var(--primary); }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 1.2rem;
-  font-size: 1.15rem;
+  min-width: 1.05rem;
+  font-size: 1.05rem;
   line-height: 1;
 }
 
@@ -785,6 +788,53 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 
 /* Skeleton shimmer */
 .skeleton { position: relative; overflow: hidden; background: linear-gradient(90deg, rgba(255,255,255,.06), rgba(255,255,255,.14), rgba(255,255,255,.06)); background-size: 200% 100%; animation: shimmer 1.2s linear infinite; border-radius: 12px; }
+
+[data-tooltip] { position: relative; }
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--surface-raised);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-shadow: var(--card-shadow);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  z-index: 2100;
+}
+[data-tooltip]::before {
+  content: '';
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border-width: 6px;
+  border-style: solid;
+  border-color: transparent transparent var(--surface-raised) transparent;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+  z-index: 2100;
+}
+[data-tooltip]:hover::after,
+[data-tooltip]:hover::before,
+[data-tooltip]:focus-visible::after,
+[data-tooltip]:focus-visible::before { opacity: 1; }
+
+.progress-panel .progress {
+  background-color: color-mix(in srgb, var(--border) 60%, transparent);
+}
+
+.progress-panel .progress-bar {
+  background-color: var(--accent);
+}
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 /* Floating search */

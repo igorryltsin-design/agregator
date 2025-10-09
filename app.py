@@ -4,12 +4,14 @@ import os
 import re
 import json
 import hashlib
+import hmac
 import logging
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 import itertools
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app
 from functools import wraps
@@ -123,6 +125,42 @@ except Exception:
     _morph = None
 
 logger = logging.getLogger(__name__)
+
+PIPELINE_API_KEY = (os.getenv("PIPELINE_API_KEY") or "").strip()
+
+
+def _extract_pipeline_token() -> Optional[str]:
+    header = request.headers.get('Authorization')
+    token: Optional[str] = None
+    if header:
+        lowered = header.lower()
+        if lowered.startswith('bearer '):
+            token = header[7:].strip()
+        else:
+            token = header.strip()
+    if not token:
+        token = request.headers.get('X-Agregator-Key')
+        if token:
+            token = token.strip()
+    if not token:
+        token = request.headers.get('X-Agregator-Token')
+        if token:
+            token = token.strip()
+    return token or None
+
+
+def _check_pipeline_access() -> tuple[bool, Optional[Response]]:
+    user = _load_current_user()
+    if user and getattr(user, 'role', '') == 'admin':
+        return True, None
+    if PIPELINE_API_KEY:
+        token = _extract_pipeline_token()
+        if token and hmac.compare_digest(token, PIPELINE_API_KEY):
+            return True, None
+        resp = jsonify({'ok': False, 'error': 'Forbidden'})
+        resp.status_code = 403
+        return False, resp
+    return True, None
 
 
 class TimedCache:
@@ -2219,10 +2257,19 @@ def _access_gate():
     user = _load_current_user()
     if _is_public_path(path):
         return None
+    if path == '/api/training/problem-pipeline':
+        if request.method == 'OPTIONS':
+            return None
+        allowed, failure_response = _check_pipeline_access()
+        if allowed:
+            return None
+        return _add_pipeline_cors_headers(failure_response)
     if user:
         return None
     if path.startswith('/api/') or request.headers.get('X-Requested-With') == 'XMLHttpRequest':
-        return ("Не авторизовано", 401)
+        resp = jsonify({'ok': False, 'error': 'Не авторизовано'})
+        resp.status_code = 401
+        return _add_pipeline_cors_headers(resp)
     return redirect('/app/login')
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -8767,6 +8814,446 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         "items": results,
         "progress": progress.lines,
     }
+
+
+def _resolve_problem_score(problem: Dict[str, Any]) -> Optional[float]:
+    score_keys = (
+        'score',
+        'humanScore',
+        'human_score',
+        'remoteScore',
+        'remote_score',
+        'autoScore',
+        'auto_score',
+    )
+    for key in score_keys:
+        if key in problem:
+            value = problem.get(key)
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _split_text_for_dataset(
+    text: str,
+    *,
+    min_chars: int = 120,
+    max_chars: int = 700,
+    max_segments: int = 6,
+) -> List[str]:
+    cleaned = (text or '').strip()
+    if not cleaned:
+        return []
+
+    # Сначала пробуем разбить по пустым строкам
+    candidates = [segment.strip() for segment in re.split(r"\n\s*\n+", cleaned) if segment.strip()]
+
+    segments: List[str] = []
+    for block in candidates:
+        if len(block) <= max_chars:
+            if len(block) >= min_chars:
+                segments.append(block)
+            continue
+
+        sentences = re.split(r"(?<=[.!?])\s+", block)
+        buffer: List[str] = []
+        current = ''
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            tentative = f"{current} {sentence}".strip() if current else sentence
+            if len(tentative) > max_chars:
+                if current:
+                    segments.append(current.strip())
+                if len(sentence) >= min_chars:
+                    segments.append(sentence[:max_chars].strip())
+                current = ''
+            else:
+                current = tentative
+        if current and len(current) >= min_chars:
+            segments.append(current.strip())
+
+    if not segments:
+        if len(cleaned) >= min_chars:
+            segments = [cleaned[:max_chars]]
+
+    return segments[:max_segments]
+
+
+def _extract_pairs_from_response(raw: str) -> List[Dict[str, str]]:
+    if not raw:
+        return []
+    start = raw.find('{')
+    end = raw.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return []
+    snippet = raw[start:end + 1]
+    try:
+        payload = json.loads(snippet)
+    except json.JSONDecodeError:
+        try:
+            snippet = re.sub(r".*?(\{.*\})", r"\1", raw, flags=re.S)
+            payload = json.loads(snippet)
+        except Exception:
+            return []
+    items = payload.get('pairs')
+    if not isinstance(items, list):
+        return []
+    pairs: List[Dict[str, str]] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        question = str(entry.get('question') or '').strip()
+        answer = str(entry.get('answer') or '').strip()
+        if question and answer:
+            pairs.append({'question': question, 'answer': answer})
+    return pairs
+
+
+def _generate_pairs_from_snippet(
+    snippet: str,
+    *,
+    desired_pairs: int,
+    temperature: float,
+    max_tokens: int,
+    problem_question: Optional[str],
+) -> List[Dict[str, str]]:
+    paragraph = (snippet or '').strip()
+    if not paragraph:
+        return []
+
+    system_prompt = (
+        'Ты — помощник по подготовке данных для обучения. Отвечай на русском языке, '
+        'формируй содержательные вопросы и ответы и соблюдай формат JSON без дополнительных комментариев.'
+    )
+    intro = (
+        "Тебе дан абзац текста. Сформируй {count} пар \"вопрос-ответ\" для тонкой настройки модели. "
+        "В каждом вопросе делай акцент на фактах, причинно-следственных связях, числах или важных утверждениях из абзаца. "
+        "Не упоминай, что вопрос взят из текста. Ответ должен быть вытекающим только из абзаца.\n\n"
+    )
+    if problem_question:
+        intro += f"Проблемный пользовательский вопрос: {problem_question.strip()}\n"
+
+    user_prompt = (
+        f"{intro}Абзац:\n\"\"\"\n{paragraph}\n\"\"\"\n\n"
+        "Формат ответа:\n"
+        "{\n  \"pairs\": [\n    { \"question\": \"...\", \"answer\": \"...\" }\n  ]\n}\n"
+        f"Количество элементов в массиве должно быть ровно {desired_pairs}. Не добавляй других полей."
+    )
+
+    try:
+        raw = call_lmstudio_compose(
+            system_prompt,
+            user_prompt,
+            temperature=max(0.0, float(temperature)),
+            max_tokens=max(128, int(max_tokens)),
+        )
+    except Exception as exc:
+        app.logger.warning(f"QA generation failed: {exc}")
+        return []
+
+    pairs = _extract_pairs_from_response(raw)
+    return pairs
+
+
+def _launch_fine_tune_job(
+    dataset: Sequence[Dict[str, str]],
+    fine_tune_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    server_url = (fine_tune_config.get('server_url') or '').strip()
+    base_model_path = (fine_tune_config.get('base_model_path') or '').strip()
+    config_payload = fine_tune_config.get('config') or {}
+    if not server_url or not base_model_path or not isinstance(config_payload, dict):
+        raise ValueError('server_url, base_model_path и config обязательны для запуска дообучения')
+
+    payload: Dict[str, Any] = {
+        'base_model_path': base_model_path,
+        'dataset': [
+            {
+                'input': item['input'],
+                'output': item['output'],
+                'source': item.get('source'),
+            }
+            for item in dataset
+        ],
+        'config': config_payload,
+    }
+
+    if fine_tune_config.get('output_dir'):
+        payload['output_dir'] = fine_tune_config['output_dir']
+
+    endpoint = server_url.rstrip('/') + '/v1/fine-tunes'
+    headers = fine_tune_config.get('headers')
+    timeout = float(fine_tune_config.get('timeout', 900))
+    response = requests.post(endpoint, json=payload, headers=headers, timeout=timeout)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Fine-tune request failed: {response.status_code} {response.text[:200]}")
+    return response.json()
+
+
+def _build_dataset_from_problems(
+    payload: Dict[str, Any],
+    logs: List[str],
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    evaluation = payload.get('evaluation') or {}
+    items = evaluation.get('items') or []
+    if not isinstance(items, list) or not items:
+        raise ValueError('evaluation.items должен быть непустым списком')
+
+    generation_opts = payload.get('generation') or {}
+    search_opts = payload.get('search') or {}
+
+    score_threshold = payload.get('score_threshold', evaluation.get('quality_gate'))
+    try:
+        threshold_value = float(score_threshold) if score_threshold is not None else None
+    except (TypeError, ValueError):
+        threshold_value = None
+
+    max_questions = int(generation_opts.get('max_questions') or payload.get('max_questions') or len(items))
+    target_pairs = int(payload.get('target_pairs') or generation_opts.get('target_pairs') or generation_opts.get('total_pairs') or 20)
+    pairs_per_snippet = max(1, int(generation_opts.get('pairs_per_snippet') or 1))
+    include_reference_pair = bool(generation_opts.get('include_reference_pair', True))
+    min_paragraph_chars = max(30, int(generation_opts.get('min_paragraph_chars', 120)))
+    max_paragraph_chars = max(min_paragraph_chars, int(generation_opts.get('max_paragraph_chars', 700)))
+    llm_temperature = float(generation_opts.get('temperature', 0.2))
+    llm_max_tokens = int(generation_opts.get('max_tokens', 512))
+
+    scored_items: List[Tuple[Optional[float], int, Dict[str, Any]]] = []
+    for idx, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            continue
+        score = _resolve_problem_score(raw)
+        if threshold_value is None or (score is None) or (score <= threshold_value):
+            scored_items.append((score, idx, raw))
+
+    if not scored_items:
+        raise ValueError('Не найдено вопросов, требующих внимания — уточните порог или список')
+
+    scored_items.sort(key=lambda entry: (entry[0] if entry[0] is not None else -1.0, entry[1]))
+    selected_items = scored_items[:max(1, max_questions)]
+
+    dataset: List[Dict[str, str]] = []
+    dataset_dedup: set[Tuple[str, str]] = set()
+    processed = 0
+
+    for rank, (score, _, problem) in enumerate(selected_items, start=1):
+        question = str(problem.get('question') or '').strip()
+        reference = str(problem.get('referenceAnswer') or problem.get('reference') or '').strip()
+        logs.append(f"[problem {rank}] score={score!r} question='{question[:80]}'")
+
+        if include_reference_pair and question and reference:
+            key = (question, reference)
+            if key not in dataset_dedup:
+                dataset.append({'input': question, 'output': reference, 'source': 'evaluation'})
+                dataset_dedup.add(key)
+                logs.append(f"  добавлена пара из эталонного ответа")
+                if len(dataset) >= target_pairs:
+                    break
+
+        search_parts = [question]
+        if reference:
+            search_parts.append(reference)
+        search_query = ' '.join(part for part in search_parts if part).strip()
+        if not search_query:
+            logs.append('  пропущено: пустой поисковый запрос')
+            continue
+
+        search_payload: Dict[str, Any] = {
+            'query': search_query,
+            'top_k': search_opts.get('top_k', 5),
+            'deep_search': bool(search_opts.get('deep_search', True)),
+            'llm_snippets': False,
+            'max_candidates': search_opts.get('max_candidates', 20),
+            'max_snippets': search_opts.get('max_snippets', 3),
+            'chunk_chars': search_opts.get('chunk_chars', 5000),
+            'max_chunks': search_opts.get('max_chunks', 25),
+        }
+        if 'sources' in search_opts:
+            search_payload['sources'] = search_opts['sources']
+        if 'collection_ids' in search_opts:
+            search_payload['collection_ids'] = search_opts['collection_ids']
+        if 'material_types' in search_opts:
+            search_payload['material_types'] = search_opts['material_types']
+
+        progress_lines: List[str] = []
+        result = _ai_search_core(search_payload, progress_lines.append)
+        for line in progress_lines:
+            logs.append(f"  [search] {line}")
+
+        items_found = result.get('items') or []
+        logs.append(f"  найдено кандидатов: {len(items_found)}")
+
+        for cand_index, candidate in enumerate(items_found, start=1):
+            file_id = candidate.get('file_id')
+            if not file_id:
+                continue
+            file_obj = File.query.get(int(file_id))
+            if not file_obj:
+                continue
+
+            snippets: List[str] = []
+            for snippet in candidate.get('snippets') or []:
+                snippet = (snippet or '').strip()
+                if len(snippet) >= min_paragraph_chars:
+                    snippets.append(snippet)
+
+            if not snippets:
+                text_excerpt = _read_cached_excerpt_for_file(file_obj)
+                snippets = [
+                    chunk
+                    for chunk in _split_text_for_dataset(
+                        text_excerpt,
+                        min_chars=min_paragraph_chars,
+                        max_chars=max_paragraph_chars,
+                        max_segments=search_opts.get('max_segments', 4),
+                    )
+                ]
+
+            if not snippets:
+                continue
+
+            for sn_index, snippet in enumerate(snippets, start=1):
+                if len(dataset) >= target_pairs:
+                    break
+                pairs = _generate_pairs_from_snippet(
+                    snippet,
+                    desired_pairs=pairs_per_snippet,
+                    temperature=llm_temperature,
+                    max_tokens=llm_max_tokens,
+                    problem_question=question,
+                )
+                if not pairs:
+                    continue
+                for pair in pairs:
+                    q_text = pair['question'].strip()
+                    a_text = pair['answer'].strip()
+                    if not q_text or not a_text:
+                        continue
+                    key = (q_text, a_text)
+                    if key in dataset_dedup:
+                        continue
+                    dataset.append({
+                        'input': q_text,
+                        'output': a_text,
+                        'source': f"agregator:{file_obj.rel_path or file_obj.filename}#s{sn_index}"
+                    })
+                    dataset_dedup.add(key)
+                    logs.append(
+                        f"  добавлена пара из файла '{file_obj.rel_path or file_obj.filename}' (сниппет {sn_index})"
+                    )
+                    if len(dataset) >= target_pairs:
+                        break
+            if len(dataset) >= target_pairs:
+                break
+
+        processed += 1
+        if len(dataset) >= target_pairs:
+            break
+
+    meta = {
+        'selected_problems': len(selected_items),
+        'processed_problems': processed,
+        'target_pairs': target_pairs,
+    }
+    return dataset, meta
+
+
+def _add_pipeline_cors_headers(response: Response) -> Response:
+    origin = request.headers.get('Origin')
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        vary = response.headers.get('Vary')
+        response.headers['Vary'] = f"{vary}, Origin" if vary else 'Origin'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    else:
+        response.headers.setdefault('Access-Control-Allow-Origin', '*')
+    response.headers.setdefault('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    response.headers.setdefault('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    return response
+
+
+def _pipeline_cors_preflight() -> Response:
+    response = make_response('', 204)
+    return _add_pipeline_cors_headers(response)
+
+
+@app.route('/api/training/problem-pipeline', methods=['POST', 'OPTIONS'])
+def api_training_problem_pipeline():
+    if request.method == 'OPTIONS':
+        return _pipeline_cors_preflight()
+    allowed, failure_response = _check_pipeline_access()
+    if not allowed:
+        return _add_pipeline_cors_headers(failure_response)
+    payload = request.get_json(silent=True) or {}
+    logs: List[str] = []
+
+    try:
+        dataset, meta = _build_dataset_from_problems(payload, logs)
+    except ValueError as exc:
+        logs.append(f"Ошибка: {exc}")
+        resp = jsonify({'ok': False, 'error': str(exc), 'logs': logs})
+        resp.status_code = 400
+        return _add_pipeline_cors_headers(resp)
+    except Exception as exc:
+        app.logger.exception('problem pipeline failed')
+        logs.append(f'Неожиданная ошибка: {exc}')
+        resp = jsonify({'ok': False, 'error': 'Не удалось построить датасет', 'logs': logs})
+        resp.status_code = 500
+        return _add_pipeline_cors_headers(resp)
+
+    if not dataset:
+        logs.append('Датасет пуст — нечего отправлять на дообучение')
+        resp = jsonify({'ok': False, 'error': 'Датасет пуст', 'logs': logs, 'meta': meta})
+        resp.status_code = 400
+        return _add_pipeline_cors_headers(resp)
+
+    dry_run = bool(payload.get('dry_run'))
+    include_dataset = bool(payload.get('include_dataset'))
+    job_info: Optional[Dict[str, Any]] = None
+
+    if not dry_run and payload.get('fine_tune'):
+        try:
+            job_info = _launch_fine_tune_job(dataset, payload['fine_tune'])
+            logs.append(f"Запущено дообучение: задача {job_info.get('id')}")
+        except Exception as exc:
+            app.logger.exception('fine-tune launch failed')
+            logs.append(f"Ошибка запуска дообучения: {exc}")
+            resp = jsonify({
+                'ok': False,
+                'error': str(exc),
+                'logs': logs,
+                'meta': meta,
+                'dataset_size': len(dataset),
+            })
+            resp.status_code = 502
+            return _add_pipeline_cors_headers(resp)
+
+    preview = [
+        {
+            'input': item['input'][:160],
+            'output': item['output'][:160],
+            'source': item.get('source'),
+        }
+        for item in dataset[:3]
+    ]
+
+    response: Dict[str, Any] = {
+        'ok': True,
+        'dataset_size': len(dataset),
+        'meta': meta,
+        'logs': logs,
+        'preview': preview,
+    }
+    if job_info is not None:
+        response['fine_tune_job'] = job_info
+    if include_dataset:
+        response['dataset'] = dataset
+    elif dry_run:
+        response['dataset_preview_full'] = dataset[: min(len(dataset), 10)]
+    return _add_pipeline_cors_headers(jsonify(response))
 
 
 @app.route('/api/ai-search', methods=['POST'])
