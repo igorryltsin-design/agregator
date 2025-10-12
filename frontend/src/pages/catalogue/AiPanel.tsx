@@ -30,10 +30,13 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
     setAiFullText,
     aiUseLlmSnippets,
     setAiUseLlmSnippets,
+    aiAllLanguages,
+    setAiAllLanguages,
     aiUseTags,
     setAiUseTags,
     aiUseText,
     setAiUseText,
+    aiLanguageOptions,
     aiLoading,
     aiProgress,
     progressItems,
@@ -62,7 +65,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
               {showAiSettings ? 'Скрыть настройки' : 'Настройки ИИ'}
             </button>
             <span className="muted" style={{ fontSize: '0.9rem' }}>
-              Топ {aiTopK} · кандидатов {aiMaxCandidates} · {aiDeepSearch ? 'глубокий' : 'быстрый'}{aiFullText ? ' · полный текст' : ''}{aiUseLlmSnippets ? ' · сниппеты LLM' : ''}
+              Топ {aiTopK} · кандидатов {aiMaxCandidates} · {aiDeepSearch ? 'глубокий' : 'быстрый'}{aiFullText ? ' · полный текст' : ''}{aiUseLlmSnippets ? ' · сниппеты LLM' : ''}{aiAllLanguages ? ' · все языки' : ''}
             </span>
           </>
         )}
@@ -191,6 +194,22 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
                 <label className="form-check-label" htmlFor="aiText">Учитывать метаданные</label>
               </div>
               <small className="text-muted">Выключите, если нужна чистая работа только по одному источнику.</small>
+            </div>
+            <div className="col-12 col-lg-3 d-flex flex-column justify-content-center">
+              <div className="form-check form-switch">
+                <input
+                  className="form-check-input"
+                  type="checkbox"
+                  id="aiAllLanguages"
+                  checked={aiAllLanguages}
+                  disabled={aiLanguageOptions.length === 0}
+                  onChange={e => setAiAllLanguages(e.target.checked)}
+                />
+                <label className="form-check-label" htmlFor="aiAllLanguages">Искать по всем языкам</label>
+              </div>
+              <small className="text-muted">
+                {aiLanguageOptions.length ? `Доступно: ${aiLanguageOptions.join(', ')}` : 'Нет языковых тегов'}
+              </small>
             </div>
             <div className="col-12 col-lg-3 d-flex flex-column justify-content-center">
               <div className="form-check form-switch">

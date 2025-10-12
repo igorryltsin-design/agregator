@@ -1,5 +1,5 @@
 import React from 'react'
-import { materialTypeOptions, tagKeyRu } from '../../utils/locale'
+import { useMaterialTypeOptions, tagKeyRu } from '../../utils/locale'
 import { useCatalogueState } from './useCatalogueState'
 import AiPanel from './AiPanel'
 import FileCard from './FileCard'
@@ -9,6 +9,7 @@ import FilterSidebar from './FilterSidebar'
 export default function CatalogueView() {
   const catalogue = useCatalogueState()
   const { searchParams, selectors, list, ai, pagination, modals, helpers, facets, facetsLoading, collections } = catalogue
+  const materialTypeOptions = useMaterialTypeOptions()
 
   const { sp, setSp, dq, type, collectionId } = searchParams
   const { selectedTags, setSelectedTags, removeTag } = selectors

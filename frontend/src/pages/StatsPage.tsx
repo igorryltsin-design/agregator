@@ -90,7 +90,7 @@ export default function StatsPage(){
     return () => ac.abort()
   }, [])
 
-  // palette from CSS variables
+  // Палитра считывается из CSS‑переменных темы
   const palette = useMemo(() => {
     const css = getComputedStyle(document.documentElement)
     return {
@@ -229,7 +229,7 @@ export default function StatsPage(){
         options:{ ...commonOptions }
       })
     }
-    // Files per collection
+    // Распределение файлов по коллекциям
     const coll = data.collections_counts || []
     if (refCollections.current) {
       chartCollections.current?.destroy()
@@ -239,7 +239,7 @@ export default function StatsPage(){
         options:{ ...hbarOptions, indexAxis:'y' }
       })
     }
-    // Collections total size (MB)
+    // Совокупный размер коллекций (в МБ)
     const collSize = (data.collections_total_size||[]).map(([name, bytes]) => [name, (Number(bytes||0)/(1024*1024))] as any)
     if (refCollSize.current) {
       chartCollSize.current?.destroy()
@@ -249,7 +249,7 @@ export default function StatsPage(){
         options:{ ...hbarOptions, indexAxis:'y' }
       })
     }
-    // Largest files (MB)
+    // Самые крупные файлы (в МБ)
     const largest = (data.largest_files||[]).map(([label, bytes]) => [label, (Number(bytes||0)/(1024*1024))] as any)
     if (refLargest.current) {
       chartLargest.current?.destroy()
@@ -259,7 +259,7 @@ export default function StatsPage(){
         options:{ ...hbarOptions, indexAxis:'y' }
       })
     }
-    // Tag keys
+    // Ключи тегов
     const tagKeys = data.tag_keys || []
     if (!selectedKey && tagKeys.length>0) setSelectedKey(String(tagKeys[0][0]||''))
     if (refTagKeys.current) {
@@ -269,7 +269,7 @@ export default function StatsPage(){
         options:{ ...hbarOptions, indexAxis:'y', onClick: (_evt:any, els:any[])=>{ if(!els?.length) return; const i=els[0].index; const raw = tagKeys?.[i]?.[0]; if (raw) setSelectedKey(String(raw)) } }
       })
     }
-    // Top authors bar (horizontal)
+    // Горизонтальная диаграмма по топовым авторам
     const authors = data.authors || []
     if (refAuthorsBar.current) {
       chartAuthorsBar.current?.destroy()
@@ -279,7 +279,7 @@ export default function StatsPage(){
         options:{ ...hbarOptions, indexAxis:'y', onClick: (_evt:any, els:any[])=>{ if(!els?.length) return; const i=els[0].index; const label = (chartAuthorsBar.current as any)?.data?.labels?.[i]; if (label) nav(`/?q=${encodeURIComponent(String(label))}`) } }
       })
     }
-    // cleanup on theme change or data change
+    // При смене темы или данных уничтожаем диаграммы, чтобы избежать утечек
     return () => {
       chartTypes.current?.destroy(); chartMonths.current?.destroy(); chartYears.current?.destroy(); chartSizes.current?.destroy(); chartExts.current?.destroy(); chartWeekdays.current?.destroy(); chartHours.current?.destroy(); chartMeta.current?.destroy(); chartAvg.current?.destroy(); chartAuthorsBar.current?.destroy(); chartCollections.current?.destroy(); chartCollSize.current?.destroy(); chartLargest.current?.destroy(); chartTagKeys.current?.destroy(); chartTagVals.current?.destroy()
   }

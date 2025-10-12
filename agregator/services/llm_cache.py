@@ -56,7 +56,7 @@ class LlmCache:
             if time.time() - ts > self.ttl_seconds:
                 self._data.pop(key, None)
                 return None
-            # move to end for LRU semantics
+            # Переносим в конец, чтобы соблюсти семантику LRU
             self._data.move_to_end(key)
             return response
 

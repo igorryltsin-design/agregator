@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Creates a clean standalone copy of the AiWord frontend that can be moved
-# to another machine. By default the copy is placed under backups/ with a
-# timestamped directory name. Pass a custom destination path as the first
-# argument. Add --zip to also produce a .tar.gz archive next to the copy.
+# Создаёт автономную копию фронтенда AiWord для переноса на другую машину.
+# По умолчанию копия сохраняется в каталоге backups/ с отметкой времени в имени.
+# В качестве первого аргумента можно передать путь назначения.
+# Флаг --zip дополнительно создаст архив .tar.gz рядом с копией.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_DIR="${ROOT_DIR}/AiWord"

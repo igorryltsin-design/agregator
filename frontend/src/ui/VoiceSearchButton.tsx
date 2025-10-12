@@ -37,7 +37,7 @@ export default function VoiceSearchButton({ onTranscribed, onError, disabled }: 
         try {
           mediaRecorderRef.current.stop()
         } catch (e) {
-          // ignore
+          // Игнорируем ошибку остановки медиарекордера
         }
       }
       mediaRecorderRef.current = null

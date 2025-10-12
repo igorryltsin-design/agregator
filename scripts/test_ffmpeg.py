@@ -54,7 +54,7 @@ def main():
             n = min(int(3*rate), frames)
             raw = wf.readframes(n)
             import array
-            a = array.array('h'); a.frombytes(raw)  # 16-bit
+            a = array.array('h'); a.frombytes(raw)  # 16-битные значения
             val = rms([x/32768.0 for x in a])
             print(f"RMS (first 3s): {val:.6f} {'(very low, maybe silence)' if val < 0.005 else ''}")
 

@@ -104,7 +104,7 @@ class FacetService:
             try:
                 return self.cache.get_or_set(cache_key, lambda: self._build_facets(params, search_candidate_fn, like_filter_fn))
             except AttributeError:
-                # cache without get_or_set support
+                # кеш не поддерживает get_or_set — используем запасной путь
                 cached = getattr(self.cache, 'get', lambda key: None)(cache_key)
                 if cached is not None:
                     return cached

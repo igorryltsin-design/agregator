@@ -143,7 +143,7 @@ export default function App() {
         setScanRunning(!!j.running)
         setScanStat(j)
       } catch {
-        // ignore
+        // Игнорируем временные ошибки опроса статуса сканирования
       } finally {
         timer = setTimeout(poll, 1500)
       }

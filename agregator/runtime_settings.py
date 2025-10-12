@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,79 @@ def _sanitize_list(values: Optional[Iterable[Any]]) -> Optional[List[str]]:
 
 def _sanitize_subdir(name: str) -> str:
     return str(name or "").strip().strip("/\\")
+
+
+def _safe_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value: Any, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _normalize_material_types(
+    raw: Optional[Iterable[Any]], *, fallback: Optional[List[Mapping[str, Any]]] = None
+) -> List[Dict[str, Any]]:
+    use_fallback = raw is None
+    if isinstance(raw, Iterable) and not isinstance(raw, (str, bytes, dict)):
+        source = list(raw)
+    else:
+        source = []
+    if use_fallback and fallback:
+        source = list(fallback)
+    result: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in source:
+        if not isinstance(item, Mapping):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        entry: Dict[str, Any] = {"key": key}
+        entry["label"] = str(item.get("label") or "")
+        entry["description"] = str(item.get("description") or "")
+        entry["enabled"] = _coerce_bool(item.get("enabled"), default=True)
+        entry["extensions"] = _sanitize_list(item.get("extensions")) or []
+        entry["text_keywords"] = _sanitize_list(item.get("text_keywords")) or []
+        entry["filename_keywords"] = _sanitize_list(item.get("filename_keywords")) or []
+        entry["exclude_keywords"] = _sanitize_list(item.get("exclude_keywords")) or []
+        entry["aliases"] = _sanitize_list(item.get("aliases")) or []
+        entry["llm_hint"] = str(item.get("llm_hint") or "")
+        entry["priority"] = _safe_int(item.get("priority"), default=0)
+        entry["threshold"] = _safe_float(item.get("threshold"), default=1.0)
+        entry["extension_weight"] = _safe_float(item.get("extension_weight"), default=2.0)
+        entry["filename_weight"] = _safe_float(item.get("filename_weight"), default=1.5)
+        entry["text_weight"] = _safe_float(item.get("text_weight"), default=1.0)
+        entry["require_extension"] = _coerce_bool(item.get("require_extension"), default=False)
+        entry["require_filename"] = _coerce_bool(item.get("require_filename"), default=False)
+        entry["require_text"] = _coerce_bool(item.get("require_text"), default=False)
+        flow_raw = item.get("flow")
+        if isinstance(flow_raw, (list, tuple)):
+            entry["flow"] = [str(v or "").strip().lower() for v in flow_raw if str(v or "").strip()]
+        special_raw = item.get("special")
+        special: Dict[str, Any] = {}
+        if isinstance(special_raw, Mapping):
+            if "journal_toc_required" in special_raw:
+                special["journal_toc_required"] = _coerce_bool(
+                    special_raw.get("journal_toc_required"), default=True
+                )
+            if "min_toc_entries" in special_raw:
+                special["min_toc_entries"] = max(1, _safe_int(special_raw.get("min_toc_entries"), default=5))
+            if "min_pages" in special_raw:
+                special["min_pages"] = max(1, _safe_int(special_raw.get("min_pages"), default=20))
+            if "weight" in special_raw:
+                special["weight"] = _safe_float(special_raw.get("weight"), default=2.0)
+        if special:
+            entry["special"] = special
+        result.append(entry)
+    return result
 
 
 @dataclass
@@ -85,6 +159,7 @@ class RuntimeSettings:
     search_facet_tag_keys: Optional[List[str]] = None
     graph_facet_tag_keys: Optional[List[str]] = None
     search_facet_include_types: bool = True
+    material_types: List[Dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_config(cls, config: "AppConfig") -> "RuntimeSettings":
@@ -130,6 +205,7 @@ class RuntimeSettings:
             search_facet_tag_keys=_sanitize_list(config.search_facet_tag_keys),
             graph_facet_tag_keys=_sanitize_list(config.graph_facet_tag_keys),
             search_facet_include_types=bool(config.search_facet_include_types),
+            material_types=_normalize_material_types(config.material_type_profiles),
         )
 
     # -- сериализация -----------------------------------------------------
@@ -180,6 +256,7 @@ class RuntimeSettings:
                 list(self.graph_facet_tag_keys) if self.graph_facet_tag_keys is not None else None
             ),
             "SEARCH_FACET_INCLUDE_TYPES": bool(self.search_facet_include_types),
+            "MATERIAL_TYPES": copy.deepcopy(self.material_types),
         }
 
     # -- применение -------------------------------------------------------
@@ -215,6 +292,7 @@ class RuntimeSettings:
         app.config["LM_MAX_INPUT_CHARS"] = self.lm_max_input_chars
         app.config["LM_MAX_OUTPUT_TOKENS"] = self.lm_max_output_tokens
         app.config["AZURE_OPENAI_API_VERSION"] = self.azure_openai_api_version
+        app.config["MATERIAL_TYPES"] = copy.deepcopy(self.material_types)
 
     # -- обновление -------------------------------------------------------
     def update_from_mapping(self, payload: Mapping[str, Any]) -> None:
@@ -330,6 +408,9 @@ class RuntimeSettings:
                 self.search_facet_include_types = _coerce_bool(
                     raw, default=self.search_facet_include_types
                 )
+            elif key == "MATERIAL_TYPES":
+                fallback = self.material_types or None
+                self.material_types = _normalize_material_types(raw, fallback=fallback)
 
         if not self.collections_in_separate_dirs:
             self.collection_type_subdirs = False

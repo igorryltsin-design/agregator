@@ -77,7 +77,7 @@ export default function UsersPage(){
           if (opts.length) setRoleOptions(opts)
         }
       } catch {
-        /* noop */
+        /* Заглушка: ничего не делаем */
       }
     })()
   }, [isAdmin])

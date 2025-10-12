@@ -33,7 +33,7 @@ class SearchService:
         self._cache_version = 0
 
     # ------------------------------------------------------------------
-    # Cache helpers
+    # Вспомогательные методы работы с кешем
     # ------------------------------------------------------------------
     def invalidate_cache(self, reason: str | None = None) -> None:
         self._cache_version += 1
@@ -41,7 +41,7 @@ class SearchService:
             self.logger.debug("Search cache invalidated: %s", reason)
 
     # ------------------------------------------------------------------
-    # FTS maintenance
+    # Обслуживание FTS
     # ------------------------------------------------------------------
     def ensure_support(self) -> None:
         """Ensure indexes, virtual tables and triggers exist for SQLite search."""
@@ -60,7 +60,7 @@ class SearchService:
                 for stmt in statements:
                     try:
                         conn.execute(sql_text(stmt))
-                    except Exception as exc:  # pragma: no cover - diagnostics only
+                    except Exception as exc:  # pragma: no cover - только для диагностики
                         self.logger.debug('Index creation failed (%s): %s', stmt, exc)
 
                 conn.execute(sql_text(
@@ -88,7 +88,7 @@ class SearchService:
                     """
                 ))
 
-                # Legacy trigger cleanup (handled in Python now)
+                # Удаляем устаревшие триггеры (теперь их функции выполняет Python)
                 try:
                     for legacy in (
                         'trg_files_ai', 'trg_files_au', 'trg_files_ad',
@@ -223,7 +223,7 @@ class SearchService:
         self.invalidate_cache(f'delete_file:{file_id}')
 
     # ------------------------------------------------------------------
-    # Query helpers
+    # Вспомогательные функции для построения запросов
     # ------------------------------------------------------------------
     def _fts_match_query(self, query: str) -> Optional[str]:
         tokens = self._FTS_TOKEN_PATTERN.findall((query or '').lower())

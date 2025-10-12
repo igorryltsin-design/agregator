@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -65,6 +65,7 @@ class AppConfig:
     import_subdir: str
     move_on_rename: bool
     type_dirs: Dict[str, str]
+    material_type_profiles: List[Dict[str, Any]]
     default_prompts: Dict[str, str]
     prompts: Dict[str, str]
     summarize_audio: bool
@@ -139,12 +140,164 @@ class AppConfig:
             "image": "images",
             "other": "other",
         }
+        material_type_profiles: List[Dict[str, Any]] = [
+            {
+                "key": "image",
+                "label": "Изображение",
+                "description": "Фотографии, сканы и другие графические файлы.",
+                "extensions": ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
+                "priority": 120,
+                "extension_weight": 3.0,
+                "filename_weight": 1.5,
+                "text_weight": 1.0,
+                "llm_hint": "Изображение или фотография. Требуется визуальное описание и ключевые слова.",
+            },
+            {
+                "key": "audio",
+                "label": "Аудио",
+                "description": "Звуковые записи, требующие транскрибации.",
+                "extensions": ["mp3", "wav", "m4a", "flac", "ogg"],
+                "priority": 110,
+                "extension_weight": 3.0,
+                "filename_weight": 1.5,
+                "text_weight": 1.0,
+                "llm_hint": "Аудиозапись. Сначала требуется транскрибация, затем анализ содержания.",
+            },
+            {
+                "key": "dissertation_abstract",
+                "label": "Автореферат",
+                "description": "Автореферат диссертации, краткое изложение основных результатов.",
+                "text_keywords": ["автореферат", "автореферат диссертац", "autoreferat", "автoref"],
+                "filename_keywords": ["автореферат", "autoreferat", "автoref"],
+                "priority": 95,
+                "threshold": 1.0,
+                "llm_hint": "Автореферат — краткое изложение диссертации с акцентом на цели, новизну и выводы.",
+            },
+            {
+                "key": "dissertation",
+                "label": "Диссертация",
+                "description": "Полный текст диссертации на соискание учёной степени.",
+                "text_keywords": ["диссертац", "на соискание степени", "диссертация"],
+                "filename_keywords": ["диссер", "dissert", "thesis"],
+                "priority": 90,
+                "threshold": 1.0,
+                "llm_hint": "Полная диссертация с подробным описанием исследования, структуры и приложений.",
+            },
+            {
+                "key": "patent",
+                "label": "Патент",
+                "description": "Патентные документы с описанием изобретения и классификацией.",
+                "text_keywords": ["патент", "patent", "mpk", "ipc"],
+                "filename_keywords": ["патент", "patent", "ru", "wo", "ep"],
+                "priority": 87,
+                "threshold": 1.0,
+                "llm_hint": "Патентное описание с формулой изобретения и ссылками на классификаторы.",
+            },
+            {
+                "key": "standard",
+                "label": "Стандарт",
+                "description": "ГОСТ, ISO, IEC, СанПиН и другие нормативные документы.",
+                "text_keywords": ["гост", "gost", "iso", "iec", "стб", "санпин", " сп ", "ту ", " сто "],
+                "filename_keywords": ["гост", "gost", "iso", "iec", "санпин", "сто_", "сто ", "ту_", "tu_"],
+                "priority": 88,
+                "threshold": 1.0,
+                "llm_hint": "Нормативный документ. Важно выявить номер стандарта, область применения и актуальность.",
+            },
+            {
+                "key": "proceedings",
+                "label": "Материалы конференции",
+                "description": "Сборники трудов, тезисов и материалов конференций.",
+                "text_keywords": ["материалы конференции", "сборник трудов", "proceedings", "conference", "symposium", "workshop", "тезисы"],
+                "filename_keywords": ["proceedings", "conf", "symposium", "workshop"],
+                "priority": 75,
+                "threshold": 1.0,
+                "llm_hint": "Материалы научной конференции или сборник тезисов участников.",
+            },
+            {
+                "key": "journal",
+                "label": "Журнал",
+                "description": "Целый выпуск научного журнала с оглавлением.",
+                "text_keywords": ["журнал", "вестник", "issn", "выпуск", "№"],
+                "filename_keywords": ["журнал", "journal", "magazine", "issue", "vestnik", "выпуск"],
+                "priority": 85,
+                "threshold": 1.5,
+                "special": {"journal_toc_required": True, "min_toc_entries": 5},
+                "llm_hint": "Отдельный выпуск журнала с несколькими статьями и оглавлением.",
+            },
+            {
+                "key": "article",
+                "label": "Статья",
+                "description": "Научная статья или отдельная публикация.",
+                "text_keywords": ["статья", "журнал", "doi", "удк", "материалы конференц", "тезисы"],
+                "priority": 60,
+                "threshold": 1.0,
+                "llm_hint": "Отдельная научная статья; выделяй аннотацию, авторов, ключевые слова.",
+            },
+            {
+                "key": "textbook",
+                "label": "Учебник",
+                "description": "Учебные пособия и учебники для студентов.",
+                "text_keywords": ["учебник", "учебное пособ", "пособие", "для студентов"],
+                "priority": 55,
+                "threshold": 1.0,
+                "llm_hint": "Учебное пособие. Отмечай целевую аудиторию и структуру курса.",
+            },
+            {
+                "key": "monograph",
+                "label": "Монография",
+                "description": "Научная монография или фундаментальное исследование.",
+                "text_keywords": ["монография", "monograph"],
+                "filename_keywords": ["монограф", "monograph"],
+                "priority": 58,
+                "threshold": 1.0,
+                "llm_hint": "Научная монография — глубокое авторское исследование.",
+            },
+            {
+                "key": "report",
+                "label": "Отчёт",
+                "description": "Отчётные документы, ТЗ, пояснительные записки.",
+                "text_keywords": ["отчет", "отчёт", "техническое задание", "пояснительная записка", "technical specification"],
+                "filename_keywords": ["отчет", "отчёт", "tz_", "тз_"],
+                "priority": 65,
+                "threshold": 1.0,
+                "llm_hint": "Отчёт или техническая документация. Важно фиксировать заказчика, исполнителя и период.",
+            },
+            {
+                "key": "presentation",
+                "label": "Презентация",
+                "description": "Слайды презентаций и докладов.",
+                "text_keywords": ["презентация", "slides", "powerpoint", "слайды", "deck"],
+                "filename_keywords": ["презентац", "slides", "ppt", "pptx", "keynote", "deck"],
+                "extensions": ["ppt", "pptx", "key", "odp"],
+                "priority": 62,
+                "threshold": 1.0,
+                "llm_hint": "Презентация в слайдах. Структура: слайды, разделы, основные тезисы.",
+            },
+            {
+                "key": "note",
+                "label": "Заметка",
+                "description": "Короткие текстовые заметки и инструкции.",
+                "text_keywords": ["заметка", "note"],
+                "extensions": ["md", "txt", "rst"],
+                "priority": 30,
+                "threshold": 1.0,
+                "llm_hint": "Краткая заметка или текстовый файл с минимальной структурой.",
+            },
+            {
+                "key": "document",
+                "label": "Документ",
+                "description": "Общий тип по умолчанию, если ничего не подошло.",
+                "priority": 0,
+                "threshold": 0.0,
+                "llm_hint": "Базовый тип документа, когда классификация не определена.",
+            },
+        ]
         default_prompts: Dict[str, str] = {
             "metadata_system": (
                 "Ты помощник по каталогизации научных материалов. "
-                "Твоя задача: определить тип материала из набора: dissertation, dissertation_abstract, article, textbook, "
-                "monograph, report, patent, presentation, proceedings, standard, note, document. "
-                "Если подходит несколько — выбери наиболее вероятный. Верни ТОЛЬКО валидный JSON без пояснений. "
+                "Определи material_type из списка: {{TYPE_LIST}}. "
+                "Используй подсказки по типам:\n{{TYPE_HINTS}}\n"
+                "Верни ТОЛЬКО валидный JSON без пояснений. "
                 "Ключи: material_type, title, author, year, advisor, keywords (array), novelty (string), "
                 "literature (array), organizations (array), classification (array). Если данных нет — пустые строки/массивы."
             ),
@@ -198,6 +351,7 @@ class AppConfig:
             import_subdir=_sanitize_subdir(os.getenv("IMPORT_SUBDIR", "import")),
             move_on_rename=_getenv_bool("MOVE_ON_RENAME", True),
             type_dirs=type_dirs,
+            material_type_profiles=material_type_profiles,
             default_prompts=default_prompts,
             prompts=prompts,
             summarize_audio=_getenv_bool("SUMMARIZE_AUDIO", False),

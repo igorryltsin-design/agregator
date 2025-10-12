@@ -1,42 +1,17 @@
-const MATERIAL_TYPE_MAP: Record<string, string> = {
-  dissertation: 'Диссертация',
-  dissertation_abstract: 'Автореферат',
-  article: 'Статья',
-  journal: 'Журнал',
-  textbook: 'Учебник',
-  monograph: 'Монография',
-  report: 'Отчёт',
-  patent: 'Патент',
-  presentation: 'Презентация',
-  proceedings: 'Труды',
-  standard: 'Стандарт',
-  note: 'Заметка',
-  document: 'Документ',
-  file: 'Файл',
-  audio: 'Аудио',
-  image: 'Изображение',
-  video: 'Видео',
-  other: 'Другое',
+import { materialTypeLabel, materialTypeSlug as storeMaterialTypeSlug, useMaterialTypeOptions, getMaterialTypeOptionsSnapshot } from './materialTypesStore'
+
+export { useMaterialTypeOptions }
+
+export function materialTypeOptionsSnapshot(): { value: string; label: string }[] {
+  return getMaterialTypeOptionsSnapshot()
 }
 
-export const materialTypeOptions = Object.entries(MATERIAL_TYPE_MAP).map(([value, label]) => ({ value, label }))
-
 export function materialTypeRu(type: string | null | undefined, fallback: string = 'Другое'): string {
-  if (!type) return fallback
-  const key = String(type).toLowerCase()
-  return MATERIAL_TYPE_MAP[key] || String(type)
+  return materialTypeLabel(type, fallback)
 }
 
 export function materialTypeSlug(input: string | null | undefined): string | null {
-  if (!input) return null
-  const trimmed = input.trim()
-  if (!trimmed) return null
-  const lower = trimmed.toLowerCase()
-  const optionByValue = materialTypeOptions.find(opt => opt.value === lower)
-  if (optionByValue) return optionByValue.value
-  const optionByLabel = materialTypeOptions.find(opt => opt.label.toLowerCase() === lower)
-  if (optionByLabel) return optionByLabel.value
-  return trimmed
+  return storeMaterialTypeSlug(input)
 }
 
 export function tagKeyRu(key: string | null | undefined): string {

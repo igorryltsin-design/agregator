@@ -546,7 +546,7 @@ export default function App() {
   const [citeReplaceFrom, setCiteReplaceFrom] = useState<number>(-1);
   const [citeReplaceTo, setCiteReplaceTo] = useState<number>(-1);
 
-  // --- Deep integration with Agregator ---
+  // --- Глубокая интеграция с Agregator ---
   interface AggCollection { id: number; name: string; slug: string; searchable: boolean; graphable: boolean; count?: number }
   interface AggSearchItem { file_id: number; title: string; rel_path?: string; score?: number; snippets?: string[]; hits?: unknown[]; matched_terms?: string[] }
   interface AiSearchRequest {
@@ -590,7 +590,7 @@ export default function App() {
 
   const [templateDraft, setTemplateDraft] = useState<CustomAgentDraft>(() => templateDefaultsByKey(newAgentTemplate));
 
-  // Streaming LLM state
+  // Состояние потокового ответа LLM
   const [useStream, setUseStream] = useState<boolean>(true);
   const [liveText, setLiveText] = useState<string>('');
   const [abortCtrl, setAbortCtrl] = useState<AbortController | null>(null);
@@ -614,7 +614,7 @@ export default function App() {
   const chainAbortRef = useRef<boolean>(false);
   const [showHelp, setShowHelp] = useState<boolean>(false);
 
-  // Facet suggestions for filters
+  // Подсказки фасетов для фильтров
   type FacetType = { name: string; count: number };
   type FacetVal = { value: string; count: number };
   const [facetTypes, setFacetTypes] = useState<FacetType[]>([]);
@@ -622,7 +622,7 @@ export default function App() {
   const [facetKey, setFacetKey] = useState<string>('');
   const [facetValue, setFacetValue] = useState<string>('');
 
-  // Mapping for footnotes → sources list
+  // Соответствие сносок и списка источников
   const [, setAggCiteMap] = useState<Map<number, AggSearchItem>>(new Map());
 
   useEffect(() => {
@@ -704,7 +704,7 @@ export default function App() {
           setProject(data.project);
           setContent(data.content);
           setBibText(data.bibText || ""); // Восстанавливаем bibText
-          try { if (data.bibText) setBibDb(parseBibTeX(data.bibText)); } catch { /* ignore broken bib */ }
+          try { if (data.bibText) setBibDb(parseBibTeX(data.bibText)); } catch { /* игнорируем повреждённый BibTeX */ }
         }
       } catch (error) {
         console.error('Ошибка восстановления автосохранения:', error);
@@ -725,8 +725,8 @@ export default function App() {
     }
   }, []);
 
-  // Persist Agregator toggle
-  useEffect(()=>{ try{ localStorage.setItem('aiword-use-agregator', useAgregator ? '1':'0'); }catch{ /* storage disabled */ } }, [useAgregator]);
+  // Сохраняем переключатель интеграции с Agregator
+  useEffect(()=>{ try{ localStorage.setItem('aiword-use-agregator', useAgregator ? '1':'0'); }catch{ /* хранилище недоступно */ } }, [useAgregator]);
 
   useEffect(() => {
     return () => {
@@ -737,7 +737,7 @@ export default function App() {
     };
   }, []);
 
-  // Load collections when needed
+  // Загружаем коллекции по требованию
   useEffect(() => {
     if (!useAgregator) {
       return;
@@ -859,7 +859,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  // Markdown renderer (client-side)
+  // Рендерер Markdown на стороне клиента
   const md = useMemo(() => {
     const instance = new MarkdownIt({
       html: false,
@@ -1012,7 +1012,7 @@ export default function App() {
     return data.choices?.[0]?.message?.content || '';
   };
 
-  // Streaming version (OpenAI-compatible SSE)
+  // Потоковая версия (совместимо с OpenAI/SSE)
   const applyStreamUpdate = (force = false) => {
     const ctx = streamContextRef.current;
     if (!ctx) return;
@@ -1088,7 +1088,7 @@ export default function App() {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      // SSE: split by newlines, parse lines starting with 'data:'
+      // SSE: разбиваем на строки и разбираем те, что начинаются с 'data:'
       const lines = buf.split(/\r?\n/);
       buf = lines.pop() || '';
       for (const line of lines) {
@@ -1107,7 +1107,7 @@ export default function App() {
               applyStreamUpdate();
             }
           }
-        }catch{ /* ignore malformed SSE chunk */ }
+        }catch{ /* игнорируем некорректный SSE-фрагмент */ }
       }
     }
     setAbortCtrl(null);
@@ -1120,7 +1120,7 @@ export default function App() {
     return full;
   };
 
-  // Compose context from Agregator AI search
+  // Собираем контекст из AI-поиска Agregator
   interface AggSearchResult {
     items: AggSearchItem[];
     answer?: string;
@@ -1296,7 +1296,7 @@ export default function App() {
       let catalogContext = '';
       const catalogEnabled = useAgregator && (action === 'custom' ? Boolean(customConfig?.useCatalog) : true);
       if (catalogEnabled && (action !== 'factcheck' || !providedCatalog)) {
-        // Determine a meaningful query for the catalogue
+        // Подбираем осмысленный запрос для каталога
         let q = '';
         if (action === 'outline') q = String(payload.topic || project.title || '').slice(0, 300);
         else if (action === 'draft') q = `${String(payload.outline_point||'Раздел')} — ${String(project.title||'').slice(0,200)}`;
@@ -1327,7 +1327,7 @@ export default function App() {
           }
         }
       }
-      // Capture insertion position if streaming to editor
+      // Запоминаем позицию вставки при потоковой передаче в редактор
       if (injectToEditor) {
         const textarea = editorRef.current;
         let start = content.length;
@@ -1483,7 +1483,7 @@ export default function App() {
       const usedCatalog = Boolean(catalogContext || providedCatalog);
       addLog('Агент — завершено', `Действие: ${actionLabel}\nВремя: ${formatDuration(elapsedMs)}${usedCatalog ? '\nКонтекст: каталог' : ''}`);
 
-      // Finalize streaming region to stable text
+      // Завершаем потоковую вставку и фиксируем текст
       if (applyToEditor) {
         if (injectToEditor) {
           const ctx = streamContextRef.current;
@@ -1526,7 +1526,7 @@ export default function App() {
     }
   };
 
-  // Insert helper: put text at editor caret
+  // Вставка текста в позицию курсора редактора
   const insertAtCaret = (text: string) => {
     const textarea = editorRef.current;
     if (!textarea) return;
@@ -1538,7 +1538,7 @@ export default function App() {
     setTimeout(()=>{ textarea.focus(); const pos = start + text.length; textarea.setSelectionRange(pos, pos); }, 0);
   };
 
-  // Build or update "## Источники каталога" section based on aggCiteMap
+  // Создаём или обновляем раздел "## Источники каталога" по данным aggCiteMap
   const updateSourcesSection = (map: Map<number, AggSearchItem>) => {
     const keys = Array.from(map.keys()).sort((a, b) => a - b);
     const lines = keys.map(n => {
@@ -2616,7 +2616,7 @@ export default function App() {
       }
 
       if (format === 'docx') {
-        // Build paragraphs, lists, and tables
+        // Собираем параграфы, списки и таблицы
         const lines = content.split('\n');
         const children: (Paragraph | DocxTable)[] = [];
         let currentTable: string[][] = [];
@@ -2720,7 +2720,7 @@ export default function App() {
         if (projectData._ui?.templatesMap) setTemplatesMap(projectData._ui.templatesMap);
         if (projectData._ui?.bibText) {
           setBibText(projectData._ui.bibText);
-          try { setBibDb(parseBibTeX(projectData._ui.bibText)); } catch { /* ignore invalid saved bib */ }
+          try { setBibDb(parseBibTeX(projectData._ui.bibText)); } catch { /* игнорируем некорректный сохранённый BibTeX */ }
         }
         addLog('Проект загружен', `${projectData.title || 'Без названия'}`);
       } catch (error) {
@@ -2855,7 +2855,7 @@ export default function App() {
 
   return (
     <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'dark bg-gray-900' : 'bg-gray-50'}`}>
-      {/* Header */}
+      {/* Шапка */}
       <header className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700 sticky top-0 z-50">
         <div className="w-full pl-0 pr-3 sm:pr-6 lg:pr-8" style={{ paddingLeft: 'env(safe-area-inset-left, 0px)' }}>
           <div className="flex items-center h-16 gap-4">
@@ -2960,7 +2960,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Help modal */}
+      {/* Модальное окно помощи */}
       {showHelp && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
           <div className="max-w-3xl w-full bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-200 dark:border-gray-700 p-6 overflow-y-auto max-h-[80vh]">
@@ -3008,7 +3008,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Content */}
+      {/* Основной контент */}
       <div className="w-full py-4" style={{ paddingLeft: 'env(safe-area-inset-left, 0px)', paddingRight: 'env(safe-area-inset-right, 0px)' }}>
         {useStream && !streamToEditor && liveText && (
           <div className="mb-3 bg-white dark:bg-gray-800 rounded-xl shadow-sm p-3 border border-gray-200 dark:border-gray-700">
@@ -3017,10 +3017,10 @@ export default function App() {
           </div>
         )}
         <div className={`grid grid-cols-1 gap-4 ${focusMode ? 'lg:grid-cols-[1fr]' : 'lg:grid-cols-[minmax(0,300px)_minmax(0,1fr)_minmax(0,300px)]'}`}>
-          {/* Left Panel (fixed content) */}
+          {/* Левая панель (фиксированная часть) */}
           {!focusMode && (
           <div className={`${leftOpen ? '' : 'hidden lg:block'} space-y-4 lg:sticky lg:top-20 self-start max-h-[calc(100vh-100px)] overflow-y-auto`}>
-            {/* Agent Actions */}
+            {/* Действия агента */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center">
                 <Sparkles className="w-5 h-5 mr-2" />
@@ -3087,7 +3087,7 @@ export default function App() {
               </p>
             </div>
 
-            {/* Agregator integration */}
+            {/* Интеграция с Agregator */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-3 flex items-center">
                 <Database className="w-5 h-5 mr-2" />
@@ -3517,7 +3517,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Templates */}
+            {/* Шаблоны */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center">
                 <BookOpen className="w-5 h-5 mr-2" />
@@ -3552,7 +3552,7 @@ export default function App() {
               </button>
             </div>
 
-            {/* Export */}
+            {/* Экспорт */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center">
                 <Download className="w-5 h-5 mr-2" />
@@ -3572,9 +3572,9 @@ export default function App() {
           </div>
           )}
 
-          {/* Main Editor Area */}
+          {/* Основная область редактора */}
           <div onContextMenu={(e)=>{ e.preventDefault(); if(selectedTemplateKey){ setContent(prev => `${prev}\n\n${templatesMap[selectedTemplateKey]}\n\n`);} }}>
-            {/* Tab Content */}
+            {/* Содержимое вкладки */}
             <div className="mt-3 bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 min-h-[600px]">
               {activeTab === 'editor' && (
                 <div className="p-4">
@@ -3695,10 +3695,10 @@ export default function App() {
             </div>
           </div>
 
-          {/* Right Panel (moved content) */}
+          {/* Правая панель (перенесённый блок) */}
           {!focusMode && (
           <div className={`${rightOpen ? '' : 'hidden lg:block'} space-y-4 lg:sticky lg:top-20 self-start max-h-[calc(100vh-100px)] overflow-y-auto`}>
-            {/* Project Management */}
+            {/* Управление проектом */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center">
                 <FolderOpen className="w-5 h-5 mr-2" />
@@ -3723,7 +3723,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* LLM Settings */}
+            {/* Настройки LLM */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center">
                 <Settings className="w-5 h-5 mr-2" />
@@ -3741,7 +3741,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Project Settings */}
+            {/* Настройки проекта */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-3 flex items-center">
                 <Settings className="w-5 h-5 mr-2" />
@@ -3758,7 +3758,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Criteria Profiles */}
+            {/* Профили критериев */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-4 border border-gray-200 dark:border-gray-700">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-3 flex items-center">
                 <Star className="w-5 h-5 mr-2" />Критерии
@@ -3791,7 +3791,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Toast */}
+      {/* Уведомление */}
       {exportToast && (
         <div className="fixed bottom-6 right-6 z-50 bg-gray-900 text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-3">
           <span>{exportToast}</span>
@@ -3802,7 +3802,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Footer */}
+      {/* Подвал */}
       <footer className="bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400">

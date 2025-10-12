@@ -17,8 +17,8 @@ from urllib3.util.retry import Retry
 class HttpSettings:
     """Runtime configuration for HTTP requests."""
 
-    timeout: float  # total read timeout in seconds
-    connect_timeout: float  # connect timeout in seconds
+    timeout: float  # суммарное время ожидания чтения в секундах
+    connect_timeout: float  # время установления соединения в секундах
     retries: int
     backoff_factor: float
     status_forcelist: Iterable[int] = (429, 500, 502, 503, 504)

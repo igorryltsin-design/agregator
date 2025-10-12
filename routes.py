@@ -12,7 +12,7 @@ from flask import current_app
 from sqlalchemy import func
 import re
 
-# --- Natasha/pymorphy2 helpers for RU morphology and synonyms ---
+# --- Вспомогательные функции Natasha/pymorphy2 для морфологии и синонимов ---
 try:
     from razdel import tokenize as _ru_tokenize
 except Exception:

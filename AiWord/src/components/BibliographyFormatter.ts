@@ -36,8 +36,8 @@ export function parseBibTeX(bibText: string): BibDatabase {
     const fields: Record<string, string> = {};
     const persons: Record<string, string[]> = {};
 
-    // Extract fields until the closing brace of entry
-    // Greedy field matcher handling {...} and "..."
+    // Извлекаем поля до закрывающей фигурной скобки записи
+    // Жадный парсер полей, поддерживает {...} и "..."
     const fieldRegex = /(\w+)\s*=\s*(\{[\s\S]*?\}|"[\s\S]*?"|[^,\n]+)\s*,?/g;
     let m: RegExpExecArray | null;
     while ((m = fieldRegex.exec(body))) {

@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
+import type { MaterialTypeDefinition } from '../utils/materialTypesStore'
+import { loadMaterialTypes } from '../utils/materialTypesStore'
 
 type Collection = {
   id: number
@@ -61,6 +63,7 @@ type Settings = {
   default_use_llm?: boolean
   default_prune?: boolean
   type_dirs?: Record<string, string>
+  material_types?: MaterialTypeDefinition[]
 }
 
 const fallbackPromptDefaults: Record<string, string> = {
@@ -83,10 +86,120 @@ const promptOrder = ['metadata_system', 'summarize_audio_system', 'keywords_syst
 
 const boolVal = (value: any, fallback: boolean) => (value === undefined ? fallback : !!value)
 
+const sanitizeStringArray = (value: any): string[] => {
+  if (!Array.isArray(value)) return []
+  return value.map(item => String(item ?? '').trim()).filter(Boolean)
+}
+
+const parseListInput = (value: string): string[] => value.split(/[,;\n]/).map(token => token.trim()).filter(Boolean)
+
+const formatListInput = (value?: string[]): string => (Array.isArray(value) && value.length ? value.join(', ') : '')
+
+const createEmptyMaterialType = (): MaterialTypeDefinition => ({
+  key: '',
+  label: '',
+  description: '',
+  llm_hint: '',
+  enabled: true,
+  priority: 0,
+  threshold: 1,
+  text_keywords: [],
+  filename_keywords: [],
+  extensions: [],
+  exclude_keywords: [],
+  require_extension: false,
+  require_filename: false,
+  require_text: false,
+  extension_weight: 2,
+  filename_weight: 1.5,
+  text_weight: 1,
+  flow: [],
+  aliases: [],
+  special: {},
+})
+
+const normalizeMaterialTypeDefinition = (raw: any): MaterialTypeDefinition => {
+  const base = createEmptyMaterialType()
+  const key = String(raw?.key ?? '').trim()
+  return {
+    ...base,
+    key,
+    label: raw?.label !== undefined && raw?.label !== null ? String(raw.label) : '',
+    description: raw?.description !== undefined && raw?.description !== null ? String(raw.description) : '',
+    llm_hint: raw?.llm_hint !== undefined && raw?.llm_hint !== null ? String(raw.llm_hint) : '',
+    enabled: raw?.enabled === undefined ? base.enabled : !!raw.enabled,
+    priority: Number.isFinite(Number(raw?.priority)) ? Number(raw.priority) : base.priority,
+    threshold: Number.isFinite(Number(raw?.threshold)) ? Number(raw.threshold) : base.threshold,
+    text_keywords: sanitizeStringArray(raw?.text_keywords ?? raw?.textKeywords),
+    filename_keywords: sanitizeStringArray(raw?.filename_keywords ?? raw?.filenameKeywords),
+    extensions: sanitizeStringArray(raw?.extensions),
+    exclude_keywords: sanitizeStringArray(raw?.exclude_keywords ?? raw?.excludeKeywords),
+    require_extension: raw?.require_extension === undefined ? base.require_extension : !!raw.require_extension,
+    require_filename: raw?.require_filename === undefined ? base.require_filename : !!raw.require_filename,
+    require_text: raw?.require_text === undefined ? base.require_text : !!raw.require_text,
+    extension_weight: Number.isFinite(Number(raw?.extension_weight)) ? Number(raw.extension_weight) : base.extension_weight,
+    filename_weight: Number.isFinite(Number(raw?.filename_weight)) ? Number(raw.filename_weight) : base.filename_weight,
+    text_weight: Number.isFinite(Number(raw?.text_weight)) ? Number(raw.text_weight) : base.text_weight,
+    flow: sanitizeStringArray(raw?.flow).map(token => token.toLowerCase()),
+    aliases: sanitizeStringArray(raw?.aliases),
+    special: raw?.special && typeof raw.special === 'object' ? { ...(raw.special as Record<string, any>) } : {},
+  }
+}
+
+const slugifyTypeKey = (value: string): string => {
+  const trimmed = value.trim()
+  if (!trimmed) return ''
+  const normalized = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')
+  if (normalized) return normalized
+  return trimmed.replace(/\s+/g, '_').toLowerCase()
+}
+
+const prepareMaterialTypeForSave = (entry: MaterialTypeDefinition): Record<string, any> | null => {
+  const key = slugifyTypeKey(entry.key || '')
+  if (!key) return null
+  const toList = (list?: string[]) => (Array.isArray(list) ? list.map(item => item.trim()).filter(Boolean) : [])
+  const flow = toList(entry.flow).map(item => item.toLowerCase())
+  const prepared: Record<string, any> = {
+    key,
+    label: (entry.label || '').trim(),
+    description: (entry.description || '').trim(),
+    llm_hint: (entry.llm_hint || '').trim(),
+    enabled: entry.enabled !== false,
+    priority: Number.isFinite(entry.priority) ? entry.priority : 0,
+    threshold: Number.isFinite(entry.threshold) ? entry.threshold : 1,
+    text_keywords: toList(entry.text_keywords),
+    filename_keywords: toList(entry.filename_keywords),
+    extensions: toList(entry.extensions),
+    exclude_keywords: toList(entry.exclude_keywords),
+    require_extension: !!entry.require_extension,
+    require_filename: !!entry.require_filename,
+    require_text: !!entry.require_text,
+    extension_weight: Number.isFinite(entry.extension_weight) ? entry.extension_weight : 2,
+    filename_weight: Number.isFinite(entry.filename_weight) ? entry.filename_weight : 1.5,
+    text_weight: Number.isFinite(entry.text_weight) ? entry.text_weight : 1,
+    flow,
+    aliases: toList(entry.aliases),
+    special: entry.special && typeof entry.special === 'object' ? entry.special : {},
+  }
+  return prepared
+}
+
+const formatSpecial = (value?: Record<string, any>): string => {
+  if (!value || !Object.keys(value).length) return ''
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return ''
+  }
+}
+
 const normalizeSettings = (raw: any): Settings => {
   const promptDefaults = { ...fallbackPromptDefaults, ...(raw?.prompt_defaults || {}) }
   const prompts = { ...promptDefaults, ...(raw?.prompts || {}) }
   const collectionsInDirs = boolVal(raw?.collections_in_dirs, false)
+  const materialTypes = Array.isArray(raw?.material_types)
+    ? raw.material_types.map((item: any) => normalizeMaterialTypeDefinition(item))
+    : []
   const collections = Array.isArray(raw?.collections)
     ? raw.collections.map((col: any) => ({
         id: Number(col?.id ?? 0),
@@ -139,6 +252,7 @@ const normalizeSettings = (raw: any): Settings => {
     default_use_llm: boolVal(raw?.default_use_llm, true),
     default_prune: boolVal(raw?.default_prune, true),
     type_dirs: raw?.type_dirs || {},
+    material_types: materialTypes,
   }
 }
 
@@ -195,6 +309,20 @@ export default function SettingsPage() {
   }, [s?.llm_endpoints])
 
   const assignedAiwordIds = useMemo(() => new Set((s?.aiword_users || []).map(u => u.user_id)), [s?.aiword_users])
+  const duplicateMaterialKeys = useMemo(() => {
+    const duplicates = new Set<string>()
+    if (!s?.material_types) return duplicates
+    const counts = new Map<string, number>()
+    s.material_types.forEach(mt => {
+      const key = (mt.key || '').trim().toLowerCase()
+      if (!key) return
+      counts.set(key, (counts.get(key) || 0) + 1)
+    })
+    counts.forEach((count, key) => {
+      if (count > 1) duplicates.add(key)
+    })
+    return duplicates
+  }, [s?.material_types])
   const llmPurposes = useMemo<LlmPurposeOption[]>(() => {
     if (Array.isArray(s?.llm_purposes)) {
       const list = [...s.llm_purposes]
@@ -397,6 +525,32 @@ export default function SettingsPage() {
     })
   }, [])
 
+  const addMaterialType = useCallback(() => {
+    setS(prev => {
+      if (!prev) return prev
+      const next = [...(prev.material_types || []), createEmptyMaterialType()]
+      return { ...prev, material_types: next }
+    })
+  }, [])
+
+  const updateMaterialType = useCallback((index: number, value: MaterialTypeDefinition) => {
+    setS(prev => {
+      if (!prev) return prev
+      const list = [...(prev.material_types || [])]
+      list[index] = value
+      return { ...prev, material_types: list }
+    })
+  }, [])
+
+  const removeMaterialType = useCallback((index: number) => {
+    setS(prev => {
+      if (!prev) return prev
+      const list = [...(prev.material_types || [])]
+      list.splice(index, 1)
+      return { ...prev, material_types: list }
+    })
+  }, [])
+
   const save = async () => {
     if (!s) return
     setSaving(true)
@@ -417,9 +571,15 @@ export default function SettingsPage() {
         searchable: !!col.searchable,
         graphable: !!col.graphable,
       }))
+      const preparedMaterialTypes = (payload.material_types || [])
+        .map((item: MaterialTypeDefinition) => prepareMaterialTypeForSave(item))
+        .filter((item): item is Record<string, any> => Boolean(item))
+      payload.material_types = preparedMaterialTypes
       const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       if (r.ok) {
+        setS(prev => prev ? { ...prev, material_types: preparedMaterialTypes.map(normalizeMaterialTypeDefinition) } : prev)
         toasts.push('Настройки сохранены', 'success')
+        loadMaterialTypes(true).catch(() => {})
       } else {
         toasts.push(r.status === 403 ? 'Недостаточно прав' : 'Ошибка сохранения настроек', 'error')
       }
@@ -505,6 +665,7 @@ export default function SettingsPage() {
 
   const llmEndpoints = s.llm_endpoints || []
   const aiwordUsers = s.aiword_users || []
+  const materialTypes = s.material_types || []
 
   return (
     <div className="d-grid gap-3">
@@ -656,7 +817,19 @@ export default function SettingsPage() {
               <label className="form-check-label" htmlFor="rerank">LLM‑реранжирование поиска</label>
             </div>
           </div>
-        </div>
+      </div>
+    </div>
+
+      <div className="card p-3">
+        <div className="fw-semibold mb-1">Типы документов и эвристики</div>
+        <div className="text-muted mb-3" style={{ fontSize: 13 }}>Настройте ключевые слова, расширения и специальные правила для автоматического определения типа документов.</div>
+        <MaterialTypesEditor
+          materialTypes={materialTypes}
+          onChange={updateMaterialType}
+          onRemove={removeMaterialType}
+          onAdd={addMaterialType}
+          duplicateKeys={duplicateMaterialKeys}
+        />
       </div>
 
       <div className="card p-3">
@@ -981,6 +1154,235 @@ function CollectionsEditor({ collections, onSaved }: { collections: Collection[]
     <div className="d-flex flex-wrap align-items-center gap-2">
       <input className="form-control" placeholder="Новая коллекция" value={newName} onChange={e => setNewName(e.target.value)} style={{ maxWidth: 320 }} />
       <button className="btn btn-outline-primary" onClick={save} disabled={saving}>{saving ? 'Сохранение…' : 'Сохранить'}</button>
+    </div>
+  )
+}
+
+type MaterialTypesEditorProps = {
+  materialTypes: MaterialTypeDefinition[]
+  onChange: (index: number, value: MaterialTypeDefinition) => void
+  onRemove: (index: number) => void
+  onAdd: () => void
+  duplicateKeys: Set<string>
+}
+
+type MaterialTypeCardProps = {
+  value: MaterialTypeDefinition
+  index: number
+  onChange: (value: MaterialTypeDefinition) => void
+  onRemove: () => void
+  disableRemove?: boolean
+  duplicateKey?: boolean
+}
+
+function MaterialTypesEditor({ materialTypes, onChange, onRemove, onAdd, duplicateKeys }: MaterialTypesEditorProps) {
+  if (!materialTypes.length) {
+    return (
+      <div className="d-grid gap-3">
+        <div className="text-muted" style={{ fontSize: 13 }}>Типы ещё не настроены.</div>
+        <button className="btn btn-outline-primary" type="button" onClick={onAdd}>Добавить тип</button>
+      </div>
+    )
+  }
+  return (
+    <div className="d-grid gap-3">
+      {materialTypes.map((item, index) => (
+        <MaterialTypeCard
+          key={item.key ? `${item.key}-${index}` : `material-${index}`}
+          value={item}
+          index={index}
+          onChange={next => onChange(index, next)}
+          onRemove={() => onRemove(index)}
+          disableRemove={item.key.trim().toLowerCase() === 'document'}
+          duplicateKey={item.key ? duplicateKeys.has(item.key.trim().toLowerCase()) : false}
+        />
+      ))}
+      <div>
+        <button className="btn btn-outline-primary" type="button" onClick={onAdd}>Добавить тип</button>
+      </div>
+    </div>
+  )
+}
+
+function MaterialTypeCard({ value, index, onChange, onRemove, disableRemove, duplicateKey }: MaterialTypeCardProps) {
+  const [specialDraft, setSpecialDraft] = useState(() => formatSpecial(value.special))
+  const [specialError, setSpecialError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!specialError) {
+      setSpecialDraft(formatSpecial(value.special))
+    }
+  }, [value.special, specialError])
+
+  const idPrefix = useMemo(() => `mt-${index}-${value.key || 'new'}`, [index, value.key])
+
+  const updateField = useCallback((patch: Partial<MaterialTypeDefinition>) => {
+    onChange({ ...value, ...patch })
+  }, [onChange, value])
+
+  const handleNumberChange = useCallback((field: keyof MaterialTypeDefinition) => (event: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = event.target.value
+    if (raw === '') {
+      updateField({ [field]: undefined } as Partial<MaterialTypeDefinition>)
+      return
+    }
+    const num = Number(raw)
+    if (Number.isFinite(num)) {
+      updateField({ [field]: num } as Partial<MaterialTypeDefinition>)
+    }
+  }, [updateField])
+
+  const handleSpecialBlur = useCallback(() => {
+    if (!specialDraft.trim()) {
+      setSpecialError(null)
+      updateField({ special: {} })
+      return
+    }
+    try {
+      const parsed = JSON.parse(specialDraft)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        setSpecialError(null)
+        updateField({ special: parsed })
+      } else {
+        setSpecialError('Ожидается JSON-объект')
+      }
+    } catch {
+      setSpecialError('Некорректный JSON')
+    }
+  }, [specialDraft, updateField])
+
+  return (
+    <div className="border rounded-3 p-3" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
+      <div className="d-flex justify-content-between align-items-start gap-3">
+        <div className="flex-grow-1">
+          <label className="form-label">Идентификатор (slug)</label>
+          <input
+            className={`form-control${duplicateKey ? ' is-invalid' : ''}`}
+            value={value.key}
+            onChange={event => updateField({ key: event.target.value })}
+            placeholder="report"
+          />
+          <div className="form-text">Используется для API, директорий и фильтров.</div>
+          {duplicateKey && <div className="invalid-feedback d-block">Ключ уже используется</div>}
+        </div>
+        <div className="d-flex flex-column align-items-end gap-2">
+          <div className="form-check form-switch">
+            <input
+              className="form-check-input"
+              type="checkbox"
+              id={`${idPrefix}-enabled`}
+              checked={value.enabled !== false}
+              onChange={event => updateField({ enabled: event.target.checked })}
+            />
+            <label className="form-check-label" htmlFor={`${idPrefix}-enabled`}>Активен</label>
+          </div>
+          <button className="btn btn-sm btn-outline-danger" type="button" onClick={onRemove} disabled={disableRemove}>Удалить</button>
+        </div>
+      </div>
+
+      <div className="row g-3 mt-2">
+        <div className="col-md-4">
+          <label className="form-label">Название</label>
+          <input className="form-control" value={value.label || ''} onChange={event => updateField({ label: event.target.value })} placeholder="Отчёт" />
+          <div className="form-text">Отображается пользователям.</div>
+        </div>
+        <div className="col-md-4">
+          <label className="form-label">LLM подсказка</label>
+          <textarea className="form-control" rows={2} value={value.llm_hint || ''} onChange={event => updateField({ llm_hint: event.target.value })} />
+        </div>
+        <div className="col-md-4">
+          <label className="form-label">Описание</label>
+          <textarea className="form-control" rows={2} value={value.description || ''} onChange={event => updateField({ description: event.target.value })} />
+        </div>
+      </div>
+
+      <div className="row g-3 mt-2">
+        <div className="col-md-4">
+          <label className="form-label">Ключевые слова в тексте</label>
+          <textarea className="form-control" rows={3} value={formatListInput(value.text_keywords)} onChange={event => updateField({ text_keywords: parseListInput(event.target.value) })} placeholder="статья, журнал" />
+          <div className="form-text">Через запятую или с новой строки.</div>
+        </div>
+        <div className="col-md-4">
+          <label className="form-label">Ключевые слова в имени файла</label>
+          <textarea className="form-control" rows={3} value={formatListInput(value.filename_keywords)} onChange={event => updateField({ filename_keywords: parseListInput(event.target.value) })} placeholder="report, отчёт" />
+        </div>
+        <div className="col-md-4">
+          <label className="form-label">Исключающие слова</label>
+          <textarea className="form-control" rows={3} value={formatListInput(value.exclude_keywords)} onChange={event => updateField({ exclude_keywords: parseListInput(event.target.value) })} placeholder="шаблон" />
+        </div>
+      </div>
+
+      <div className="row g-3 mt-2">
+        <div className="col-md-4">
+          <label className="form-label">Расширения</label>
+          <input className="form-control" value={formatListInput(value.extensions)} onChange={event => updateField({ extensions: parseListInput(event.target.value).map(token => token.toLowerCase()) })} placeholder="pdf, docx" />
+        </div>
+        <div className="col-md-4">
+          <label className="form-label">Псевдонимы (aliases)</label>
+          <input className="form-control" value={formatListInput(value.aliases)} onChange={event => updateField({ aliases: parseListInput(event.target.value) })} placeholder="alt-1, alt-2" />
+        </div>
+        <div className="col-md-4">
+          <label className="form-label">Порядок этапов (flow)</label>
+          <input className="form-control" value={formatListInput(value.flow)} onChange={event => updateField({ flow: parseListInput(event.target.value).map(token => token.toLowerCase()) })} placeholder="extension,filename,heuristics" />
+          <div className="form-text">Оставьте пустым, чтобы использовать все этапы.</div>
+        </div>
+      </div>
+
+      <details className="mt-3">
+        <summary className="fw-semibold">Расширенные настройки</summary>
+        <div className="row g-3 mt-2">
+          <div className="col-md-3">
+            <label className="form-label">Приоритет</label>
+            <input className="form-control" type="number" value={value.priority ?? ''} onChange={handleNumberChange('priority')} />
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Порог совпадений</label>
+            <input className="form-control" type="number" step="0.1" value={value.threshold ?? ''} onChange={handleNumberChange('threshold')} />
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Вес расширений</label>
+            <input className="form-control" type="number" step="0.1" value={value.extension_weight ?? ''} onChange={handleNumberChange('extension_weight')} />
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Вес имени</label>
+            <input className="form-control" type="number" step="0.1" value={value.filename_weight ?? ''} onChange={handleNumberChange('filename_weight')} />
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Вес текста</label>
+            <input className="form-control" type="number" step="0.1" value={value.text_weight ?? ''} onChange={handleNumberChange('text_weight')} />
+          </div>
+        </div>
+        <div className="d-flex flex-wrap gap-3 mt-3">
+          <div className="form-check">
+            <input className="form-check-input" type="checkbox" id={`${idPrefix}-req-ext`} checked={!!value.require_extension} onChange={event => updateField({ require_extension: event.target.checked })} />
+            <label className="form-check-label" htmlFor={`${idPrefix}-req-ext`}>Требуется совпадение расширения</label>
+          </div>
+          <div className="form-check">
+            <input className="form-check-input" type="checkbox" id={`${idPrefix}-req-name`} checked={!!value.require_filename} onChange={event => updateField({ require_filename: event.target.checked })} />
+            <label className="form-check-label" htmlFor={`${idPrefix}-req-name`}>Требуется совпадение имени файла</label>
+          </div>
+          <div className="form-check">
+            <input className="form-check-input" type="checkbox" id={`${idPrefix}-req-text`} checked={!!value.require_text} onChange={event => updateField({ require_text: event.target.checked })} />
+            <label className="form-check-label" htmlFor={`${idPrefix}-req-text`}>Требуется совпадение текста</label>
+          </div>
+        </div>
+        <div className="mt-3">
+          <label className="form-label">Специальные правила (JSON)</label>
+          <textarea
+            className={`form-control${specialError ? ' is-invalid' : ''}`}
+            rows={4}
+            value={specialDraft}
+            onChange={event => setSpecialDraft(event.target.value)}
+            onBlur={handleSpecialBlur}
+            placeholder='{"journal_toc_required": true, "min_toc_entries": 5}'
+          />
+          {specialError ? (
+            <div className="invalid-feedback d-block">{specialError}</div>
+          ) : (
+            <div className="form-text">Например: {`{"journal_toc_required": true, "min_toc_entries": 5}`}</div>
+          )}
+        </div>
+      </details>
     </div>
   )
 }

@@ -67,6 +67,7 @@ export function useCatalogueState() {
   const [aiMaxSnippets, setAiMaxSnippets] = useState<number>(3)
   const [aiFullText, setAiFullText] = useState<boolean>(false)
   const [aiUseLlmSnippets, setAiUseLlmSnippets] = useState<boolean>(false)
+  const [aiAllLanguages, setAiAllLanguages] = useState<boolean>(false)
   const [showAiSettings, setShowAiSettings] = useState<boolean>(false)
   const [facets, setFacets] = useState<FacetData | null>(null)
   const [facetsLoading, setFacetsLoading] = useState<boolean>(false)
@@ -241,6 +242,24 @@ export function useCatalogueState() {
 
   const canSpeakAnswer = useMemo(() => speechSupported && aiAnswerPlain.length > 0, [speechSupported, aiAnswerPlain])
 
+  const availableLanguages = useMemo(() => {
+    const langFacet = facets?.tag_facets?.lang
+    if (!langFacet || !Array.isArray(langFacet)) return []
+    const seen = new Set<string>()
+    const list: string[] = []
+    for (const entry of langFacet) {
+      if (!Array.isArray(entry) || entry.length === 0) continue
+      const rawValue = entry[0]
+      const code = String(rawValue || '').trim()
+      if (!code) continue
+      const key = code.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      list.push(code)
+    }
+    return list
+  }, [facets])
+
   const resetAiState = useCallback(() => {
     setAiMode(false)
     setAiProgress([])
@@ -250,6 +269,7 @@ export function useCatalogueState() {
     setAiFilteredKeywords([])
     setAiQueryHash('')
     setFeedbackStatus({})
+    setAiAllLanguages(false)
     stopSpeakingAnswer()
   }, [stopSpeakingAnswer])
 
@@ -258,7 +278,7 @@ export function useCatalogueState() {
       try {
         localStorage.setItem('catalogue.autoSpeakAnswer', autoSpeakAnswer ? '1' : '0')
       } catch {
-        // ignore storage errors
+        // Игнорируем сбои доступа к localStorage
       }
     }
     if (!autoSpeakAnswer) {
@@ -597,6 +617,11 @@ export function useCatalogueState() {
           payload.max_snippets = aiMaxSnippets
           payload.full_text = aiFullText
           payload.llm_snippets = aiUseLlmSnippets
+          payload.all_languages = aiAllLanguages
+          if (aiAllLanguages) {
+            const langs = availableLanguages.filter(code => typeof code === 'string' && code.trim().length > 0)
+            if (langs.length) payload.languages = langs
+          }
           if (collectionId) payload.collection_id = Number(collectionId)
           if (type) payload.material_types = [type]
           if (year_from) payload.year_from = year_from
@@ -666,7 +691,7 @@ export function useCatalogueState() {
       cancelled = true
       abortCurrent()
     }
-  }, [params, offset, selectedTags, aiMode, commit, aiTopK, aiDeepSearch, aiUseTags, aiUseText, aiMaxCandidates, aiChunkChars, aiMaxChunks, aiMaxSnippets, aiFullText, aiUseLlmSnippets, dq, collectionId, type, year_from, year_to, page])
+  }, [params, offset, selectedTags, aiMode, commit, aiTopK, aiDeepSearch, aiUseTags, aiUseText, aiMaxCandidates, aiChunkChars, aiMaxChunks, aiMaxSnippets, aiFullText, aiUseLlmSnippets, aiAllLanguages, availableLanguages, dq, collectionId, type, year_from, year_to, page])
 
   useEffect(() => {
     let cancelled = false
@@ -771,7 +796,8 @@ export function useCatalogueState() {
       aiTopK, setAiTopK, aiDeepSearch, setAiDeepSearch, aiUseTags, setAiUseTags,
       aiUseText, setAiUseText, aiMaxCandidates, setAiMaxCandidates, aiChunkChars, setAiChunkChars,
       aiMaxChunks, setAiMaxChunks, aiMaxSnippets, setAiMaxSnippets, aiFullText, setAiFullText,
-      aiUseLlmSnippets, setAiUseLlmSnippets, showAiSettings, setShowAiSettings,
+      aiUseLlmSnippets, setAiUseLlmSnippets, aiAllLanguages, setAiAllLanguages, showAiSettings, setShowAiSettings,
+      aiLanguageOptions: availableLanguages,
       aiLoadingState: { speechSupported, autoSpeakAnswer, setAutoSpeakAnswer, speechState, speechError, setSpeechError },
       handlers: { handleSourceFeedback, handleKeywordFeedback, handleKeywordRestore, speakAnswer, stopSpeakingAnswer },
       canSpeakAnswer,

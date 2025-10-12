@@ -14,6 +14,7 @@ import itertools
 import copy
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import click
 from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app, has_app_context
 from functools import wraps
 from werkzeug.utils import secure_filename
@@ -23,12 +24,16 @@ import threading
 try:
     from flask import copy_current_app_context
 except ImportError:  # запасной вариант для старых версий Flask
+    from flask import current_app
+
     def copy_current_app_context(func):
+        app_obj = current_app._get_current_object()
+
         @wraps(func)
         def wrapper(*args, **kwargs):
-            from flask import current_app
-            with current_app.app_context():
+            with app_obj.app_context():
                 return func(*args, **kwargs)
+
         return wrapper
 from sqlalchemy import func, and_, or_, exists, text, event
 from sqlalchemy.engine import Engine
@@ -51,6 +56,12 @@ from models import (
     AiSearchSnippetCache,
     AiSearchKeywordFeedback,
     AiSearchMetric,
+    RagDocument,
+    RagDocumentVersion,
+    RagDocumentChunk,
+    RagChunkEmbedding,
+    RagIngestFailure,
+    RagSession,
 )
 
 
@@ -95,6 +106,21 @@ from agregator.services import (
     list_system_log_files as svc_list_system_log_files,
     resolve_log_name as svc_resolve_log_name,
     tail_log_file as svc_tail_log_file,
+)
+from agregator.rag import (
+    ChunkConfig,
+    ContextSelector,
+    KeywordRetriever,
+    ContextSection,
+    RagIndexer,
+    VectorRetriever,
+    load_embedding_backend,
+    vector_to_bytes,
+    build_system_prompt,
+    build_user_prompt,
+    fallback_answer,
+    validate_answer,
+    detect_language,
 )
 try:
     import docx
@@ -758,7 +784,7 @@ def _row_text_for_search(f: File) -> str:
     return ' '.join(parts)
 
 # Простое кэширующее хранилище в памяти для расширения ключевых слов ИИ
-AI_EXPAND_CACHE: dict[str, tuple[float, list[str]]] = {}
+AI_EXPAND_CACHE: dict[str, tuple[float, list[str], list[tuple[str, int]]]] = {}
 
 # Весовые коэффициенты и параметры оценки (можно менять через переменные окружения)
 def _getf(name: str, default: float) -> float:
@@ -3897,7 +3923,7 @@ def call_lmstudio_summarize(text: str, filename: str) -> str:
             {"role": "user", "content": user},
         ]
         try:
-            provider_name = provider  # preserve for logs
+            provider_name = provider  # сохраняем имя провайдера для логов
             _provider, response = _llm_send_chat(
                 choice,
                 messages,
@@ -4988,11 +5014,11 @@ def aiword_index():
     <script>
     (function(){{
       try {{
-        // Align LM Studio config with Agregator
+        // Синхронизируем настройки LM Studio с Agregator
         localStorage.setItem('llm-writer-base-url', {lm_base!r});
         localStorage.setItem('llm-writer-model', {lm_model!r});
       }} catch(e){{}}
-      // Preload bibliography from Agregator DB
+      // Загружаем библиографию из базы Agregator
       fetch('/api/aiword/bibtex').then(r=>r.ok?r.text():Promise.resolve('')).then(txt=>{{
         if (!txt) return;
         try {{
@@ -6872,6 +6898,80 @@ def stats_redirect():
 def graph_redirect():
     return redirect('/app/graph')
 
+
+def _read_text_file_with_fallback(path: Path) -> str:
+    for encoding in ("utf-8", "cp1251", "latin-1"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            break
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _extract_text_for_rag(path: Path, *, limit_chars: int = 120_000) -> str:
+    ext = path.suffix.lower().lstrip(".")
+    if ext == "pdf":
+        return extract_text_pdf(path, limit_chars=limit_chars, force_ocr_first_page=False)
+    if ext == "docx":
+        return extract_text_docx(path, limit_chars=limit_chars)
+    if ext == "rtf":
+        return extract_text_rtf(path, limit_chars=limit_chars)
+    if ext == "epub":
+        return extract_text_epub(path, limit_chars=limit_chars)
+    if ext == "djvu":
+        return extract_text_djvu(path, limit_chars=limit_chars)
+    if ext in AUDIO_EXTS:
+        return transcribe_audio(path, limit_chars=limit_chars)
+    if ext in {"txt", "md", "markdown"}:
+        return _read_text_file_with_fallback(path)
+    try:
+        return _read_text_file_with_fallback(path)
+    except Exception:
+        return ""
+
+
+def _resolve_candidate_paths(file_obj: File) -> List[Path]:
+    candidates: List[Path] = []
+    if file_obj.path:
+        candidates.append(Path(file_obj.path))
+    if file_obj.rel_path:
+        rel = Path(file_obj.rel_path)
+        candidates.append(rel)
+        try:
+            scan_root = runtime_settings_store.current.scan_root
+            candidates.append(scan_root / rel)
+        except Exception:
+            pass
+        candidates.append(Path("library") / rel)
+    seen: set[str] = set()
+    resolved: List[Path] = []
+    for candidate in candidates:
+        try:
+            normalized = candidate.expanduser()
+        except Exception:
+            normalized = candidate
+        key = str(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append(normalized)
+    return resolved
+
+
+def _build_translation_hint(query_lang: Optional[str], section_lang: Optional[str]) -> str:
+    q = (query_lang or "").lower()
+    s = (section_lang or "").lower()
+    if not q or not s or q == s or s == "mixed" or s == "unknown":
+        return ""
+    if q == "ru":
+        return f"Фрагмент на {s}, ответ оставь на русском, цитаты — на оригинале."
+    if s == "ru":
+        return f"Fragment language ru; respond in {q or 'user language'}, keep quotes на русском."
+    return f"Фрагмент на {s}, ответ оставь на {q or 'языке запроса'}, цитаты — на оригинале."
+
+
 @app.cli.command("init-db")
 def init_db():
     db.create_all()
@@ -6918,6 +7018,485 @@ def init_db():
             added += 1
     db.session.commit()
     print(f"DB initialized. Added {added} tag schema rows (existing preserved).")
+
+
+@app.cli.command("rag-ingest-file")
+@click.argument("file_id", type=int)
+@click.option("--text-path", type=click.Path(exists=True, dir_okay=False), default=None, help="Путь к готовому тексту (если нужно переопределить извлечение).")
+@click.option("--normalizer-version", default="v1", show_default=True, help="Версия нормализатора текста.")
+@click.option("--max-tokens", type=int, default=700, show_default=True, help="Максимум токенов в чанке до overlap.")
+@click.option("--overlap", type=int, default=120, show_default=True, help="Число токенов overlap между чанками.")
+@click.option("--min-tokens", type=int, default=80, show_default=True, help="Минимум токенов в чанке, при меньшем объёме чанки сливаются.")
+@click.option("--skip-if-unchanged/--force", default=True, show_default=True, help="Пропускать индексацию, если текст не изменился.")
+@click.option("--commit/--no-commit", default=True, show_default=True, help="Коммитить изменения в базе данных.")
+def rag_ingest_file_cli(
+    file_id: int,
+    text_path: Optional[str],
+    normalizer_version: str,
+    max_tokens: int,
+    overlap: int,
+    min_tokens: int,
+    skip_if_unchanged: bool,
+    commit: bool,
+) -> None:
+    """Индексирует файл в таблицах RAG (документ, чанки, версии)."""
+    file_obj = File.query.filter_by(id=file_id).first()
+    if not file_obj:
+        raise click.ClickException(f"Файл с id={file_id} не найден.")
+
+    cfg = ChunkConfig(
+        max_tokens=max(16, max_tokens),
+        overlap=max(0, min(overlap, max_tokens - 1)),
+        min_tokens=max(1, min_tokens),
+    )
+    raw_text: Optional[str] = None
+    source_path: Optional[Path] = None
+
+    if text_path:
+        source_path = Path(text_path)
+        raw_text = _read_text_file_with_fallback(source_path)
+    else:
+        for candidate in _resolve_candidate_paths(file_obj):
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            extracted = _extract_text_for_rag(candidate)
+            if extracted:
+                source_path = candidate
+                raw_text = extracted
+                break
+    if not raw_text:
+        raw_text = file_obj.text_excerpt or ""
+    if not raw_text.strip():
+        raise click.ClickException("Не удалось получить текст для индексации (файл пустой или недоступен).")
+
+    metadata = {
+        "source": "cli.rag_ingest_file",
+        "source_path": str(source_path) if source_path else None,
+        "file_sha1": file_obj.sha1,
+        "manual_text_path": bool(text_path),
+    }
+
+    indexer = RagIndexer(chunk_config=cfg, normalizer_version=normalizer_version)
+    try:
+        result = indexer.ingest_document(
+            file_obj,
+            raw_text,
+            metadata=metadata,
+            skip_if_unchanged=skip_if_unchanged,
+            commit=commit,
+        )
+    except Exception as exc:
+        app.logger.exception("RAG ingest failed for file_id=%s", file_id)
+        raise click.ClickException(str(exc))
+
+    if result.get("skipped"):
+        click.echo(
+            f"RAG индекс для файла {file_id} пропущен: {result.get('reason', 'unchanged')}. "
+            f"Версия={result.get('version')}"
+        )
+    else:
+        click.echo(
+            f"RAG индекс готов: файл {file_id}, версия {result.get('version')} (id={result.get('version_id')}), "
+            f"чанков={result.get('chunks')}, язык={result.get('language')}, commit={'yes' if commit else 'no'}"
+        )
+
+
+@app.cli.command("rag-embed-chunks")
+@click.option("--backend", type=click.Choice(["auto", "hash", "sentence-transformers"]), default="auto", show_default=True)
+@click.option("--model-name", default="intfloat/multilingual-e5-large", show_default=True, help="Название модели/конфигурации.")
+@click.option("--model-version", default=None, help="Версия модели; по умолчанию берётся из backend.")
+@click.option("--dim", type=int, default=384, show_default=True, help="Размерность эмбеддингов (для hash backend).")
+@click.option("--batch-size", type=int, default=32, show_default=True)
+@click.option("--limit", type=int, default=256, show_default=True, help="Максимум чанков для обработки за один запуск.")
+@click.option("--min-chunk-id", type=int, default=None, help="Обрабатывать чанки с id >= указанного.")
+@click.option("--normalize/--no-normalize", default=True, show_default=True, help="Нормализовать векторы (L2).")
+@click.option("--device", default=None, help="Устройство для sentence-transformers (cpu/cuda:0/... ).")
+@click.option("--commit/--no-commit", default=True, show_default=True, help="Сохранять изменения в базе данных.")
+def rag_embed_chunks_cli(
+    backend: str,
+    model_name: str,
+    model_version: Optional[str],
+    dim: int,
+    batch_size: int,
+    limit: int,
+    min_chunk_id: Optional[int],
+    normalize: bool,
+    device: Optional[str],
+    commit: bool,
+) -> None:
+    """Генерирует эмбеддинги для чанков RAG и сохраняет их в БД."""
+    engine = load_embedding_backend(
+        backend,
+        model_name=model_name,
+        dim=dim,
+        normalize=normalize,
+        batch_size=batch_size,
+        device=device,
+    )
+    resolved_model_name = getattr(engine, "model_name", model_name)
+    resolved_model_version = model_version or getattr(engine, "model_version", "unknown")
+    try:
+        join_condition = and_(
+            RagChunkEmbedding.chunk_id == RagDocumentChunk.id,
+            RagChunkEmbedding.model_name == resolved_model_name,
+            RagChunkEmbedding.model_version == resolved_model_version,
+        )
+        query = db.session.query(RagDocumentChunk).outerjoin(RagChunkEmbedding, join_condition)
+        query = query.filter(RagChunkEmbedding.id.is_(None))
+        if min_chunk_id is not None:
+            query = query.filter(RagDocumentChunk.id >= min_chunk_id)
+        query = query.order_by(RagDocumentChunk.id)
+        if limit > 0:
+            query = query.limit(limit)
+        chunks: List[RagDocumentChunk] = query.all()
+        if not chunks:
+            click.echo("Нет чанков, требующих построения эмбеддингов.")
+            return
+        click.echo(f"Будет обработано чанков: {len(chunks)} (backend={getattr(engine, 'name', backend)})")
+        processed = 0
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            texts = [c.content or "" for c in batch]
+            vectors = engine.embed_many(texts)
+            if len(vectors) != len(batch):
+                raise RuntimeError("Размер ответа backend эмбеддингов не совпадает с размером батча.")
+            for chunk_obj, vector in zip(batch, vectors):
+                vector_bytes = vector_to_bytes(vector)
+                vector_checksum = hashlib.sha256(vector_bytes).hexdigest()
+                embedding = RagChunkEmbedding(
+                    chunk_id=chunk_obj.id,
+                    model_name=resolved_model_name,
+                    model_version=resolved_model_version,
+                    dim=len(vector),
+                    vector=vector_bytes,
+                    vector_checksum=vector_checksum,
+                )
+                db.session.add(embedding)
+                processed += 1
+        if commit:
+            db.session.commit()
+            click.echo(f"Сохранено эмбеддингов: {processed}")
+        else:
+            db.session.rollback()
+            click.echo(f"[no-commit] Сгенерировано эмбеддингов: {processed}, изменения отменены.")
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+
+
+@app.cli.command("rag-search")
+@click.argument("query", type=str)
+@click.option("--backend", type=click.Choice(["auto", "hash", "sentence-transformers"]), default="auto", show_default=True)
+@click.option("--model-name", default="intfloat/multilingual-e5-large", show_default=True)
+@click.option("--model-version", default=None)
+@click.option("--dim", type=int, default=384, show_default=True)
+@click.option("--normalize/--no-normalize", default=True, show_default=True)
+@click.option("--batch-size", type=int, default=32, show_default=True)
+@click.option("--device", default=None)
+@click.option("--top-k", type=int, default=6, show_default=True)
+@click.option("--max-candidates", type=int, default=1000, show_default=True)
+def rag_search_cli(
+    query: str,
+    backend: str,
+    model_name: str,
+    model_version: Optional[str],
+    dim: int,
+    normalize: bool,
+    batch_size: int,
+    device: Optional[str],
+    top_k: int,
+    max_candidates: int,
+) -> None:
+    """Выполняет dense-поиск по чанкам RAG для текстового запроса."""
+    engine = load_embedding_backend(
+        backend,
+        model_name=model_name,
+        dim=dim,
+        normalize=normalize,
+        batch_size=batch_size,
+        device=device,
+    )
+    try:
+        vectors = engine.embed_many([query])
+        resolved_model_name = getattr(engine, "model_name", model_name)
+        resolved_model_version = model_version or getattr(engine, "model_version", "unknown")
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+    if not vectors:
+        click.echo("Не удалось получить эмбеддинг для запроса.")
+        return
+    retriever = VectorRetriever(
+        model_name=resolved_model_name,
+        model_version=resolved_model_version,
+        max_candidates=max_candidates,
+    )
+    results = retriever.search_by_vector(vectors[0], top_k=top_k)
+    if not results:
+        click.echo("Совпадений не найдено.")
+        return
+    click.echo(f"Топ {len(results)} результатов:")
+    for idx, item in enumerate(results, start=1):
+        doc = item.document
+        doc_info = f"doc_id={doc.id}" if doc else "doc_id=?"
+        click.echo(
+            f"{idx}. score={item.score:.4f} chunk_id={item.chunk.id} {doc_info} "
+            f"lang={item.lang or '-'} keywords={item.keywords or '-'}"
+        )
+
+
+@app.cli.command("rag-context")
+@click.argument("query", type=str)
+@click.option("--backend", type=click.Choice(["auto", "hash", "sentence-transformers"]), default="auto", show_default=True)
+@click.option("--model-name", default="intfloat/multilingual-e5-large", show_default=True)
+@click.option("--model-version", default=None)
+@click.option("--dim", type=int, default=384, show_default=True)
+@click.option("--normalize/--no-normalize", default=True, show_default=True)
+@click.option("--batch-size", type=int, default=32, show_default=True)
+@click.option("--device", default=None)
+@click.option("--top-k", type=int, default=6, show_default=True)
+@click.option("--dense-top-k", type=int, default=12, show_default=True)
+@click.option("--sparse-limit", type=int, default=100, show_default=True)
+@click.option("--max-candidates", type=int, default=1000, show_default=True)
+@click.option("--max-per-document", type=int, default=2, show_default=True)
+@click.option("--doc-penalty", type=float, default=0.1, show_default=True)
+@click.option("--dense-weight", type=float, default=1.0, show_default=True)
+@click.option("--sparse-weight", type=float, default=0.6, show_default=True)
+@click.option("--min-dense-score", type=float, default=0.0, show_default=True)
+@click.option("--min-sparse-score", type=float, default=0.0, show_default=True)
+@click.option("--min-combined-score", type=float, default=0.0, show_default=True)
+@click.option("--max-tokens", type=int, default=3500, show_default=True, help="Ограничение по суммарным токенам контекста (0 = без ограничения).")
+@click.option("--rerank-mode", type=click.Choice(["none", "combined", "dense", "sparse"]), default="none", show_default=True, help="Дополнительный реранж, например по dense-score.")
+@click.option("--lang", multiple=True, help="Ограничить языки чанков (повторяемая опция).")
+def rag_context_cli(
+    query: str,
+    backend: str,
+    model_name: str,
+    model_version: Optional[str],
+    dim: int,
+    normalize: bool,
+    batch_size: int,
+    device: Optional[str],
+    top_k: int,
+    dense_top_k: int,
+    sparse_limit: int,
+    max_candidates: int,
+    max_per_document: int,
+    doc_penalty: float,
+    dense_weight: float,
+    sparse_weight: float,
+    min_dense_score: float,
+    min_sparse_score: float,
+    min_combined_score: float,
+    max_tokens: int,
+    rerank_mode: str,
+    lang: Sequence[str],
+) -> None:
+    """Формирует комбинированный контекст (dense + keyword) для запроса."""
+    languages = [item.strip() for item in lang if item.strip()] or None
+    engine = load_embedding_backend(
+        backend,
+        model_name=model_name,
+        dim=dim,
+        normalize=normalize,
+        batch_size=batch_size,
+        device=device,
+    )
+    try:
+        vectors = engine.embed_many([query])
+        resolved_model_name = getattr(engine, "model_name", model_name)
+        resolved_model_version = model_version or getattr(engine, "model_version", "unknown")
+    finally:
+        try:
+            engine.close()
+        except Exception:
+            pass
+    if not vectors:
+        click.echo("Не удалось получить эмбеддинг для запроса.")
+        return
+    vector_retriever = VectorRetriever(
+        model_name=resolved_model_name,
+        model_version=resolved_model_version,
+        max_candidates=max_candidates,
+    )
+    keyword_retriever = KeywordRetriever(limit=sparse_limit)
+    mode = (rerank_mode or "none").lower()
+
+    def _make_rerank(mode_name: str):
+        if mode_name == "dense":
+            return lambda _q, items: sorted(items, key=lambda c: (c.dense_score, c.combined_score), reverse=True)
+        if mode_name == "sparse":
+            return lambda _q, items: sorted(items, key=lambda c: (c.sparse_score, c.combined_score), reverse=True)
+        if mode_name == "combined":
+            return lambda _q, items: sorted(items, key=lambda c: c.combined_score, reverse=True)
+        return None
+
+    rerank_fn = _make_rerank(mode)
+    selector = ContextSelector(
+        vector_retriever=vector_retriever,
+        keyword_retriever=keyword_retriever,
+        dense_weight=dense_weight,
+        sparse_weight=sparse_weight,
+        doc_penalty=doc_penalty,
+        max_per_document=max_per_document,
+        dense_top_k=dense_top_k,
+        sparse_limit=sparse_limit,
+        min_dense_score=min_dense_score,
+        min_sparse_score=min_sparse_score,
+        min_combined_score=min_combined_score,
+        max_total_tokens=max_tokens if max_tokens > 0 else None,
+        rerank_fn=rerank_fn,
+    )
+    contexts = selector.select(
+        query=query,
+        query_vector=vectors[0],
+        top_k=top_k,
+        languages=languages,
+        max_total_tokens=max_tokens if max_tokens > 0 else None,
+    )
+    if not contexts:
+        click.echo("Контекст не подобран.")
+        return
+    click.echo(f"Отобрано чанков: {len(contexts)}")
+    for idx, ctx in enumerate(contexts, start=1):
+        doc = ctx.document
+        doc_id = doc.id if doc else None
+        title = None
+        if doc and getattr(doc, "file", None):
+            title = doc.file.title or doc.file.filename
+        keywords_text = ", ".join(ctx.matched_terms[:5]) if ctx.matched_terms else "-"
+        preview = (ctx.chunk.preview or ctx.chunk.content or "")[:200].replace("\n", " ").strip()
+        click.echo(
+            f"{idx}. doc={doc_id or '-'} chunk={ctx.chunk.id} adj={ctx.adjusted_score:.4f} "
+            f"combined={ctx.combined_score:.4f} dense={ctx.dense_score:.4f} sparse={ctx.sparse_score:.4f} "
+            f"lang={ctx.chunk.lang_primary or '-'} keywords={keywords_text}"
+        )
+        if title:
+            click.echo(f"   title: {title}")
+        if ctx.reasoning_hint:
+            click.echo(f"   hint: {ctx.reasoning_hint}")
+        if preview:
+            click.echo(f"   preview: {preview}")
+
+
+@app.cli.command("rag-generate")
+@click.argument("query", type=str)
+@click.option("--chunk-id", "chunk_ids", multiple=True, type=int, required=True, help="ID чанков, которые попадут в контекст.")
+@click.option("--temperature", type=float, default=0.2, show_default=True)
+@click.option("--max-tokens", type=int, default=400, show_default=True)
+@click.option("--llm/--no-llm", default=True, show_default=True, help="Вызвать ли LLM, иначе вывести только промпты.")
+@click.option("--custom-system", default=None, help="Переопределить системный промпт.")
+@click.option("--store/--no-store", default=True, show_default=True, help="Сохранить результат в таблицу rag_sessions.")
+def rag_generate_cli(
+    query: str,
+    chunk_ids: Sequence[int],
+    temperature: float,
+    max_tokens: int,
+    llm: bool,
+    custom_system: Optional[str],
+    store: bool,
+) -> None:
+    """Собирает промпт для RAG-ответа и опционально вызывает LLM."""
+    if not chunk_ids:
+        click.echo("Не указаны chunk-id.")
+        raise click.Abort()
+    rows = (
+        db.session.query(RagDocumentChunk, RagDocument, File)
+        .join(RagDocument, RagDocumentChunk.document_id == RagDocument.id)
+        .join(File, File.id == RagDocument.file_id)
+        .filter(RagDocumentChunk.id.in_(chunk_ids))
+        .order_by(RagDocumentChunk.id)
+        .all()
+    )
+    if not rows:
+        click.echo("Чанки не найдены.")
+        return
+    sections: List[ContextSection] = []
+    allowed_refs = set()
+    query_lang = detect_language(query)
+    for chunk, document, file_obj in rows:
+        extra_meta = {}
+        if chunk.meta:
+            try:
+                extra_meta = json.loads(chunk.meta)
+            except Exception:
+                extra_meta = {}
+        section_lang = (chunk.lang_primary or document.lang_primary or "").lower()
+        sections.append(
+            ContextSection(
+                doc_id=document.id,
+                chunk_id=chunk.id,
+                title=file_obj.title or file_obj.filename or f"Документ {file_obj.id}",
+                language=section_lang,
+                score_dense=float(extra_meta.get("dense_score") or 0.0),
+                score_sparse=float(extra_meta.get("sparse_score") or 0.0),
+                combined_score=float(extra_meta.get("combined_score") or 0.0),
+                reasoning_hint=str(extra_meta.get("hint") or ""),
+                preview=chunk.preview or str(extra_meta.get("preview") or ""),
+                content=chunk.content or "",
+                url=file_obj.rel_path,
+                extra={"section_path": chunk.section_path or ""},
+            )
+        )
+        allowed_refs.add((document.id, chunk.id))
+
+    for section in sections:
+        section.translation_hint = _build_translation_hint(query_lang, section.language)
+
+    system_prompt = build_system_prompt(custom_system)
+    user_prompt = build_user_prompt(query, sections)
+    click.echo("=== System Prompt ===")
+    click.echo(system_prompt)
+    click.echo("\n=== User Prompt ===")
+    click.echo(user_prompt)
+
+    if not llm:
+        click.echo("\nLLM вызов отключён (флаг --no-llm).")
+        return
+
+    answer = call_lmstudio_compose(
+        system_prompt,
+        user_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    ).strip()
+    if not answer:
+        answer = fallback_answer()
+    click.echo("\n=== LLM Ответ ===")
+    click.echo(answer)
+
+    validation = validate_answer(answer, sorted(allowed_refs))
+    click.echo("\n=== Валидация ===")
+    click.echo(json.dumps(validation.as_dict(), ensure_ascii=False, indent=2))
+
+    if store:
+        try:
+            session_record = RagSession(
+                query=query,
+                query_lang=query_lang,
+                chunk_ids=",".join(str(cid) for cid in chunk_ids),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                answer=answer,
+                validation=json.dumps(validation.as_dict(), ensure_ascii=False),
+                model_name=getattr(_rt(), "lmstudio_model", None),
+                params=json.dumps({
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "llm": bool(llm),
+                }, ensure_ascii=False),
+            )
+            db.session.add(session_record)
+            db.session.commit()
+            click.echo(f"\nSession saved: id={session_record.id}")
+        except Exception as exc:
+            db.session.rollback()
+            click.echo(f"\n[warn] Не удалось сохранить сессию: {exc}")
+
 
 # ------------------- App bootstrap -------------------
 
@@ -8335,17 +8914,201 @@ def _extract_quoted_phrases(text: str) -> list[str]:
     return phrases
 
 
-def _ai_expand_keywords(query: str) -> list[str]:
+def _normalize_language_code(lang: str) -> str | None:
+    if lang is None:
+        return None
+    code = re.sub(r"[^a-zA-Z\-]", "", str(lang)).lower()
+    if not code:
+        return None
+    if "-" in code:
+        code = code.split("-", 1)[0]
+    if len(code) < 2:
+        return None
+    return code[:8]
+
+
+def _guess_query_language(text: str) -> str | None:
+    if not text:
+        return None
+    cyr = sum(1 for ch in text if ('а' <= ch.lower() <= 'я') or ch.lower() == 'ё')
+    lat = sum(1 for ch in text if 'a' <= ch.lower() <= 'z')
+    if cyr == 0 and lat == 0:
+        return None
+    return 'ru' if cyr >= lat else 'en'
+
+
+def _ensure_russian_text(text: str, *, label: str = 'text') -> tuple[str, bool]:
+    """
+    Гарантировать русскую формулировку текста.
+
+    Возвращает (new_text, translated_flag). Перевод применяется, только если в тексте
+    отсутствует кириллица, но есть латиница — чтобы не трогать уже русские ответы и смешанные фрагменты.
+    """
+    original = (text or '').strip()
+    if not original:
+        return '', False
+    cyr = sum(1 for ch in original if 'а' <= ch.lower() <= 'я' or ch.lower() == 'ё')
+    lat = sum(1 for ch in original if 'a' <= ch.lower() <= 'z')
+    if cyr > 0 or lat == 0:
+        return original, False
+    system = (
+        "Ты профессиональный переводчик. Переведи приведённый текст на русский язык, "
+        "сохраняя смысл, факты, числовые значения и ссылки. Не добавляй пояснений и комментариев."
+    )
+    user = (
+        "Исходный текст:\n"
+        f"{original}\n\n"
+        "Переведи этот текст на русский язык, сохранив стиль и точность. "
+        "Не добавляй ничего сверх перевода."
+    )
+    translated = ""
+    try:
+        translated = call_lmstudio_compose(
+            system,
+            user,
+            temperature=0.0,
+            max_tokens=min(max(200, len(original) + 120), _lm_max_output_tokens()),
+        )
+    except Exception as exc:
+        app.logger.debug("Russian translation failed (%s): %s", label, exc)
+    translated = (translated or '').strip()
+    if not translated:
+        return original, False
+    trans_cyr = sum(1 for ch in translated if 'а' <= ch.lower() <= 'я' or ch.lower() == 'ё')
+    if trans_cyr == 0:
+        return original, False
+    return translated, True
+
+
+def _ai_expand_multilingual_terms(query: str, base_terms: Sequence[str], languages: Sequence[str]) -> tuple[list[str], list[tuple[str, int]]]:
+    sanitized: list[str] = []
+    seen_langs = set()
+    for raw_lang in languages:
+        normalized = _normalize_language_code(raw_lang)
+        if not normalized:
+            continue
+        if normalized in seen_langs:
+            continue
+        seen_langs.add(normalized)
+        sanitized.append(normalized)
+    if not sanitized:
+        return [], []
+    base_lang = _guess_query_language(query)
+    if base_lang:
+        sanitized = [lang for lang in sanitized if lang != base_lang]
+    if not sanitized:
+        return [], []
+    sanitized = sanitized[:5]
+    base_preview = ", ".join([str(t) for t in list(base_terms)[:6] if t])
+    system = (
+        "Ты помогаешь поисковой системе расширить запрос. "
+        "Для каждого указанного языка подбери 2-6 коротких ключевых фраз (1-3 слова) на этом языке. "
+        "Фразы должны быть естественными, без транслитерации и повторов. "
+        "Верни JSON-объект без пояснений: {\"en\": [\"term\"...], \"de\": [...]}. Ответ должен быть только JSON."
+        " Используй только перечисленные языки в виде ключей."
+    )
+    user_parts = [
+        f"Исходный запрос: {query}",
+    ]
+    if base_preview:
+        user_parts.append(f"Базовые ключевые слова: {base_preview}")
+    user_parts.append(f"Языки для расширения: {', '.join(sanitized)}")
+    user_parts.append("Не добавляй другие поля и пояснения.")
+    raw = call_lmstudio_compose(system, "\n".join(user_parts), temperature=0.15, max_tokens=280)
+    if not raw:
+        return [], []
+    raw = raw.strip()
+    if not raw:
+        return [], []
+    parsed: dict[str, list[str]] | None = None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            parsed = data
+    except Exception:
+        match = re.search(r"```json\s*(\{.*?\})\s*```", raw, flags=re.S)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                if isinstance(data, dict):
+                    parsed = data
+            except Exception:
+                parsed = None
+    if not parsed:
+        return [], []
+    base_seen = {str(term).strip().lower() for term in base_terms if term}
+    extras: list[str] = []
+    lang_order: list[str] = []
+    lang_counter: dict[str, int] = {}
+    for lang, items in parsed.items():
+        normalized_lang = _normalize_language_code(lang)
+        if not normalized_lang or normalized_lang not in sanitized:
+            continue
+        if not isinstance(items, list):
+            continue
+        if normalized_lang not in lang_counter:
+            lang_counter[normalized_lang] = 0
+            lang_order.append(normalized_lang)
+        for item in items:
+            normalized_term = _normalize_keyword_candidate(item)
+            if not normalized_term:
+                continue
+            key = normalized_term.lower()
+            if key in base_seen:
+                continue
+            base_seen.add(key)
+            extras.append(normalized_term)
+            lang_counter[normalized_lang] += 1
+    lang_stats = [(lang, lang_counter.get(lang, 0)) for lang in lang_order if lang_counter.get(lang, 0) > 0]
+    return extras, lang_stats
+
+
+def _ai_expand_keywords(
+    query: str,
+    *,
+    multi_lang: bool = False,
+    target_langs: Sequence[str] | None = None,
+) -> tuple[list[str], list[tuple[str, int]]]:
     q = (query or "").strip()
     if not q:
-        return []
+        return [], []
     mandatory = _extract_quoted_phrases(q)
-    # TTL в минутах; по умолчанию 20
+    sanitized_langs: list[str] = []
+    if multi_lang and target_langs:
+        seen_langs = set()
+        for raw_lang in target_langs:
+            normalized = _normalize_language_code(raw_lang)
+            if not normalized:
+                continue
+            if normalized in seen_langs:
+                continue
+            seen_langs.add(normalized)
+            sanitized_langs.append(normalized)
+        if sanitized_langs:
+            sanitized_langs = sanitized_langs[:5]
+    base_lang = _guess_query_language(q)
+    cross_langs: list[str] = []
+    if base_lang == 'ru':
+        cross_langs.append('en')
+    elif base_lang == 'en':
+        cross_langs.append('ru')
+    active_langs: list[str] = []
+    for lang in sanitized_langs + cross_langs:
+        normalized = _normalize_language_code(lang)
+        if not normalized:
+            continue
+        if normalized == base_lang:
+            continue
+        if normalized not in active_langs:
+            active_langs.append(normalized)
     try:
         ttl_min = int(os.getenv("AI_EXPAND_TTL_MIN", "20") or 20)
     except Exception:
         ttl_min = 20
-    key = _sha256(q)
+    cache_suffix = ""
+    if active_langs:
+        cache_suffix = f"|lang:{','.join(active_langs)}"
+    key = _sha256(q + cache_suffix)
     now = _now()
     cached = AI_EXPAND_CACHE.get(key)
     if cached and (now - cached[0]) < ttl_min * 60:
@@ -8353,18 +9116,16 @@ def _ai_expand_keywords(query: str) -> list[str]:
         for phrase in mandatory:
             if phrase and phrase not in cached_terms:
                 cached_terms.insert(0, phrase)
-        return cached_terms
-    # Запрашиваем ключевые слова у LLM; при сбое используем простые токены
+        cached_langs = cached[2] if len(cached) > 2 else []
+        return cached_terms, cached_langs
     kws = []
     try:
         kws = call_lmstudio_keywords(q, "ai-search") or []
     except Exception:
         kws = []
     if not kws:
-        # запасной вариант: наивное разделение на токены
         toks = [t.strip() for t in re.split(r"[\s,;]+", q) if t.strip()]
         kws = toks[:12]
-    # удаляем дубликаты, сохраняя порядок и приводя к нормализованному виду
     seen = set()
     res: list[str] = []
     for w in kws:
@@ -8376,13 +9137,20 @@ def _ai_expand_keywords(query: str) -> list[str]:
         if normalized not in seen:
             seen.add(normalized)
             res.append(normalized)
-    # добавляем обязательные фразы из кавычек в начало
+    lang_details: list[tuple[str, int]] = []
+    if active_langs:
+        extra_terms, extra_stats = _ai_expand_multilingual_terms(q, res, active_langs)
+        for term in extra_terms:
+            if term and term not in seen:
+                seen.add(term)
+                res.append(term)
+        lang_details.extend(extra_stats)
     for phrase in reversed(mandatory):
         if phrase and phrase not in seen:
             res.insert(0, phrase)
             seen.add(phrase)
-    AI_EXPAND_CACHE[key] = (now, res)
-    return res
+    AI_EXPAND_CACHE[key] = (now, res, lang_details)
+    return res, lang_details
 
 
 def _read_cached_excerpt_for_file(f: File) -> str:
@@ -8793,6 +9561,23 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     except Exception:
         max_snippets = 3
     max_snippets = max(1, min(max_snippets, 10))
+    all_languages = bool(data.get('all_languages'))
+    try:
+        requested_languages = [str(x).strip() for x in (data.get('languages') or []) if str(x).strip()]
+    except Exception:
+        requested_languages = []
+    if requested_languages:
+        dedup_langs: list[str] = []
+        seen_langs = set()
+        for raw_lang in requested_languages:
+            key = raw_lang.lower()
+            if key in seen_langs:
+                continue
+            seen_langs.add(key)
+            dedup_langs.append(raw_lang)
+        requested_languages = dedup_langs
+    else:
+        requested_languages = []
     progress = _ProgressLogger(progress_cb)
     query_hash = _query_fingerprint(query, data)
     mandatory_terms = _extract_quoted_phrases(query)
@@ -8818,6 +9603,16 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     progress.add(f"Параметры: кандидатов ≤ {max_candidates}, сниппетов ≤ {max_snippets}")
     progress.add(f"Контент: чанк {chunk_chars} симв., чанков ≤ {max_chunks}, full-text {'вкл' if full_text else 'выкл'}")
     progress.add(f"LLM сниппеты: {'вкл' if llm_snippets else 'выкл'}")
+    if all_languages:
+        if requested_languages:
+            preview_langs = ', '.join(requested_languages[:5])
+            if len(requested_languages) > 5:
+                preview_langs += '…'
+            progress.add(f"Языки: все ({preview_langs})")
+        else:
+            progress.add("Языки: все (нет языковых тегов)")
+    else:
+        progress.add("Языки: по умолчанию")
     # Необязательный фильтр по коллекциям (список id)
     if 'collection_id' in data and 'collection_ids' not in data:
         data['collection_ids'] = [data['collection_id']]
@@ -8848,10 +9643,14 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         tag_filters = []
 
     # Расширяем и токенизируем
-    keywords = _ai_expand_keywords(query)
+    keywords, lang_details = _ai_expand_keywords(query, multi_lang=all_languages, target_langs=requested_languages)
     base_tokens = _tokenize_query(query)
     extra_tokens: list[str] = []
     ai_phrase_terms: list[str] = []
+    if lang_details:
+        preview_langs = ', '.join(f"{code}(+{count})" for code, count in lang_details if count > 0)
+        if preview_langs:
+            progress.add(f"Доп. языки: {preview_langs}")
     for w in keywords:
         normalized_kw = _normalize_keyword_candidate(w)
         if normalized_kw:
@@ -9214,19 +10013,22 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                     continue
                 cache_entry = _get_cached_snippet(res.get('file_id'), query_hash, True)
                 if cache_entry and cache_entry.snippet:
-                    res['llm_snippet'] = cache_entry.snippet
-                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — cache hit")
-                    _store_snippet_cache(res.get('file_id'), query_hash, True, cache_entry.snippet, meta={'len': len(cache_entry.snippet)}, ttl_hours=SNIPPET_CACHE_TTL_HOURS)
+                    translated_snippet, translated = _ensure_russian_text(cache_entry.snippet, label='snippet-cache')
+                    res['llm_snippet'] = translated_snippet
+                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — cache hit" + (' (перевод)' if translated else ''))
+                    if translated:
+                        _store_snippet_cache(res.get('file_id'), query_hash, True, translated_snippet, meta={'len': len(translated_snippet)}, ttl_hours=SNIPPET_CACHE_TTL_HOURS)
                     continue
                 ctx = context[:1200]
                 system = (
                     "Ты создаёшь короткий сниппет (до двух предложений) для поисковой выдачи. "
-                    "Используй только предоставленный текст, не добавляй новых фактов."
+                    "Используй только предоставленный текст, не добавляй новых фактов. "
+                    "Отвечай на русском языке."
                 )
                 user_msg = (
                     f"Запрос: {query}\n"
                     f"Фрагменты документа:\n{ctx}\n"
-                    "Сформулируй 1-2 предложения с ключевыми фактами и сохрани смысл."
+                    "Сформулируй 1-2 предложения с ключевыми фактами и сохрани смысл. Ответ дай на русском языке."
                 )
                 snippet_text = ""
                 error_logged = False
@@ -9236,8 +10038,12 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                     error_logged = True
                     progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — ошибка: {exc}")
                 if snippet_text:
+                    snippet_text, translated = _ensure_russian_text(snippet_text, label='snippet')
                     res['llm_snippet'] = snippet_text
-                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — готово ({len(snippet_text)} символов)")
+                    note = f" ({len(snippet_text)} символов)"
+                    if translated:
+                        note += ", переведено"
+                    progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — готово{note}")
                     _store_snippet_cache(res.get('file_id'), query_hash, True, snippet_text, meta={'len': len(snippet_text)})
                 elif not error_logged:
                     progress.add(f"LLM сниппеты [{idx}/{total_targets}]: {title} — пустой ответ")
@@ -9263,11 +10069,19 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
             system = (
                 "Ты помощник поиска. Сформулируй краткий, фактический ответ на вопрос пользователя, "
                 "используя ТОЛЬКО предоставленные фрагменты. Не выдумывай и не обобщай сверх текста. "
-                "Ссылайся на источники квадратными скобками [n] там, где берешь факт. Не упоминай слова 'стенограмма' или подобные."
+                "Ссылайся на источники квадратными скобками [n] там, где берешь факт. Не упоминай слова 'стенограмма' или подобные. "
+                "Отвечай строго на русском языке."
             )
-            user_msg = f"Вопрос: {query}\nФрагменты:\n" + "\n".join(lines)
+            user_msg = (
+                f"Вопрос: {query}\n"
+                f"Фрагменты:\n" + "\n".join(lines) + "\n"
+                "Ответь на русском языке."
+            )
             answer = (call_lmstudio_compose(system, user_msg, temperature=0.1, max_tokens=min(350, _lm_max_output_tokens())) or "").strip()
             if answer:
+                answer, translated = _ensure_russian_text(answer, label='answer')
+                if translated:
+                    progress.add("LLM ответ: переведён на русский")
                 progress.add(f"LLM ответ готов ({len(answer)} символов)")
             else:
                 progress.add("LLM ответ пуст")

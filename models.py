@@ -47,7 +47,7 @@ class CollectionMember(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     collection_id = db.Column(db.Integer, db.ForeignKey("collections.id", ondelete="CASCADE"), index=True, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
-    role = db.Column(db.String, nullable=False, default="viewer")  # роли viewer/editor
+    role = db.Column(db.String, nullable=False, default="viewer")  # допустимые роли: viewer (просмотр) или editor (редактирование)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     collection = db.relationship("Collection", backref="members", lazy=True)
@@ -89,6 +89,7 @@ class File(db.Model):
 
     collection = db.relationship("Collection", backref="files", lazy=True)
     tags = db.relationship("Tag", backref="file", cascade="all, delete-orphan")
+    rag_document = db.relationship("RagDocument", backref="file", uselist=False, cascade="all, delete-orphan")
 
 
 class Tag(db.Model):
@@ -182,7 +183,7 @@ class AiSearchKeywordFeedback(db.Model):
     file_id = db.Column(db.Integer, db.ForeignKey("files.id", ondelete="SET NULL"), index=True, nullable=True)
     query_hash = db.Column(db.String(64), index=True, nullable=False)
     keyword = db.Column(db.String(120), nullable=True)
-    action = db.Column(db.String(32), nullable=False)  # clicked, relevant, irrelevant, ignored
+    action = db.Column(db.String(32), nullable=False)  # варианты действий: клик, релевантно, нерелевантно, игнор
     score = db.Column(db.Float, nullable=True)
     detail = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -206,6 +207,135 @@ class AiSearchMetric(db.Model):
     meta = db.Column(db.Text, nullable=True)
 
     user = db.relationship("User", lazy=True)
+
+
+class RagDocument(db.Model):
+    __tablename__ = "rag_documents"
+    id = db.Column(db.Integer, primary_key=True)
+    file_id = db.Column(db.Integer, db.ForeignKey("files.id", ondelete="CASCADE"), unique=True, nullable=False)
+    latest_version = db.Column(db.Integer, nullable=False, default=0)
+    is_ready_for_rag = db.Column(db.Boolean, nullable=False, default=False)
+    import_status = db.Column(db.String(32), nullable=False, default="pending")
+    lang_primary = db.Column(db.String(16), nullable=True)
+    last_indexed_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    versions = db.relationship(
+        "RagDocumentVersion",
+        backref="document",
+        order_by="RagDocumentVersion.version",
+        cascade="all, delete-orphan",
+        lazy=True,
+    )
+    chunks = db.relationship(
+        "RagDocumentChunk",
+        backref="document",
+        cascade="all, delete-orphan",
+        lazy=True,
+    )
+
+
+class RagDocumentVersion(db.Model):
+    __tablename__ = "rag_document_versions"
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey("rag_documents.id", ondelete="CASCADE"), index=True, nullable=False)
+    version = db.Column(db.Integer, nullable=False)
+    sha256 = db.Column(db.String(64), nullable=True)
+    dedupe_hash = db.Column(db.String(64), nullable=True)
+    imported_at = db.Column(db.DateTime, default=datetime.utcnow)
+    normalizer_version = db.Column(db.String(32), nullable=True)
+    metadata_json = db.Column(db.Text, nullable=True)
+    raw_text = db.Column(db.Text, nullable=True)
+    clean_text = db.Column(db.Text, nullable=True)
+    lang_primary = db.Column(db.String(16), nullable=True)
+    chunk_count = db.Column(db.Integer, nullable=False, default=0)
+    error = db.Column(db.Text, nullable=True)
+
+    chunks = db.relationship(
+        "RagDocumentChunk",
+        backref="version",
+        cascade="all, delete-orphan",
+        lazy=True,
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint("document_id", "version", name="uq_rag_doc_version"),
+    )
+
+
+class RagDocumentChunk(db.Model):
+    __tablename__ = "rag_document_chunks"
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey("rag_documents.id", ondelete="CASCADE"), index=True, nullable=False)
+    version_id = db.Column(db.Integer, db.ForeignKey("rag_document_versions.id", ondelete="CASCADE"), index=True, nullable=False)
+    ordinal = db.Column(db.Integer, nullable=False)
+    section_path = db.Column(db.String, nullable=True)
+    token_count = db.Column(db.Integer, nullable=True)
+    char_count = db.Column(db.Integer, nullable=True)
+    content = db.Column(db.Text, nullable=False)
+    content_hash = db.Column(db.String(64), nullable=True, index=True)
+    preview = db.Column(db.String(512), nullable=True)
+    keywords_top = db.Column(db.String(512), nullable=True)
+    lang_primary = db.Column(db.String(16), nullable=True)
+    meta = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    embeddings = db.relationship(
+        "RagChunkEmbedding",
+        backref="chunk",
+        cascade="all, delete-orphan",
+        lazy=True,
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint("version_id", "ordinal", name="uq_rag_chunk_order"),
+    )
+
+
+class RagChunkEmbedding(db.Model):
+    __tablename__ = "rag_chunk_embeddings"
+    id = db.Column(db.Integer, primary_key=True)
+    chunk_id = db.Column(db.Integer, db.ForeignKey("rag_document_chunks.id", ondelete="CASCADE"), index=True, nullable=False)
+    model_name = db.Column(db.String(120), nullable=False)
+    model_version = db.Column(db.String(60), nullable=True)
+    dim = db.Column(db.Integer, nullable=False)
+    vector = db.Column(db.LargeBinary, nullable=False)
+    vector_checksum = db.Column(db.String(64), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("chunk_id", "model_name", "model_version", name="uq_rag_chunk_embedding_variant"),
+    )
+
+
+class RagIngestFailure(db.Model):
+    __tablename__ = "rag_ingest_failures"
+    id = db.Column(db.Integer, primary_key=True)
+    file_id = db.Column(db.Integer, db.ForeignKey("files.id", ondelete="SET NULL"), index=True, nullable=True)
+    stage = db.Column(db.String(64), nullable=False)
+    error = db.Column(db.Text, nullable=False)
+    resolved = db.Column(db.Boolean, nullable=False, default=False)
+    resolved_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    meta = db.Column(db.Text, nullable=True)
+
+    file = db.relationship("File", lazy=True)
+
+
+class RagSession(db.Model):
+    __tablename__ = "rag_sessions"
+    id = db.Column(db.Integer, primary_key=True)
+    query = db.Column(db.Text, nullable=False)
+    query_lang = db.Column(db.String(16), nullable=True)
+    chunk_ids = db.Column(db.Text, nullable=False)
+    system_prompt = db.Column(db.Text, nullable=False)
+    user_prompt = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, nullable=True)
+    validation = db.Column(db.Text, nullable=True)
+    model_name = db.Column(db.String(120), nullable=True)
+    params = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
 
 def upsert_tag(file_obj: File, key: str, value: str):

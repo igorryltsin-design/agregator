@@ -51,7 +51,7 @@ export default function GraphPage() {
         }
         const res = await fetch(`/api/graph?${qs.toString()}`)
         const data: { nodes: Node[]; edges: Edge[] } = await res.json()
-        // degree filter (client)
+        // Клиентская фильтрация по степени узлов
         const deg: Record<string, number> = {}
         data.edges.forEach(e => { deg[e.from]=(deg[e.from]||0)+1; deg[e.to]=(deg[e.to]||0)+1 })
         let nodesFiltered = data.nodes.filter(n => (deg[n.id]||0) >= (hideSingletons ? Math.max(2, minDegree) : minDegree))
@@ -80,7 +80,7 @@ export default function GraphPage() {
       } finally { setLoading(false) }
     }
     if (view === 'graph') run()
-    // Cleanup created network and datasets on dependency change
+    // При смене зависимостей удаляем созданные сети и наборы данных
     return () => {
       try { networkRef.current?.destroy() } catch {}
       try { nodesRef.current?.clear() } catch {}
@@ -89,7 +89,7 @@ export default function GraphPage() {
     }
   }, [view, keys, minDegree, hideSingletons, limit, search, smartSearch, yearFrom, yearTo])
 
-  // Load facets once to discover tag keys and counts for cloud
+  // Один раз загружаем фасеты, чтобы узнать ключи тегов и построить облако
   useEffect(() => {
     let cancelled = false
     const load = async () => {

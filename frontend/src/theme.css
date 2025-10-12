@@ -651,7 +651,7 @@ input[type="file"]:disabled::-webkit-file-upload-button {
   line-height: 1.2;
 }
 
-/* Admin facet settings layout tweaks */
+/* Подстройка раскладки блока настроек фасетов */
 .facet-settings .facet-switch {
   --switch-width: 32px;
   --switch-height: 18px;
@@ -745,30 +745,30 @@ input[type="file"]:disabled::-webkit-file-upload-button {
   min-height: auto;
 }
 
-/* KPI widgets */
+/* KPI‑виджеты */
 .kpi .label { text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }
 .kpi .value { font-size: 28px; font-weight: 700; }
 
-/* Charts */
+/* Графики */
 .chart-card { height: 260px; }
 .chart-card .chart-title { font-size: 14px; color: var(--muted); margin: 4px 8px; }
 .chart-card .chart-body { position: relative; height: calc(100% - 28px); }
 
-/* Masonry layout */
+/* Раскладка masonry */
 .masonry { column-count: 1; column-gap: 12px; }
 @media (min-width: 768px) { .masonry { column-count: 2; } }
 @media (min-width: 1200px) { .masonry { column-count: 3; } }
-/* Ensure proper flow inside multi‑column masonry */
+/* Обеспечиваем корректный поток во многостолбцовом masonry */
 .masonry-item {
   break-inside: avoid;
   margin-bottom: 12px;
-  display: inline-block; /* needed for CSS columns masonry */
+  display: inline-block; /* необходимо для корректной работы колонок CSS */
   width: 100%;
   vertical-align: top;
 }
 .masonry-item .card { overflow: hidden; }
 
-/* Card accents per material type */
+/* Цветовые акценты карточек по типам материалов */
 .card[class*="card-type-"]{ border-left-width: 4px; border-left-style: solid; }
 .card-type-dissertation{ border-left-color: #8957e5; }
 .card-type-dissertation_abstract{ border-left-color: #a371f7; }
@@ -786,7 +786,7 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 .card-type-image{ border-left-color: #2ea043; }
 .card-type-other{ border-left-color: var(--border); }
 
-/* Skeleton shimmer */
+/* Анимация мерцания скелетона */
 .skeleton { position: relative; overflow: hidden; background: linear-gradient(90deg, rgba(255,255,255,.06), rgba(255,255,255,.14), rgba(255,255,255,.06)); background-size: 200% 100%; animation: shimmer 1.2s linear infinite; border-radius: 12px; }
 
 [data-tooltip] { position: relative; }
@@ -837,10 +837,10 @@ input[type="file"]:disabled::-webkit-file-upload-button {
 }
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
-/* Floating search */
+/* Плавающая строка поиска */
 .floating-search { position: sticky; top: 8px; z-index: 1040; backdrop-filter: blur(4px); background: color-mix(in srgb, var(--surface) 92%, var(--bg)); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; }
 
-/* Focus rings */
+/* Обводки фокуса */
 *:focus { outline: 2px solid var(--accent) !important; outline-offset: 2px; }
 
 

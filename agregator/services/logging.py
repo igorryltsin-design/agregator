@@ -80,7 +80,7 @@ def configure_logging(
 
     log_level = level or app.config.get("LOG_LEVEL") or "INFO"
     resolved_level = logging.getLevelName(str(log_level).upper())
-    if isinstance(resolved_level, str):  # unknown name returns string
+    if isinstance(resolved_level, str):  # неизвестное имя уровня возвращает строку
         resolved_level = logging.INFO
 
     app.logger.setLevel(resolved_level)

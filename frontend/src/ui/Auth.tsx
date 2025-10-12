@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { loadMaterialTypes, resetMaterialTypes } from '../utils/materialTypesStore'
 
 type AuthUser = {
   id: number
@@ -39,16 +40,20 @@ const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => 
       const r = await fetch('/api/auth/me', { credentials: 'same-origin' })
       if (!r.ok) {
         setUser(null)
+        resetMaterialTypes()
         return
       }
       const data = await r.json().catch(() => ({}))
       if (data?.ok && data.user) {
         setUser(data.user)
+        await loadMaterialTypes().catch(() => {})
       } else {
         setUser(null)
+        resetMaterialTypes()
       }
     } catch {
       setUser(null)
+      resetMaterialTypes()
     }
   }, [])
 
@@ -71,14 +76,17 @@ const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => 
       if (r.ok && data?.ok && data.user) {
         setUser(data.user)
         setLoading(false)
+        await loadMaterialTypes(true).catch(() => {})
         return { ok: true }
       }
       setUser(null)
       setLoading(false)
+      resetMaterialTypes()
       return { ok: false, error: data?.error || 'Ошибка входа' }
     } catch {
       setUser(null)
       setLoading(false)
+      resetMaterialTypes()
       return { ok: false, error: 'Ошибка подключения к серверу' }
     }
   }, [])
@@ -90,6 +98,7 @@ const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => 
       // игнорируем
     }
     setUser(null)
+    resetMaterialTypes()
   }, [])
 
   const refresh = useCallback(async () => {

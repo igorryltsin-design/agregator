@@ -66,7 +66,7 @@ export default function UploadPage(){
         setJobs(mapped)
       }
     } catch {
-      /* ignore */
+      /* Игнорируем выделение при перетаскивании */
     } finally {
       setLoadingJobs(false)
     }
