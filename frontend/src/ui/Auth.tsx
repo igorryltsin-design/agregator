@@ -3,7 +3,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 type AuthUser = {
   id: number
   username: string
-  role: 'admin' | 'user'
+  role: 'admin' | 'editor' | 'viewer'
   full_name?: string | null
   aiword_access?: boolean
   can_upload?: boolean

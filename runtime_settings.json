@@ -49,6 +49,13 @@
     "vision_system": "Ты помощник по анализу изображений. Опиши изображение 2–4 предложениями на русском и верни 5–12 ключевых слов. Верни строго JSON: {\"description\":\"...\",\"keywords\":[\"...\"]}."
   },
   "AI_RERANK_LLM": true,
+  "LLM_CACHE_ENABLED": true,
+  "LLM_CACHE_TTL_SECONDS": 600,
+  "LLM_CACHE_MAX_ITEMS": 256,
+  "LLM_CACHE_ONLY_MODE": false,
+  "SEARCH_CACHE_ENABLED": true,
+  "SEARCH_CACHE_TTL_SECONDS": 90,
+  "SEARCH_CACHE_MAX_ITEMS": 64,
   "SEARCH_FACET_TAG_KEYS": null,
   "GRAPH_FACET_TAG_KEYS": null,
   "SEARCH_FACET_INCLUDE_TYPES": true

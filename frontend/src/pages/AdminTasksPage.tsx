@@ -9,6 +9,7 @@ type Task = {
   status: string
   progress: number
   payload?: string | null
+  payload_json?: any
   created_at?: string | null
   started_at?: string | null
   finished_at?: string | null
@@ -53,7 +54,12 @@ export default function AdminTasksPage() {
       const r = await fetch('/api/admin/tasks')
       const data = await r.json().catch(() => ({}))
       if (r.ok && data?.ok) {
-        const list: Task[] = Array.isArray(data.tasks) ? data.tasks : []
+        const list: Task[] = Array.isArray(data.tasks)
+          ? data.tasks.map((task: any) => ({
+              ...task,
+              payload_json: task.payload_json ?? undefined
+            }))
+          : []
         setTasks(list)
         setExpandedTaskId(prev => (prev !== null && !list.some(t => t.id === prev) ? null : prev))
       } else {
@@ -157,13 +163,16 @@ export default function AdminTasksPage() {
     setExpandedTaskId(prev => (prev === id ? null : id))
   }
 
-  const formatPayload = (payload?: string | null) => {
-    if (!payload) return '—'
+  const formatPayload = (task: Task) => {
+    if (task.payload_json) {
+      return JSON.stringify(task.payload_json, null, 2)
+    }
+    if (!task.payload) return '—'
     try {
-      const parsed = JSON.parse(payload)
+      const parsed = JSON.parse(task.payload)
       return JSON.stringify(parsed, null, 2)
     } catch {
-      return payload
+      return task.payload
     }
   }
 
@@ -206,6 +215,8 @@ export default function AdminTasksPage() {
                 const expanded = expandedTaskId === task.id
                 const pct = Number.isFinite(task.progress) ? Math.min(100, Math.max(0, Math.round(task.progress * 100))) : 0
                 const isFinal = FINAL_STATUSES.has(task.status)
+                const preview = task.payload_json?.result?.preview || task.payload_json?.initial_preview
+                const payloadError: string | undefined = task.error || task.payload_json?.error || undefined
                 return (
                   <React.Fragment key={task.id}>
                     <tr>
@@ -213,7 +224,7 @@ export default function AdminTasksPage() {
                       <td>{task.name}</td>
                       <td>
                         <span className={`badge ${statusBadge[task.status] || 'bg-secondary'}`}>{taskStatusRu(task.status)}</span>
-                        {task.error && <div className="text-danger" style={{ fontSize: 12 }}>{task.error}</div>}
+                        {payloadError && <div className="text-danger" style={{ fontSize: 12 }}>{payloadError}</div>}
                       </td>
                       <td style={{ minWidth: 160 }}>
                         <div className="progress" style={{ height: 6 }}>
@@ -265,15 +276,28 @@ export default function AdminTasksPage() {
                                 <div>{formatDate(task.finished_at)}</div>
                               </div>
                             </div>
-                            {task.error && (
+                            const preview = task.payload_json?.result?.preview || task.payload_json?.initial_preview
+                            {payloadError && (
                               <div className="mt-3 text-danger">
                                 <div className="text-muted" style={{ fontSize: 12 }}>Ошибка</div>
-                                <div>{task.error}</div>
+                                <div>{payloadError}</div>
+                              </div>
+                            )}
+                            {!payloadError && preview && (
+                              <div className="mt-3">
+                                <div className="text-muted" style={{ fontSize: 12 }}>Превью результата</div>
+                                <div className="small text-muted">
+                                  {preview.filename && <div>Файл: {preview.filename}</div>}
+                                  {preview.collection_name && <div>Коллекция: {preview.collection_name}</div>}
+                                  {preview.material_type && <div>Тип: {preview.material_type}</div>}
+                                  {preview.language && <div>Язык: {preview.language}</div>}
+                                  {preview.title && <div>Заголовок: {preview.title}</div>}
+                                </div>
                               </div>
                             )}
                             <div className="mt-3">
                               <div className="text-muted" style={{ fontSize: 12 }}>Данные задачи</div>
-                              <pre className="bg-dark-subtle p-2 rounded" style={{ maxHeight: 240, overflow: 'auto', fontSize: 12 }}>{formatPayload(task.payload)}</pre>
+                              <pre className="bg-dark-subtle p-2 rounded" style={{ maxHeight: 240, overflow: 'auto', fontSize: 12 }}>{formatPayload(task)}</pre>
                             </div>
                           </div>
                         </td>
@@ -288,7 +312,7 @@ export default function AdminTasksPage() {
             </tbody>
           </table>
         </div>
-        {tasks.some(t => t.payload) && (
+        {tasks.some(t => t.payload || t.payload_json) && (
           <details className="mt-3">
             <summary className="fw-semibold">Сырые данные</summary>
             <pre className="bg-body-secondary p-2 rounded" style={{ maxHeight: 240, overflow: 'auto' }}>{JSON.stringify(tasks, null, 2)}</pre>

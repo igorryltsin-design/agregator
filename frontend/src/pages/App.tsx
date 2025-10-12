@@ -335,7 +335,9 @@ export default function App() {
             <Link className={iconButtonClass} to="profile" aria-label="Профиль" data-tooltip="Профиль">
               <span className="icon-glyph" aria-hidden="true">👤</span>
             </Link>
-            <span className="badge bg-secondary text-uppercase" style={{ letterSpacing: 0.3 }}>{user.role === 'admin' ? 'Админ' : 'Пользователь'}</span>
+            <span className="badge bg-secondary text-uppercase" style={{ letterSpacing: 0.3 }}>
+              {user.role === 'admin' ? 'Админ' : user.role === 'editor' ? 'Редактор' : 'Наблюдатель'}
+            </span>
             <button className={iconButtonClass} type="button" onClick={handleLogout} aria-label="Выйти" data-tooltip="Выйти">
               <span className="icon-glyph" aria-hidden="true">🚪</span>
             </button>

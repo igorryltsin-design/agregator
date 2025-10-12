@@ -62,8 +62,9 @@ export default function AdminLlmPage() {
   }, [normalizedPurposeOptions])
   const normalizedProviderOptions = useMemo(() => {
     const defaults: LlmProviderOption[] = [
-      { id: 'openai', label: 'OpenAI-совместимый (LM Studio, OpenAI, Azure)' },
-      { id: 'ollama', label: 'Ollama' },
+      { id: 'openai', label: 'OpenAI / LM Studio / OpenRouter' },
+      { id: 'azure_openai', label: 'Azure OpenAI' },
+      { id: 'ollama', label: 'Ollama (локальные модели)' },
     ]
     const map = new Map(defaults.map(opt => [opt.id, opt] as const))
     providerOptions.forEach(opt => {

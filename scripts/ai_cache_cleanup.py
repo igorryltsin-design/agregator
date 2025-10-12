@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Utility script to prune expired AI search snippet cache entries."""
 
-from app import app, _prune_expired_snippet_cache
+from app import app, setup_app, _prune_expired_snippet_cache
+
+
+setup_app()
 
 
 def prune_expired() -> int:
