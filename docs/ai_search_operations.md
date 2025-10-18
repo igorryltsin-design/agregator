@@ -35,3 +35,19 @@
   DELETE FROM ai_search_snippet_cache WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP;
   ```
 - Periodically review `ai_search_keyword_feedback` for abusive submissions; consider anonymising user IDs in exported analytics.
+
+## RAG Utilities
+- `scripts/rag_index.py`
+  - `rebuild` — запускает полный цикл (ингест + эмбеддинги).
+  - `ingest` — только разбивает документы на чанки (`--file-id` можно повторять).
+  - `embed` — пересчитывает эмбеддинги для всех чанков.
+  - `inspect --chunk <id>` — печатает содержимое и метаданные конкретного чанка.
+- `scripts/rag_smoke.py`
+  - Прогоняет набор запросов (по умолчанию 5 типовых) через `_ai_search_core` и выводит суммарное время, число найденных документов, наличие предупреждений RAG/фолбэка.
+  - Пример: `python scripts/rag_smoke.py --deep --top-k 4 --json smoke.json` — сохраняет результат в JSON для последующего анализа.
+
+## Monitoring Checklist
+- Проверяйте `/api/admin/ai-search/metrics` — новые поля `rag_context_count`, `rag_fallback`, `rag_hallucination_warning` сигнализируют о качестве RAG-ответов.
+- Журналируйте ежедневный запуск `scripts/rag_smoke.py` (в CI или cron) и отслеживайте аномалии по времени ответа.
+- После обновления эмбеддингов используйте `scripts/rag_index.py inspect --chunk <id>` для выборочной проверки чанков.
+- Включите алерты, если `rag_fallback` или предупреждения встречаются >10% запросов подряд — вероятны проблемы с индексом или текстами.

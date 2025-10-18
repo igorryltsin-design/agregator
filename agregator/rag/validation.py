@@ -72,7 +72,10 @@ def validate_answer(
     result.unknown_citations = sorted(set(unknown_refs))
     if missing_citations or unknown_refs:
         result.hallucination_warning = True
-    result.extra_citations = sorted(set(extract_citations(normalized)) - allowed_set)
+    all_citations = set(extract_citations(normalized))
+    unknown_set = set(result.unknown_citations)
+    extra_candidates = all_citations - allowed_set - unknown_set
+    result.extra_citations = sorted(extra_candidates)
     if result.extra_citations:
         result.hallucination_warning = True
     return result

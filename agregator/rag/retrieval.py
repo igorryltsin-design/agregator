@@ -5,10 +5,11 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+from sqlalchemy import func, literal
 from sqlalchemy.orm import Session
 
 from models import RagChunkEmbedding, RagDocument, RagDocumentChunk, db
-from .utils import bytes_to_vector
+from .utils import bytes_to_vector, vector_to_bytes
 
 
 def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
@@ -55,7 +56,8 @@ class VectorRetriever:
         *,
         exclude_document_ids: Optional[Iterable[int]] = None,
         allowed_document_ids: Optional[Iterable[int]] = None,
-    ) -> List[Tuple[RagDocumentChunk, List[float]]]:
+        query_vector_bytes: Optional[bytes] = None,
+    ) -> List[Tuple[RagDocumentChunk, List[float], Optional[float]]]:
         query = (
             self.session.query(RagDocumentChunk, RagChunkEmbedding.vector)
             .join(RagChunkEmbedding, RagChunkEmbedding.chunk_id == RagDocumentChunk.id)
@@ -73,15 +75,36 @@ class VectorRetriever:
                 query = query.filter(RagDocumentChunk.document_id.in_(include_ids))
             else:
                 return []
-        query = query.order_by(RagDocumentChunk.id.asc())
+        dialect_name = ""
+        try:
+            bind = self.session.get_bind()
+            if bind is not None and bind.dialect and getattr(bind.dialect, "name", None):
+                dialect_name = bind.dialect.name.lower()
+        except Exception:
+            dialect_name = ""
+        score_expr = None
+        if query_vector_bytes and dialect_name == "sqlite":
+            score_expr = func.cosine_similarity(
+                RagChunkEmbedding.vector,
+                literal(query_vector_bytes),
+            )
+            query = query.add_columns(score_expr.label("rag_dense_score")).order_by(score_expr.desc())
+        else:
+            query = query.order_by(RagDocumentChunk.id.asc())
         if self.max_candidates:
             query = query.limit(self.max_candidates)
         rows = query.all()
-        return [
-            (chunk, bytes_to_vector(vector_bytes))
-            for chunk, vector_bytes in rows
-            if vector_bytes
-        ]
+        results: List[Tuple[RagDocumentChunk, List[float], Optional[float]]] = []
+        for row in rows:
+            if score_expr is not None:
+                chunk, vector_bytes, pre_score = row
+            else:
+                chunk, vector_bytes = row
+                pre_score = None
+            if not vector_bytes:
+                continue
+            results.append((chunk, bytes_to_vector(vector_bytes), float(pre_score) if pre_score is not None else None))
+        return results
 
     def search_by_vector(
         self,
@@ -91,15 +114,22 @@ class VectorRetriever:
         exclude_document_ids: Optional[Iterable[int]] = None,
         allowed_document_ids: Optional[Iterable[int]] = None,
     ) -> List[RetrievedChunk]:
+        query_vector_bytes = b""
+        if query_vector:
+            try:
+                query_vector_bytes = vector_to_bytes(query_vector)
+            except Exception:
+                query_vector_bytes = b""
         candidates = self._query_embeddings(
             exclude_document_ids=exclude_document_ids,
             allowed_document_ids=allowed_document_ids,
+            query_vector_bytes=query_vector_bytes or None,
         )
         if not candidates:
             return []
         scored: List[Tuple[float, RagDocumentChunk]] = []
-        for chunk, vector in candidates:
-            score = _cosine_similarity(query_vector, vector)
+        for chunk, vector, pre_score in candidates:
+            score = pre_score if pre_score is not None else _cosine_similarity(query_vector, vector)
             if score <= 0:
                 continue
             scored.append((score, chunk))

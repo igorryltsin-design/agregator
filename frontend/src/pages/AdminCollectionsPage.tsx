@@ -43,6 +43,7 @@ export default function AdminCollectionsPage() {
   const [deleteLoading, setDeleteLoading] = useState(false)
   const [clearLoading, setClearLoading] = useState(false)
   const [exportLoading, setExportLoading] = useState(false)
+  const [ragLoading, setRagLoading] = useState(false)
   const [memberForm, setMemberForm] = useState<{ username: string; role: string; userId: number | null }>({ username: '', role: 'viewer', userId: null })
   const [memberOptions, setMemberOptions] = useState<UserSuggestion[]>([])
   const [memberLookupLoading, setMemberLookupLoading] = useState(false)
@@ -184,6 +185,33 @@ export default function AdminCollectionsPage() {
       toasts.push('Ошибка при запуске сканирования коллекции', 'error')
     } finally {
       setRescanLoading(false)
+    }
+  }
+
+  const rebuildRag = async () => {
+    if (!selectedId) return
+    if (!confirm('Запустить переиндексацию RAG для выбранной коллекции?')) return
+    setRagLoading(true)
+    try {
+      const r = await fetch(`/api/collections/${selectedId}/rag/reindex`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        const files = typeof data.files === 'number' ? data.files : null
+        const message = files !== null ? `Задача RAG запущена (${files} файлов).` : 'Задача RAG запущена.'
+        toasts.push(message, 'success')
+      } else if (data?.error_code === 'collection_empty') {
+        toasts.push('В коллекции нет файлов для RAG.', 'info')
+      } else {
+        toasts.push(data?.error || 'Не удалось запустить RAG индексацию', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка при запуске RAG индексации', 'error')
+    } finally {
+      setRagLoading(false)
     }
   }
 
@@ -430,6 +458,14 @@ export default function AdminCollectionsPage() {
                   </button>
                   {isAdmin && (
                     <div className="btn-group btn-group-sm">
+                      <button
+                        type="button"
+                        className="btn btn-outline-secondary"
+                        onClick={rebuildRag}
+                        disabled={ragLoading}
+                      >
+                        {ragLoading ? '...' : 'RAG индекс'}
+                      </button>
                       <button
                         type="button"
                         className="btn btn-outline-secondary"

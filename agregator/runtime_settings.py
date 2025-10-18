@@ -144,6 +144,19 @@ class RuntimeSettings:
     ocr_langs_cfg: str
     pdf_ocr_pages_cfg: int
     always_ocr_first_page_dissertation: bool
+    rag_embedding_backend: str = "auto"
+    rag_embedding_model: str = "intfloat/multilingual-e5-large"
+    rag_embedding_dim: int = 384
+    rag_embedding_batch_size: int = 32
+    rag_embedding_device: Optional[str] = None
+    rag_embedding_endpoint: str = ""
+    rag_embedding_api_key: str = ""
+    rag_rerank_backend: str = "none"
+    rag_rerank_model: str = ""
+    rag_rerank_device: Optional[str] = None
+    rag_rerank_batch_size: int = 16
+    rag_rerank_max_length: int = 512
+    rag_rerank_max_chars: int = 1200
     prompts: Dict[str, str] = field(default_factory=dict)
     ai_rerank_llm: bool = False
     llm_cache_enabled: bool = True
@@ -170,6 +183,19 @@ class RuntimeSettings:
             lmstudio_model=config.lmstudio_model,
             lmstudio_api_key=config.lmstudio_api_key,
             lm_default_provider=config.lm_default_provider,
+            rag_embedding_backend=config.rag_embedding_backend,
+            rag_embedding_model=config.rag_embedding_model,
+            rag_embedding_dim=config.rag_embedding_dim,
+            rag_embedding_batch_size=config.rag_embedding_batch_size,
+            rag_embedding_device=config.rag_embedding_device,
+            rag_embedding_endpoint=config.rag_embedding_endpoint,
+            rag_embedding_api_key=config.rag_embedding_api_key,
+            rag_rerank_backend=config.rag_rerank_backend,
+            rag_rerank_model=config.rag_rerank_model,
+            rag_rerank_device=config.rag_rerank_device,
+            rag_rerank_batch_size=config.rag_rerank_batch_size,
+            rag_rerank_max_length=config.rag_rerank_max_length,
+            rag_rerank_max_chars=config.rag_rerank_max_chars,
             transcribe_enabled=config.transcribe_enabled,
             transcribe_backend=config.transcribe_backend,
             transcribe_model_path=config.transcribe_model_path,
@@ -217,6 +243,19 @@ class RuntimeSettings:
             "LMSTUDIO_MODEL": self.lmstudio_model,
             "LMSTUDIO_API_KEY": self.lmstudio_api_key,
             "LM_DEFAULT_PROVIDER": self.lm_default_provider,
+            "RAG_EMBEDDING_BACKEND": self.rag_embedding_backend,
+            "RAG_EMBEDDING_MODEL": self.rag_embedding_model,
+            "RAG_EMBEDDING_DIM": int(self.rag_embedding_dim),
+            "RAG_EMBEDDING_BATCH": int(self.rag_embedding_batch_size),
+            "RAG_EMBEDDING_DEVICE": self.rag_embedding_device,
+            "RAG_EMBEDDING_ENDPOINT": self.rag_embedding_endpoint,
+            "RAG_EMBEDDING_API_KEY": self.rag_embedding_api_key,
+            "RAG_RERANK_BACKEND": self.rag_rerank_backend,
+            "RAG_RERANK_MODEL": self.rag_rerank_model,
+            "RAG_RERANK_DEVICE": self.rag_rerank_device,
+            "RAG_RERANK_BATCH_SIZE": int(self.rag_rerank_batch_size),
+            "RAG_RERANK_MAX_LENGTH": int(self.rag_rerank_max_length),
+            "RAG_RERANK_MAX_CHARS": int(self.rag_rerank_max_chars),
             "TRANSCRIBE_ENABLED": bool(self.transcribe_enabled),
             "TRANSCRIBE_BACKEND": self.transcribe_backend,
             "TRANSCRIBE_MODEL_PATH": self.transcribe_model_path,
@@ -309,6 +348,50 @@ class RuntimeSettings:
                 self.lmstudio_api_key = str(raw or "")
             elif key == "LM_DEFAULT_PROVIDER" and raw:
                 self.lm_default_provider = str(raw).strip().lower() or self.lm_default_provider
+            elif key == "RAG_EMBEDDING_BACKEND" and raw is not None:
+                text = str(raw).strip().lower()
+                self.rag_embedding_backend = text or self.rag_embedding_backend
+            elif key == "RAG_EMBEDDING_MODEL" and raw is not None:
+                self.rag_embedding_model = str(raw)
+            elif key == "RAG_EMBEDDING_DIM":
+                try:
+                    self.rag_embedding_dim = max(1, int(raw))
+                except Exception:
+                    pass
+            elif key == "RAG_EMBEDDING_BATCH":
+                try:
+                    self.rag_embedding_batch_size = max(1, int(raw))
+                except Exception:
+                    pass
+            elif key == "RAG_EMBEDDING_DEVICE":
+                self.rag_embedding_device = str(raw).strip() or None
+            elif key == "RAG_EMBEDDING_ENDPOINT" and raw is not None:
+                self.rag_embedding_endpoint = str(raw).strip()
+            elif key == "RAG_EMBEDDING_API_KEY":
+                self.rag_embedding_api_key = str(raw or "")
+            elif key == "RAG_RERANK_BACKEND" and raw is not None:
+                token = str(raw).strip().lower()
+                if token:
+                    self.rag_rerank_backend = token
+            elif key == "RAG_RERANK_MODEL" and raw is not None:
+                self.rag_rerank_model = str(raw)
+            elif key == "RAG_RERANK_DEVICE":
+                self.rag_rerank_device = str(raw).strip() or None
+            elif key == "RAG_RERANK_BATCH_SIZE":
+                try:
+                    self.rag_rerank_batch_size = max(1, int(raw))
+                except Exception:
+                    pass
+            elif key == "RAG_RERANK_MAX_LENGTH":
+                try:
+                    self.rag_rerank_max_length = max(32, int(raw))
+                except Exception:
+                    pass
+            elif key == "RAG_RERANK_MAX_CHARS":
+                try:
+                    self.rag_rerank_max_chars = max(200, int(raw))
+                except Exception:
+                    pass
             elif key == "TRANSCRIBE_ENABLED":
                 self.transcribe_enabled = _coerce_bool(raw, default=self.transcribe_enabled)
             elif key == "TRANSCRIBE_BACKEND" and raw is not None:

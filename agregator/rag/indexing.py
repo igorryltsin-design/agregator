@@ -5,7 +5,8 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Dict, Iterable, List, Optional, Sequence
+import re
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -105,6 +106,13 @@ GENERIC_STOPWORDS = {
     "®",
 }
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+try:  # pragma: no cover - optional dependency
+    from razdel import sentenize as _sentenize  # type: ignore
+except Exception:  # pragma: no cover
+    _sentenize = None
+
 
 @dataclass(slots=True)
 class ChunkConfig:
@@ -190,56 +198,264 @@ def extract_keywords(text: str, lang: str, limit: int = 8) -> List[str]:
     return [token for token, _ in ranked[:limit]]
 
 
+def _split_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    if _sentenize:
+        try:
+            return [item.text.strip() for item in _sentenize(text) if item.text.strip()]
+        except Exception:
+            pass
+    return [sent.strip() for sent in _SENTENCE_SPLIT_RE.split(text) if sent.strip()]
+
+
+@dataclass(slots=True)
+class SegmentInfo:
+    text: str
+    tokens: List[str]
+    path: Tuple[str, ...]
+    heading_level: Optional[int]
+    is_heading: bool
+    distance_from_heading: int = 0
+
+
+def _guess_heading_level(line: str) -> Optional[int]:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    numeric = _HEADING_NUMERIC_RE.match(stripped)
+    if numeric:
+        parts = numeric.group(1).split(".")
+        return max(1, min(len(parts), 5))
+    alpha_total = sum(1 for ch in stripped if ch.isalpha())
+    if stripped.endswith(":") and alpha_total >= 3:
+        return 2
+    if alpha_total and alpha_total <= 120:
+        upper_total = sum(1 for ch in stripped if ch.isalpha() and ch.isupper())
+        if upper_total / max(alpha_total, 1) >= 0.65:
+            return 1
+    return None
+
+
+def _segment_text(text: str) -> List[SegmentInfo]:
+    """Разбивает текст на сегменты с учётом заголовков и их иерархии."""
+    if not text:
+        return []
+
+    segments: List[SegmentInfo] = []
+    path: List[str] = []
+    pending_lines: List[str] = []
+
+    def _flush_pending() -> None:
+        if not pending_lines:
+            return
+        joined = " ".join(pending_lines).strip()
+        pending_lines.clear()
+        if not joined:
+            return
+        for sentence in _split_sentences(joined):
+            tokens = sentence.split()
+            if not tokens:
+                continue
+            segments.append(
+                SegmentInfo(
+                    text=sentence,
+                    tokens=tokens,
+                    path=tuple(path),
+                    heading_level=len(path) if path else None,
+                    is_heading=False,
+                )
+            )
+
+    paragraphs = re.split(r"\n{2,}", text)
+    for paragraph in paragraphs:
+        block = paragraph.strip()
+        if not block:
+            _flush_pending()
+            continue
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            _flush_pending()
+            continue
+        for line in lines:
+            level = _guess_heading_level(line)
+            if level is not None:
+                _flush_pending()
+                normalized = line.strip().rstrip(":").strip()
+                if not normalized:
+                    continue
+                while len(path) < level:
+                    path.append("")
+                path[level - 1] = normalized
+                del path[level:]
+                tokens = normalized.split() or [normalized]
+                segments.append(
+                    SegmentInfo(
+                        text=normalized,
+                        tokens=tokens,
+                        path=tuple(path),
+                        heading_level=level,
+                        is_heading=True,
+                    )
+                )
+                continue
+            if line.lstrip().startswith(("-", "*", "•")):
+                _flush_pending()
+                tokens = line.split() or [line]
+                segments.append(
+                    SegmentInfo(
+                        text=line,
+                        tokens=tokens,
+                        path=tuple(path),
+                        heading_level=len(path) if path else None,
+                        is_heading=False,
+                    )
+                )
+                continue
+            pending_lines.append(line)
+        _flush_pending()
+    _flush_pending()
+
+    last_heading_idx: Optional[int] = None
+    for idx, segment in enumerate(segments):
+        if segment.is_heading:
+            last_heading_idx = idx
+            segment.distance_from_heading = 0
+        else:
+            segment.distance_from_heading = (
+                0 if last_heading_idx is None else idx - last_heading_idx
+            )
+    return segments
+
+
 def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[ChunkData]:
     if not text:
         return []
     cfg = config or ChunkConfig()
-    tokens = text.split()
-    if not tokens:
+    segments = _segment_text(text)
+    if not segments:
+        segments = [line.strip() for line in text.splitlines() if line.strip()] or [text.strip()]
+    segment_tokens_list: List[List[str]] = []
+    for segment in segments:
+        tokens = segment.split()
+        if tokens:
+            segment_tokens_list.append(tokens)
+    if not segment_tokens_list:
         return []
+    tokens: List[str] = [token for seg in segment_tokens_list for token in seg]
+    total_tokens = len(tokens)
+    if total_tokens == 0:
+        return []
+    segment_ranges: List[Tuple[int, int]] = []
+    cursor = 0
+    for seg_tokens in segment_tokens_list:
+        start_idx = cursor
+        cursor += len(seg_tokens)
+        segment_ranges.append((start_idx, cursor))
+    breakpoints = [end for _, end in segment_ranges]
+    if breakpoints[-1] != total_tokens:
+        breakpoints.append(total_tokens)
+
     max_tokens = max(cfg.max_tokens, 1)
     overlap = min(cfg.overlap, max_tokens - 1) if max_tokens > 1 else 0
     step = max(max_tokens - overlap, 1)
+
+    def _segment_span(start_token: int, end_token: int) -> Tuple[int, int, int]:
+        if not segment_ranges:
+            return (0, 0, 0)
+        seg_start = None
+        seg_end = None
+        count = 0
+        for idx, (seg_start_token, seg_end_token) in enumerate(segment_ranges):
+            if seg_end_token <= start_token:
+                continue
+            if seg_start_token >= end_token:
+                break
+            if seg_start is None:
+                seg_start = idx
+            seg_end = idx
+            count += 1
+        if seg_start is None:
+            seg_start = 0
+        if seg_end is None:
+            seg_end = seg_start
+        return seg_start, seg_end, count
+
+    def _align_breakpoint(start_token: int, raw_end: int) -> int:
+        candidate = raw_end
+        within = [bp for bp in breakpoints if start_token < bp <= raw_end]
+        if within:
+            candidate = within[-1]
+        else:
+            for bp in breakpoints:
+                if bp <= raw_end:
+                    continue
+                span = bp - start_token
+                if span <= max_tokens + max(cfg.min_tokens, 40) or bp == total_tokens:
+                    candidate = bp
+                    break
+        if candidate <= start_token:
+            candidate = min(raw_end, total_tokens)
+        return min(candidate, total_tokens)
+
     chunks: List[ChunkData] = []
-    total_tokens = len(tokens)
     ordinal = 0
-    for start in range(0, total_tokens, step):
-        end = min(start + max_tokens, total_tokens)
+    start = 0
+    while start < total_tokens:
+        raw_end = min(start + max_tokens, total_tokens)
+        end = _align_breakpoint(start, raw_end)
+        if end <= start:
+            end = min(raw_end if raw_end > start else total_tokens, total_tokens)
         chunk_tokens = tokens[start:end]
         if not chunk_tokens:
-            continue
+            break
         text_chunk = " ".join(chunk_tokens).strip()
         if not text_chunk:
+            start = end if end > start else end + 1
             continue
-        token_count = len(chunk_tokens)
-        if token_count < cfg.min_tokens and ordinal > 0:
+        if len(chunk_tokens) < cfg.min_tokens and chunks:
             prev = chunks[-1]
-            merged = f"{prev.text} {text_chunk}".strip()
+            prev_start = int(prev.meta.get("token_start", 0))
+            merged_tokens = tokens[prev_start:end]
+            merged_text = " ".join(merged_tokens).strip()
+            if not merged_text:
+                start = end if end > start else end + 1
+                continue
+            seg_start_idx, seg_end_idx, seg_count = _segment_span(prev_start, end)
+            lang = detect_language(merged_text)
             chunks[-1] = ChunkData(
                 ordinal=prev.ordinal,
-                text=merged,
-                token_count=prev.token_count + token_count,
-                char_count=len(merged),
-                preview=(merged[: cfg.preview_chars]).strip(),
-                keywords=extract_keywords(merged, detect_language(merged), cfg.keyword_count),
-                lang_primary=detect_language(merged),
-                content_hash=sha256(merged.encode("utf-8")).hexdigest(),
+                text=merged_text,
+                token_count=len(merged_tokens),
+                char_count=len(merged_text),
+                preview=(merged_text[: cfg.preview_chars]).strip(),
+                keywords=extract_keywords(merged_text, lang, cfg.keyword_count),
+                lang_primary=lang,
+                content_hash=sha256(merged_text.encode("utf-8")).hexdigest(),
                 section_path=None,
                 meta={
                     **prev.meta,
                     "token_end": end,
                     "merged_with_next": True,
+                    "segments": seg_count,
+                    "segment_start": seg_start_idx,
+                    "segment_end": seg_end_idx,
                 },
             )
+            next_start = max(prev_start, end - overlap)
+            if next_start <= prev_start:
+                next_start = end
+            start = min(next_start, total_tokens)
             continue
         ordinal += 1
+        seg_start_idx, seg_end_idx, seg_count = _segment_span(start, end)
         lang = detect_language(text_chunk)
         keywords = extract_keywords(text_chunk, lang, cfg.keyword_count)
         chunks.append(
             ChunkData(
                 ordinal=ordinal,
                 text=text_chunk,
-                token_count=token_count,
+                token_count=len(chunk_tokens),
                 char_count=len(text_chunk),
                 preview=(text_chunk[: cfg.preview_chars]).strip(),
                 keywords=keywords,
@@ -251,9 +467,18 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
                     "token_end": end,
                     "overlap": overlap,
                     "total_tokens": total_tokens,
+                    "segments": seg_count,
+                    "segment_start": seg_start_idx,
+                    "segment_end": seg_end_idx,
                 },
             )
         )
+        if end >= total_tokens:
+            break
+        next_start = end - overlap
+        if next_start <= start:
+            next_start = end
+        start = max(0, min(next_start, total_tokens))
     return chunks
 
 

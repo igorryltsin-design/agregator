@@ -52,6 +52,19 @@ class AppConfig:
     lmstudio_model: str
     lmstudio_api_key: str
     lm_default_provider: str
+    rag_embedding_backend: str
+    rag_embedding_model: str
+    rag_embedding_dim: int
+    rag_embedding_batch_size: int
+    rag_embedding_device: Optional[str]
+    rag_embedding_endpoint: str
+    rag_embedding_api_key: str
+    rag_rerank_backend: str
+    rag_rerank_model: str
+    rag_rerank_device: Optional[str]
+    rag_rerank_batch_size: int
+    rag_rerank_max_length: int
+    rag_rerank_max_chars: int
     transcribe_enabled: bool
     transcribe_backend: str
     transcribe_model_path: str
@@ -338,6 +351,20 @@ class AppConfig:
             lmstudio_model=os.getenv("LMSTUDIO_MODEL", "google/gemma-3n-e4b"),
             lmstudio_api_key=os.getenv("LMSTUDIO_API_KEY", ""),
             lm_default_provider=(os.getenv("LM_PROVIDER") or "openai").strip().lower() or "openai",
+            rag_embedding_backend=(os.getenv("RAG_EMBEDDING_BACKEND") or "lm-studio").strip().lower() or "lm-studio",
+            rag_embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5-GGUF"),
+            rag_embedding_dim=int(os.getenv("RAG_EMBEDDING_DIM", "768") or 768),
+            rag_embedding_batch_size=int(os.getenv("RAG_EMBEDDING_BATCH", "32") or 32),
+            rag_embedding_device=(os.getenv("RAG_EMBEDDING_DEVICE") or "").strip() or None,
+            rag_embedding_endpoint=os.getenv("RAG_EMBEDDING_ENDPOINT")
+            or os.getenv("LMSTUDIO_API_BASE", "http://localhost:1234/v1"),
+            rag_embedding_api_key=os.getenv("RAG_EMBEDDING_API_KEY") or os.getenv("LMSTUDIO_API_KEY", ""),
+            rag_rerank_backend=(os.getenv("RAG_RERANK_BACKEND") or "none").strip().lower() or "none",
+            rag_rerank_model=os.getenv("RAG_RERANK_MODEL", ""),
+            rag_rerank_device=(os.getenv("RAG_RERANK_DEVICE") or "").strip() or None,
+            rag_rerank_batch_size=int(os.getenv("RAG_RERANK_BATCH_SIZE", "16") or 16),
+            rag_rerank_max_length=int(os.getenv("RAG_RERANK_MAX_LENGTH", "512") or 512),
+            rag_rerank_max_chars=int(os.getenv("RAG_RERANK_MAX_CHARS", "1200") or 1200),
             transcribe_enabled=_getenv_bool("TRANSCRIBE_ENABLED", True),
             transcribe_backend=os.getenv("TRANSCRIBE_BACKEND", "faster-whisper"),
             transcribe_model_path=os.getenv("TRANSCRIBE_MODEL_PATH", os.getenv("FASTER_WHISPER_DEFAULT_MODEL", "small")),

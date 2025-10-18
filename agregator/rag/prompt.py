@@ -27,6 +27,7 @@ class ContextSection:
     chunk_id: int
     title: str
     language: str
+    token_estimate: int = 0
     score_dense: float = 0.0
     score_sparse: float = 0.0
     combined_score: float = 0.0

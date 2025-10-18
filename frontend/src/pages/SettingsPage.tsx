@@ -35,6 +35,13 @@ type Settings = {
   lm_model: string
   lm_key: string
   lm_provider: string
+  rag_embedding_backend: string
+  rag_embedding_model: string
+  rag_embedding_dim: number
+  rag_embedding_batch: number
+  rag_embedding_device?: string | null
+  rag_embedding_endpoint: string
+  rag_embedding_api_key: string
   transcribe_enabled: boolean
   transcribe_backend: string
   transcribe_model: string
@@ -219,6 +226,13 @@ const normalizeSettings = (raw: any): Settings => {
     lm_model: String(raw?.lm_model || ''),
     lm_key: String(raw?.lm_key || ''),
     lm_provider: String(raw?.lm_provider || 'openai'),
+    rag_embedding_backend: String(raw?.rag_embedding_backend || 'lm-studio'),
+    rag_embedding_model: String(raw?.rag_embedding_model || 'nomic-ai/nomic-embed-text-v1.5-GGUF'),
+    rag_embedding_dim: Number.isFinite(raw?.rag_embedding_dim) ? Number(raw.rag_embedding_dim) : 384,
+    rag_embedding_batch: Number.isFinite(raw?.rag_embedding_batch) ? Number(raw.rag_embedding_batch) : 32,
+    rag_embedding_device: raw?.rag_embedding_device ? String(raw.rag_embedding_device) : '',
+    rag_embedding_endpoint: String(raw?.rag_embedding_endpoint || raw?.lm_base || ''),
+    rag_embedding_api_key: String(raw?.rag_embedding_api_key || raw?.lm_key || ''),
     transcribe_enabled: boolVal(raw?.transcribe_enabled, true),
     transcribe_backend: String(raw?.transcribe_backend || 'faster-whisper'),
     transcribe_model: String(raw?.transcribe_model || ''),
@@ -255,6 +269,13 @@ const normalizeSettings = (raw: any): Settings => {
     material_types: materialTypes,
   }
 }
+
+const ragEmbeddingBackendOptions: Array<{ id: string; label: string }> = [
+  { id: 'lm-studio', label: 'LM Studio / OpenAI совместимый' },
+  { id: 'sentence-transformers', label: 'Sentence Transformers' },
+  { id: 'hash', label: 'Hash (псевдослучайный, оффлайн)' },
+  { id: 'auto', label: 'Auto (по умолчанию)' },
+]
 
 export default function SettingsPage() {
   const { user } = useAuth()
@@ -571,6 +592,11 @@ export default function SettingsPage() {
         searchable: !!col.searchable,
         graphable: !!col.graphable,
       }))
+      payload.rag_embedding_dim = Math.max(1, parseInt(String(payload.rag_embedding_dim || 0), 10) || 1)
+      payload.rag_embedding_batch = Math.max(1, parseInt(String(payload.rag_embedding_batch || 0), 10) || 1)
+      payload.rag_embedding_device = (payload.rag_embedding_device || '').trim()
+      payload.rag_embedding_endpoint = (payload.rag_embedding_endpoint || '').trim()
+      payload.rag_embedding_api_key = (payload.rag_embedding_api_key || '').trim()
       const preparedMaterialTypes = (payload.material_types || [])
         .map((item: MaterialTypeDefinition) => prepareMaterialTypeForSave(item))
         .filter((item): item is Record<string, any> => Boolean(item))
@@ -790,6 +816,80 @@ export default function SettingsPage() {
           <div className="col-md-2">
             <label className="form-label">LM API Key</label>
             <input className="form-control" placeholder="sk-..." value={s.lm_key} onChange={e => setS({ ...s, lm_key: e.target.value })} />
+          </div>
+          <div className="col-12">
+            <hr className="my-2" />
+          </div>
+          <div className="col-md-3">
+            <label className="form-label" htmlFor="rag-backend">RAG токенизатор</label>
+            <select
+              id="rag-backend"
+              className="form-select"
+              value={s.rag_embedding_backend}
+              onChange={e => setS({ ...s, rag_embedding_backend: e.target.value })}
+            >
+              {ragEmbeddingBackendOptions.map(opt => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Модель токенизатора</label>
+            <input
+              className="form-control"
+              placeholder="nomic-ai/nomic-embed-text-v1.5-GGUF"
+              value={s.rag_embedding_model}
+              onChange={e => setS({ ...s, rag_embedding_model: e.target.value })}
+            />
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Endpoint токенизатора</label>
+            <input
+              className="form-control"
+              placeholder="http://localhost:1234/v1"
+              value={s.rag_embedding_endpoint}
+              onChange={e => setS({ ...s, rag_embedding_endpoint: e.target.value })}
+            />
+            <div className="form-text">Укажите адрес локального LM Studio или совместимого API.</div>
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">API Key токенизатора</label>
+            <input
+              className="form-control"
+              placeholder="sk-..."
+              value={s.rag_embedding_api_key}
+              onChange={e => setS({ ...s, rag_embedding_api_key: e.target.value })}
+            />
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Размерность</label>
+            <input
+              className="form-control"
+              type="number"
+              min={1}
+              value={s.rag_embedding_dim}
+              onChange={e => setS({ ...s, rag_embedding_dim: parseInt(e.target.value || '0', 10) || 0 })}
+            />
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Batch</label>
+            <input
+              className="form-control"
+              type="number"
+              min={1}
+              value={s.rag_embedding_batch}
+              onChange={e => setS({ ...s, rag_embedding_batch: parseInt(e.target.value || '1', 10) || 1 })}
+            />
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Устройство (Sentence Transformers)</label>
+            <input
+              className="form-control"
+              placeholder="cpu / cuda:0"
+              value={s.rag_embedding_device ?? ''}
+              onChange={e => setS({ ...s, rag_embedding_device: e.target.value })}
+            />
+            <div className="form-text">Оставьте пустым для настройки по умолчанию.</div>
           </div>
           <div className="col-md-3 d-flex align-items-end">
             <div className="form-check form-switch">

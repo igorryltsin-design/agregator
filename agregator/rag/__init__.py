@@ -20,6 +20,7 @@ from .retrieval import RetrievedChunk, VectorRetriever
 from .sparse import KeywordMatch, KeywordRetriever
 from .utils import bytes_to_vector, vector_to_bytes
 from .validation import ValidationResult, extract_citations, validate_answer
+from .rerank import CrossEncoderConfig, CrossEncoderReranker, load_reranker
 
 __all__ = [
     "ChunkConfig",
@@ -47,4 +48,7 @@ __all__ = [
     "ValidationResult",
     "extract_citations",
     "validate_answer",
+    "CrossEncoderConfig",
+    "CrossEncoderReranker",
+    "load_reranker",
 ]

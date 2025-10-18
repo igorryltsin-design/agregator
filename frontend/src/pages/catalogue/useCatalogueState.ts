@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import DOMPurify from 'dompurify'
 import { materialTypeRu, materialTypeSlug } from '../../utils/locale'
 import { useToasts } from '../../ui/Toasts'
-import type { CollectionOption, FacetData, FileItem, ProgressItem, Tag } from './types'
+import type { CollectionOption, FacetData, FileItem, ProgressItem, RagContextEntry, RagValidationResult, Tag } from './types'
 
 const AI_ANSWER_ALLOWED_TAGS = ['a', 'b', 'strong', 'em', 'i', 'code', 'pre', 'p', 'br', 'ul', 'ol', 'li', 'span', 'div']
 const AI_ANSWER_ALLOWED_ATTRS = ['href', 'title', 'target', 'rel', 'class']
@@ -67,6 +67,14 @@ export function useCatalogueState() {
   const [aiMaxSnippets, setAiMaxSnippets] = useState<number>(3)
   const [aiFullText, setAiFullText] = useState<boolean>(false)
   const [aiUseLlmSnippets, setAiUseLlmSnippets] = useState<boolean>(false)
+  const [aiUseRag, setAiUseRag] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    try {
+      return localStorage.getItem('catalogue.useRag') === '1'
+    } catch {
+      return false
+    }
+  })
   const [aiAllLanguages, setAiAllLanguages] = useState<boolean>(false)
   const [showAiSettings, setShowAiSettings] = useState<boolean>(false)
   const [facets, setFacets] = useState<FacetData | null>(null)
@@ -79,6 +87,20 @@ export function useCatalogueState() {
   const [aiFilteredKeywords, setAiFilteredKeywords] = useState<string[]>([])
   const [aiQueryHash, setAiQueryHash] = useState<string>('')
   const [feedbackStatus, setFeedbackStatus] = useState<Record<string, string>>({})
+  const [ragContext, setRagContext] = useState<RagContextEntry[]>([])
+  const [ragValidation, setRagValidation] = useState<RagValidationResult | null>(null)
+  const [ragWarnings, setRagWarnings] = useState<string[]>([])
+  const [ragNotes, setRagNotes] = useState<string[]>([])
+  const [ragFallback, setRagFallback] = useState<boolean>(false)
+  const [ragSessionId, setRagSessionId] = useState<number | null>(null)
+  const [ragHintVisible, setRagHintVisible] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true
+    try {
+      return localStorage.getItem('catalogue.ragHintSeen') === '1' ? false : true
+    } catch {
+      return true
+    }
+  })
   const [speechSupported, setSpeechSupported] = useState<boolean>(() => typeof window !== 'undefined' && 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined')
   const [autoSpeakAnswer, setAutoSpeakAnswer] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
@@ -119,6 +141,7 @@ export function useCatalogueState() {
     if (lower.includes('llm ответ')) return '💬'
     if (lower.includes('llm сниппеты')) return '🧠'
     if (lower.includes('полнотекст')) return '📚'
+    if (lower.startsWith('rag') || lower.includes('rag')) return '📘'
     return '•'
   }, [])
 
@@ -127,6 +150,70 @@ export function useCatalogueState() {
     line,
     icon: progressIconFor(line),
   })), [aiProgress, progressIconFor])
+
+  const progressStatus = useMemo<{ percent: number; label: string } | undefined>(() => {
+    if (!aiMode) return undefined
+    const stages: { label: string; regex: RegExp }[] = [
+      { label: 'Подготовка запроса', regex: /(формируем|запрос|отпечаток)/i },
+      { label: 'Отбор кандидатов', regex: /(кандидат|источники: теги)/i },
+      { label: 'Глубокий поиск', regex: /(глубок|полнотекст|скан|llm сниппеты)/i },
+      { label: 'RAG контекст', regex: /rag/i },
+      { label: 'Реранжирование', regex: /реранжирование/i },
+      { label: 'Ответ LLM', regex: /llm ответ/i },
+    ]
+    let highest = -1
+    let label = ''
+    aiProgress.forEach(line => {
+      stages.forEach((stage, index) => {
+        if (stage.regex.test(line) && index > highest) {
+          highest = index
+          label = stage.label
+        }
+      })
+    })
+    const total = stages.length
+    let percent = 0
+    if (highest >= 0) {
+      percent = Math.round(((highest + 1) / total) * 100)
+    }
+    if (!label) {
+      label = aiLoading ? 'Выполняется…' : (aiProgress.length ? 'Готово' : '')
+    }
+    if (aiLoading && percent >= 100) {
+      percent = 95
+    }
+    if (!aiLoading && highest >= total - 1) {
+      percent = 100
+      if (!label) label = 'Готово'
+    }
+    return { percent, label }
+  }, [aiMode, aiProgress, aiLoading])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      localStorage.setItem('catalogue.useRag', aiUseRag ? '1' : '0')
+    } catch {
+      /* ignore */
+    }
+  }, [aiUseRag])
+
+  useEffect(() => {
+    if (aiMode && aiUseRag && ragHintVisible) {
+      setShowAiSettings(true)
+    }
+  }, [aiMode, aiUseRag, ragHintVisible, setShowAiSettings])
+
+  const dismissRagHint = useCallback(() => {
+    setRagHintVisible(false)
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem('catalogue.ragHintSeen', '1')
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [])
 
   const aiAnswerPlain = useMemo(() => {
     if (!aiAnswer) return ''
@@ -586,6 +673,33 @@ export function useCatalogueState() {
         setAiAnswer(data.answer || '')
         setAiKeywords(Array.isArray(data.keywords) ? data.keywords : [])
         setAiFilteredKeywords(Array.isArray(data.filtered_keywords) ? data.filtered_keywords : [])
+        const ragContextData: RagContextEntry[] = Array.isArray(data.rag_context) ? data.rag_context : []
+        setRagContext(ragContextData)
+        const ragValidationData: RagValidationResult | null = data.rag_validation && typeof data.rag_validation === 'object' ? data.rag_validation : null
+        setRagValidation(ragValidationData)
+        const sessionId = typeof data.rag_session_id === 'number' ? data.rag_session_id : null
+        setRagSessionId(sessionId)
+        setRagFallback(Boolean(data.rag_fallback))
+        const ragNotesRaw: string[] = Array.isArray(data.rag_notes)
+          ? data.rag_notes.map((note: any) => String(note))
+          : []
+        const warnings: string[] = []
+        if (ragValidationData?.hallucination_warning) warnings.push('Ответ содержит предупреждения по проверке фактов.')
+        if (ragValidationData?.missing_citations) warnings.push('Некоторые факты в ответе представлены без ссылок на источники.')
+        if (ragValidationData?.unknown_citations?.length) {
+          const list = ragValidationData.unknown_citations.map(([doc, chunk]) => `[${doc}:${chunk}]`).join(', ')
+          warnings.push(`Есть ссылки, отсутствующие в контексте: ${list}`)
+        }
+        if (ragValidationData?.extra_citations?.length) {
+          const list = ragValidationData.extra_citations.map(([doc, chunk]) => `[${doc}:${chunk}]`).join(', ')
+          warnings.push(`Ответ содержит лишние ссылки: ${list}`)
+        }
+        const noteWarningRegex = /(не найден|не найдены|не удалось|нет документов|fallback|пропущен|контекст не|backend)/i
+        const noteWarnings = ragNotesRaw.filter(note => noteWarningRegex.test(note))
+        const infoNotes = ragNotesRaw.filter(note => !noteWarningRegex.test(note))
+        warnings.push(...noteWarnings)
+        setRagWarnings(warnings)
+        setRagNotes(infoNotes)
         await hydrateItems(items)
       } catch (error: any) {
         if (cancelled || (error && error.name === 'AbortError')) return
@@ -609,6 +723,12 @@ export function useCatalogueState() {
           setAiSources([])
           setAiFilteredKeywords([])
           setAiQueryHash('')
+          setRagContext([])
+          setRagValidation(null)
+          setRagWarnings([])
+          setRagNotes([])
+          setRagFallback(false)
+          setRagSessionId(null)
           const payload: any = { query: dq, top_k: aiTopK, deep_search: aiDeepSearch }
           payload.sources = { tags: aiUseTags, text: aiUseText }
           payload.max_candidates = aiMaxCandidates
@@ -617,6 +737,7 @@ export function useCatalogueState() {
           payload.max_snippets = aiMaxSnippets
           payload.full_text = aiFullText
           payload.llm_snippets = aiUseLlmSnippets
+          payload.use_rag = aiUseRag
           payload.all_languages = aiAllLanguages
           if (aiAllLanguages) {
             const langs = availableLanguages.filter(code => typeof code === 'string' && code.trim().length > 0)
@@ -636,6 +757,12 @@ export function useCatalogueState() {
             setAiProgress([`Ошибка поиска: ${normalized}`])
             setAiAnswer('')
             setAiKeywords([])
+            setRagContext([])
+            setRagValidation(null)
+            setRagWarnings([])
+            setRagNotes([])
+            setRagFallback(false)
+            setRagSessionId(null)
           }
         } else {
           if (aiMode) {
@@ -649,6 +776,12 @@ export function useCatalogueState() {
             setAiSources([])
             setAiFilteredKeywords([])
             setAiQueryHash('')
+            setRagContext([])
+            setRagValidation(null)
+            setRagWarnings([])
+            setRagNotes([])
+            setRagFallback(false)
+            setRagSessionId(null)
             setLocalPage(page)
             return
           }
@@ -656,6 +789,12 @@ export function useCatalogueState() {
           setAiKeywords([])
           setAiSources([])
           setAiFilteredKeywords([])
+          setRagContext([])
+          setRagValidation(null)
+          setRagWarnings([])
+          setRagNotes([])
+          setRagFallback(false)
+          setRagSessionId(null)
           const p = new URLSearchParams(params)
           p.set('limit', String(perPage))
           p.set('offset', String(offset))
@@ -675,6 +814,10 @@ export function useCatalogueState() {
             setAiProgress([`Ошибка поиска: ${error instanceof Error ? error.message : String(error)}`])
             setAiAnswer('')
             setAiKeywords([])
+            setRagContext([])
+            setRagValidation(null)
+            setRagWarnings([])
+            setRagSessionId(null)
           }
         }
       } finally {
@@ -780,6 +923,10 @@ export function useCatalogueState() {
     setSelectedTags([])
     setAiAnswer('')
     setAiKeywords([])
+    setRagContext([])
+    setRagValidation(null)
+    setRagWarnings([])
+    setRagSessionId(null)
     setAiMode(false)
     setAiProgress([])
     setSp(params)
@@ -793,14 +940,18 @@ export function useCatalogueState() {
     ai: {
       aiMode, setAiMode, aiLoading, aiProgress, progressItems, aiAnswer, safeAiAnswer, aiAnswerPlain,
       aiKeywords, aiSources, aiFilteredKeywords, aiQueryHash, feedbackStatus,
+      ragContext, ragValidation, ragWarnings, ragNotes, ragFallback, ragSessionId,
       aiTopK, setAiTopK, aiDeepSearch, setAiDeepSearch, aiUseTags, setAiUseTags,
       aiUseText, setAiUseText, aiMaxCandidates, setAiMaxCandidates, aiChunkChars, setAiChunkChars,
       aiMaxChunks, setAiMaxChunks, aiMaxSnippets, setAiMaxSnippets, aiFullText, setAiFullText,
-      aiUseLlmSnippets, setAiUseLlmSnippets, aiAllLanguages, setAiAllLanguages, showAiSettings, setShowAiSettings,
+      aiUseLlmSnippets, setAiUseLlmSnippets, aiUseRag, setAiUseRag, aiAllLanguages, setAiAllLanguages, showAiSettings, setShowAiSettings,
       aiLanguageOptions: availableLanguages,
       aiLoadingState: { speechSupported, autoSpeakAnswer, setAutoSpeakAnswer, speechState, speechError, setSpeechError },
       handlers: { handleSourceFeedback, handleKeywordFeedback, handleKeywordRestore, speakAnswer, stopSpeakingAnswer },
       canSpeakAnswer,
+      progressStatus,
+      ragHintVisible,
+      dismissRagHint,
       resetAiState,
     },
     modals: { previewRel, setPreviewRel, editItem, setEditItem, editForm, setEditForm, saveEdit, openEdit },

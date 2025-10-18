@@ -30,6 +30,8 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
     setAiFullText,
     aiUseLlmSnippets,
     setAiUseLlmSnippets,
+    aiUseRag,
+    setAiUseRag,
     aiAllLanguages,
     setAiAllLanguages,
     aiUseTags,
@@ -40,17 +42,35 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
     aiLoading,
     aiProgress,
     progressItems,
+    progressStatus,
     aiAnswer,
     safeAiAnswer,
     aiKeywords,
     aiFilteredKeywords,
     aiSources,
+    ragContext,
+    ragValidation,
+    ragWarnings,
+    ragNotes,
+    ragFallback,
+    ragSessionId,
     aiQueryHash,
     feedbackStatus,
     aiLoadingState: { speechSupported, autoSpeakAnswer, setAutoSpeakAnswer, speechState, speechError },
     handlers: { handleSourceFeedback, handleKeywordFeedback, handleKeywordRestore, speakAnswer, stopSpeakingAnswer },
     canSpeakAnswer,
+    ragHintVisible,
+    dismissRagHint,
   } = ai
+
+  const escapeHtml = (value: string) => String(value || '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] || ch))
+  const renderMultiline = (value: string, limit = 800) => {
+    const text = String(value || '').trim()
+    const sliced = limit > 0 && text.length > limit ? text.slice(0, limit) + '…' : text
+    return { __html: escapeHtml(sliced).replace(/\n/g, '<br/>') }
+  }
+  const formatScore = (value?: number) => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(3) : '—')
+  const hasWarnings = Array.isArray(ragWarnings) && ragWarnings.length > 0
 
   return (
     <>
@@ -184,6 +204,19 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
               </div>
               <small className="text-muted">Формирует короткий пересказ для выдачи (медленнее, но информативнее).</small>
             </div>
+            <div className="col-12 col-lg-3 d-flex flex-column justify-content-center">
+              <div className="form-check form-switch">
+                <input
+                  className="form-check-input"
+                  type="checkbox"
+                  id="aiUseRag"
+                  checked={aiUseRag}
+                  onChange={e => setAiUseRag(e.target.checked)}
+                />
+                <label className="form-check-label" htmlFor="aiUseRag">Использовать RAG контекст</label>
+              </div>
+              <small className="text-muted">Выключите, если нужен быстрый ответ только по сниппетам.</small>
+            </div>
             <div className="col-12 col-lg-3">
               <div className="form-check">
                 <input className="form-check-input" type="checkbox" id="aiTags" checked={aiUseTags} onChange={e => setAiUseTags(e.target.checked)} />
@@ -238,6 +271,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
           className="mb-2"
           title="Прогресс поиска"
           caption={aiQueryHash ? `Хэш ${aiQueryHash.slice(0, 8)}` : undefined}
+          progress={progressStatus}
           bullets={(function (): ProgressBullet[] {
             const source = progressItems.length ? progressItems : [{ id: 'pending', line: 'Поиск выполняется…', icon: '⏳' }]
             return source.map((item, index) => ({
@@ -250,6 +284,16 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
         />
       )}
 
+      {aiMode && aiUseRag && ragHintVisible && (
+        <div className="alert alert-info" role="status">
+          <div className="d-flex justify-content-between align-items-center">
+            <div>
+              RAG включает точные источники и цитаты. При отсутствии данных ответ вернётся в классический режим.
+            </div>
+            <button className="btn btn-sm btn-outline-secondary" onClick={dismissRagHint}>Понятно</button>
+          </div>
+        </div>
+      )}
       {!!aiAnswer && (
         <div className="card p-3 mb-2" aria-live="polite">
           <div className="d-flex align-items-center justify-content-between mb-1 gap-2">
@@ -270,6 +314,44 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
             <div className="text-danger" style={{ fontSize: '0.85rem' }}>{speechError}</div>
           )}
           <div style={{ whiteSpace: 'pre-wrap' }} dangerouslySetInnerHTML={{ __html: safeAiAnswer }} />
+          {hasWarnings && (
+            <div className="alert alert-warning mt-3 mb-2" role="status">
+              <div className="fw-semibold mb-1">Предупреждения</div>
+              <ul className="mb-0" style={{ paddingLeft: '1.2rem' }}>
+                {ragWarnings.map((warning, idx) => (
+                  <li key={idx}>{warning}</li>
+                ))}
+              </ul>
+              {ragValidation?.facts_with_issues?.length ? (
+                <details className="mt-2 small">
+                  <summary>Факты без ссылок</summary>
+                  <ul className="mb-0" style={{ paddingLeft: '1.2rem' }}>
+                    {ragValidation.facts_with_issues.map((fact, idx) => (
+                      <li key={idx}>{fact}</li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+              {ragSessionId && (
+                <div className="text-muted small mt-2">Сессия RAG #{ragSessionId}</div>
+              )}
+            </div>
+          )}
+          {ragFallback && aiUseRag && !hasWarnings && (
+            <div className="alert alert-secondary mt-3 mb-2" role="status">
+              Ответ сформирован в fallback-режиме (классический поиск по сниппетам).
+            </div>
+          )}
+          {!!ragNotes?.length && (
+            <div className="alert alert-info mt-3 mb-2" role="status">
+              <div className="fw-semibold mb-1">Дополнительные сведения</div>
+              <ul className="mb-0" style={{ paddingLeft: '1.2rem' }}>
+                {ragNotes.map((note, idx) => (
+                  <li key={idx}>{note}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           {!!aiKeywords?.length && (
             <div className="mt-3">
               <div className="text-muted" style={{ fontSize: '0.85rem' }}>Ключевые термины</div>
@@ -385,6 +467,42 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
               </ol>
             </div>
           )}
+        </div>
+      )}
+
+      {aiUseRag && !!ragContext?.length && (
+        <div className="card p-3 mb-2">
+          <div className="fw-semibold mb-2">Контекст RAG</div>
+          <ol className="mb-0 ps-3">
+            {ragContext.map((entry, idx) => (
+              <li key={`${entry.doc_id}-${entry.chunk_id}-${idx}`} className="mb-3">
+                <div className="fw-semibold">[{idx + 1}] {entry.title || `Документ ${entry.doc_id}`}</div>
+                <div className="text-muted" style={{ fontSize: '0.8rem' }}>
+                  doc {entry.doc_id}, chunk {entry.chunk_id}
+                  {entry.language ? ` · lang ${entry.language}` : ''}
+                  {typeof entry.score_dense === 'number' ? ` · dense ${formatScore(entry.score_dense)}` : ''}
+                  {typeof entry.score_sparse === 'number' ? ` · sparse ${formatScore(entry.score_sparse)}` : ''}
+                  {typeof entry.combined_score === 'number' ? ` · combined ${formatScore(entry.combined_score)}` : ''}
+                </div>
+                {entry.translation_hint && (
+                  <div className="text-warning" style={{ fontSize: '0.8rem' }}>{entry.translation_hint}</div>
+                )}
+                {entry.preview && (
+                  <div className="text-muted" style={{ fontSize: '0.85rem' }} dangerouslySetInnerHTML={renderMultiline(entry.preview, 400)} />
+                )}
+                {entry.content && (
+                  <div className="mt-1" style={{ fontSize: '0.85rem', background: 'rgba(0,0,0,0.03)', borderRadius: 4, padding: '8px 10px' }}
+                    dangerouslySetInnerHTML={renderMultiline(entry.content, 800)}
+                  />
+                )}
+                {entry.url && (
+                  <div className="mt-1">
+                    <a href={`/preview/${encodeURIComponent(entry.url)}?embedded=1`} target="_blank" rel="noopener">Открыть документ</a>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ol>
         </div>
       )}
     </>

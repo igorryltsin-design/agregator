@@ -12,6 +12,8 @@ from .sparse import KeywordMatch, KeywordRetriever
 class ContextCandidate:
     chunk: RagDocumentChunk
     document: Optional[RagDocument]
+    preview: str = ""
+    token_estimate: int = 0
     dense_score: float = 0.0
     sparse_score: float = 0.0
     combined_score: float = 0.0
@@ -40,6 +42,8 @@ class ContextSelector:
         max_total_tokens: Optional[int] = None,
         token_estimator: Optional[Callable[[RagDocumentChunk], int]] = None,
         rerank_fn: Optional[Callable[[str, List["ContextCandidate"]], List["ContextCandidate"]]] = None,
+        token_multiplier: float = 1.6,
+        section_overhead: int = 80,
     ) -> None:
         self.vector_retriever = vector_retriever
         self.keyword_retriever = keyword_retriever
@@ -55,6 +59,8 @@ class ContextSelector:
         self.max_total_tokens = max_total_tokens
         self.token_estimator = token_estimator or self._default_token_estimator
         self.rerank_fn = rerank_fn
+        self.token_multiplier = max(1.0, float(token_multiplier))
+        self.section_overhead = max(0, int(section_overhead))
 
     def select(
         self,
@@ -64,10 +70,12 @@ class ContextSelector:
         top_k: int = 6,
         languages: Optional[Sequence[str]] = None,
         max_total_tokens: Optional[int] = None,
+        allowed_document_ids: Optional[Sequence[int]] = None,
     ) -> List[ContextCandidate]:
         dense_hits = self.vector_retriever.search_by_vector(
             query_vector,
             top_k=self.dense_top_k,
+            allowed_document_ids=allowed_document_ids,
         )
         if languages:
             languages_set = {lang.lower() for lang in languages}
@@ -85,6 +93,8 @@ class ContextSelector:
                 max_per_document=self.max_per_document * 2,
             )
         candidates = self._combine_hits(dense_hits, sparse_hits, top_k=top_k, query=query)
+        for cand in candidates:
+            self._estimate_tokens(cand)
         token_limit = max_total_tokens if max_total_tokens is not None else self.max_total_tokens
         if token_limit:
             candidates = self._cap_tokens(candidates, token_limit)
@@ -108,6 +118,7 @@ class ContextSelector:
                 ContextCandidate(
                     chunk=chunk,
                     document=doc,
+                    preview=self._make_preview(chunk),
                 ),
             )
             cand.dense_score = max(cand.dense_score, hit.score)
@@ -120,8 +131,11 @@ class ContextSelector:
                 ContextCandidate(
                     chunk=chunk,
                     document=doc,
+                    preview=self._make_preview(chunk),
                 ),
             )
+            if not cand.preview:
+                cand.preview = self._make_preview(chunk)
             cand.sparse_score = max(cand.sparse_score, match.score)
             if match.matched_terms:
                 cand.matched_terms = match.matched_terms
@@ -203,6 +217,13 @@ class ContextSelector:
             parts.append(f"preview=\"{preview}\"")
         return "; ".join(parts)
 
+    @staticmethod
+    def _make_preview(chunk: RagDocumentChunk) -> str:
+        raw = (chunk.preview or chunk.content or "").strip()
+        if not raw:
+            return ""
+        return raw[:200].replace("\n", " ").strip()
+
     def _passes_thresholds(self, cand: ContextCandidate) -> bool:
         if cand.dense_score and cand.dense_score < self.min_dense_score:
             return False
@@ -218,7 +239,7 @@ class ContextSelector:
         total = 0
         kept: List[ContextCandidate] = []
         for cand in candidates:
-            tokens = max(1, self.token_estimator(cand.chunk))
+            tokens = cand.token_estimate or self._estimate_tokens(cand)
             if total and total + tokens > limit:
                 continue
             kept.append(cand)
@@ -232,11 +253,20 @@ class ContextSelector:
         tok = getattr(chunk, "token_count", None)
         if tok:
             try:
-                return max(1, int(tok))
+                return max(1, int(tok) * 3 // 2)
             except Exception:
                 pass
         text = (chunk.content or "").strip()
         if not text:
             return 50
         words = len(text.split())
-        return max(1, int(words * 1.3))
+        return max(1, int(words * 1.6))
+
+    def _estimate_tokens(self, cand: ContextCandidate) -> int:
+        try:
+            raw_tokens = max(1, int(self.token_estimator(cand.chunk)))
+        except Exception:
+            raw_tokens = max(1, len((cand.chunk.content or "").split()))
+        adjusted = int(raw_tokens * self.token_multiplier) + self.section_overhead
+        cand.token_estimate = max(1, adjusted)
+        return cand.token_estimate

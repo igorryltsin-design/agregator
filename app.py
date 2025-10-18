@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import itertools
 import copy
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
 
 import click
 from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app, has_app_context
@@ -73,6 +73,35 @@ def _configure_sqlite_pragmas(dbapi_connection, connection_record):
     except Exception:
         _sqlite3 = None
     if _sqlite3 is not None and isinstance(dbapi_connection, _sqlite3.Connection):
+        try:
+            import math as _math
+            try:
+                from agregator.rag.utils import bytes_to_vector as _bytes_to_vector  # type: ignore
+            except Exception:
+                _bytes_to_vector = None
+
+            def _cosine_similarity_sqlite(blob_a, blob_b):
+                if _bytes_to_vector is None or blob_a is None or blob_b is None:
+                    return 0.0
+                try:
+                    vec_a = _bytes_to_vector(blob_a)
+                    vec_b = _bytes_to_vector(blob_b)
+                except Exception:
+                    return 0.0
+                if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+                    return 0.0
+                dot = sum(a * b for a, b in zip(vec_a, vec_b))
+                if dot == 0.0:
+                    return 0.0
+                norm_a = _math.sqrt(sum(a * a for a in vec_a))
+                norm_b = _math.sqrt(sum(b * b for b in vec_b))
+                if norm_a == 0.0 or norm_b == 0.0:
+                    return 0.0
+                return dot / (norm_a * norm_b)
+
+            dbapi_connection.create_function("cosine_similarity", 2, _cosine_similarity_sqlite)
+        except Exception:
+            pass
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute("PRAGMA foreign_keys = 1")
@@ -112,8 +141,10 @@ from agregator.rag import (
     ContextSelector,
     KeywordRetriever,
     ContextSection,
+    ValidationResult,
     RagIndexer,
     VectorRetriever,
+    EmbeddingBackend,
     load_embedding_backend,
     vector_to_bytes,
     build_system_prompt,
@@ -235,6 +266,15 @@ def _lm_max_output_tokens() -> int:
     return max(1, value)
 
 
+def _lm_safe_context_tokens() -> int:
+    """Return the soft limit of tokens we keep within the prompt window."""
+    try:
+        value = int(getattr(_rt(), 'lm_context_token_limit', 3200) or 3200)
+    except Exception:
+        value = 3200
+    return max(512, value)
+
+
 def _always_ocr_first_page_dissertation() -> bool:
     """Return flag for forcing OCR on the first page of dissertations."""
     try:
@@ -346,6 +386,25 @@ def _import_subdir_value() -> str:
 
 def _collections_in_separate_dirs() -> bool:
     return bool(_rt().collections_in_separate_dirs)
+
+
+def _ensure_rag_embedding_defaults() -> None:
+    runtime = runtime_settings_store.current
+    updates: dict[str, object] = {}
+    backend_raw = (runtime.rag_embedding_backend or '').strip().lower()
+    if backend_raw in ('', 'auto'):
+        updates['RAG_EMBEDDING_BACKEND'] = 'lm-studio'
+    model_raw = (runtime.rag_embedding_model or '').strip()
+    if not model_raw or model_raw == 'intfloat/multilingual-e5-large':
+        updates['RAG_EMBEDDING_MODEL'] = 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+        if (runtime.rag_embedding_dim or 0) < 256:
+            updates['RAG_EMBEDDING_DIM'] = 768
+    if not runtime.rag_embedding_endpoint:
+        updates['RAG_EMBEDDING_ENDPOINT'] = runtime.lmstudio_api_base or ''
+    if runtime.rag_embedding_api_key is None:
+        updates['RAG_EMBEDDING_API_KEY'] = ''
+    if updates:
+        runtime_settings_store.apply_updates(updates)
 
 
 _RUNTIME_ATTR_MAP = {
@@ -772,6 +831,64 @@ TASK_RETENTION_WINDOW = timedelta(days=1)
 TASK_FINAL_STATUSES = ('completed', 'error', 'cancelled')
 TASK_STUCK_STATUSES = ('running', 'pending', 'queued', 'cancelling')
 
+_RAG_RERANK_LOCK = threading.Lock()
+_RAG_RERANK_CACHE: Dict[str, "CrossEncoderReranker"] = {}
+
+
+def _reset_rag_rerank_cache(*, locked: bool = False) -> None:
+    if not locked:
+        with _RAG_RERANK_LOCK:
+            _reset_rag_rerank_cache(locked=True)
+        return
+    for instance in _RAG_RERANK_CACHE.values():
+        try:
+            instance.close()
+        except Exception:
+            pass
+    _RAG_RERANK_CACHE.clear()
+
+
+def _get_rag_reranker() -> Optional["CrossEncoderReranker"]:
+    runtime = _rt()
+    backend_raw = str(getattr(runtime, "rag_rerank_backend", "none") or "").strip().lower()
+    if backend_raw not in {"cross-encoder", "cross_encoder", "cross"}:
+        if _RAG_RERANK_CACHE:
+            _reset_rag_rerank_cache()
+        return None
+    model_name = str(getattr(runtime, "rag_rerank_model", "") or "").strip()
+    if not model_name:
+        return None
+    device = getattr(runtime, "rag_rerank_device", None)
+    batch_size = max(1, int(getattr(runtime, "rag_rerank_batch_size", 16) or 16))
+    max_length = max(32, int(getattr(runtime, "rag_rerank_max_length", 512) or 512))
+    max_chars = max(200, int(getattr(runtime, "rag_rerank_max_chars", 1200) or 1200))
+    cache_key = f"{backend_raw}::{model_name}::{device or ''}::{batch_size}::{max_length}::{max_chars}"
+    with _RAG_RERANK_LOCK:
+        existing = _RAG_RERANK_CACHE.get(cache_key)
+        if existing:
+            return existing
+        _reset_rag_rerank_cache(locked=True)
+        try:
+            from agregator.rag.rerank import CrossEncoderConfig, load_reranker
+
+            reranker = load_reranker(
+                backend_raw,
+                config=CrossEncoderConfig(
+                    model_name=model_name,
+                    device=device,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    truncate_chars=max_chars,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Не удалось инициализировать cross-encoder rerank (%s/%s): %s", backend_raw, model_name, exc)
+            return None
+        if reranker is None:
+            return None
+        _RAG_RERANK_CACHE[cache_key] = reranker
+        return reranker
+
 def _row_text_for_search(f: File) -> str:
     parts = [
         f.title or '', f.author or '', f.keywords or '', f.filename or '',
@@ -785,6 +902,7 @@ def _row_text_for_search(f: File) -> str:
 
 # Простое кэширующее хранилище в памяти для расширения ключевых слов ИИ
 AI_EXPAND_CACHE: dict[str, tuple[float, list[str], list[tuple[str, int]]]] = {}
+AI_KEYWORD_PLAN_CACHE: dict[str, tuple[float, Dict[str, List[str]]]] = {}
 
 # Весовые коэффициенты и параметры оценки (можно менять через переменные окружения)
 def _getf(name: str, default: float) -> float:
@@ -799,6 +917,8 @@ AI_SCORE_KEYWORDS = _getf('AI_SCORE_KEYWORDS', 1.2)
 AI_SCORE_EXCERPT = _getf('AI_SCORE_EXCERPT', 1.0)
 AI_SCORE_ABSTRACT = _getf('AI_SCORE_ABSTRACT', 1.0)
 AI_SCORE_TAG = _getf('AI_SCORE_TAG', 1.0)
+AI_SCORE_FTS = _getf('AI_SCORE_FTS', 1.8)
+AI_SCORE_FTS_RAW = _getf('AI_SCORE_FTS_RAW', 2.2)
 AI_BOOST_PHRASE = _getf('AI_BOOST_PHRASE', 3.0)
 AI_BOOST_MULTI = _getf('AI_BOOST_MULTI', 0.6)  # дополнительный бонус за каждое уникальное слово
 AI_BOOST_SNIPPET_COOCCUR = _getf('AI_BOOST_SNIPPET_COOCCUR', 0.8)
@@ -984,6 +1104,7 @@ def _apply_config_defaults(cfg: AppConfig) -> None:
     SENTRY_ENVIRONMENT = cfg.sentry_environment
 
     _refresh_runtime_globals()
+    _ensure_rag_embedding_defaults()
 
 
 _apply_config_defaults(CONFIG)
@@ -1019,6 +1140,7 @@ def _load_runtime_settings_from_disk() -> None:
         logger.warning("Не удалось прочитать настройки: %s", exc)
         return
     runtime_settings_store.apply_updates(data)
+    _reset_rag_rerank_cache()
     runtime = _rt()
     if runtime.lm_default_provider not in LLM_PROVIDER_CHOICES:
         runtime.lm_default_provider = 'openai'
@@ -1036,6 +1158,18 @@ def _load_runtime_settings_from_disk() -> None:
     app_ref = globals().get('app')
     if app_ref:
         runtime.apply_to_flask_config(app_ref)
+
+
+def _save_runtime_settings_to_disk() -> None:
+    try:
+        SETTINGS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = runtime_settings_store.snapshot()
+        SETTINGS_STORE_PATH.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+    except Exception as exc:
+        logger.warning("Не удалось сохранить настройки: %s", exc)
 
 
 def _runtime_settings_snapshot() -> dict:
@@ -2293,6 +2427,60 @@ def api_profile():
     if request.method == 'GET':
         return jsonify({'ok': True, 'user': _user_to_payload(user)})
     data = request.get_json(silent=True) or {}
+    runtime = runtime_settings_store.current
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
+    runtime = runtime_settings_store.current
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
+    runtime = runtime_settings_store.current
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
+    runtime = runtime_settings_store.current
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
+    runtime = runtime_settings_store.current
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
     user.full_name = (data.get('full_name') or '').strip() or None
     db.session.commit()
     try:
@@ -5354,6 +5542,13 @@ def api_settings():
             'lm_model': runtime.lmstudio_model,
             'lm_key': runtime.lmstudio_api_key,
             'lm_provider': provider_default,
+            'rag_embedding_backend': runtime.rag_embedding_backend,
+            'rag_embedding_model': runtime.rag_embedding_model,
+            'rag_embedding_dim': int(runtime.rag_embedding_dim),
+            'rag_embedding_batch': int(runtime.rag_embedding_batch_size),
+            'rag_embedding_device': runtime.rag_embedding_device,
+            'rag_embedding_endpoint': runtime.rag_embedding_endpoint or runtime.lmstudio_api_base,
+            'rag_embedding_api_key': runtime.rag_embedding_api_key or runtime.lmstudio_api_key,
             'transcribe_enabled': bool(runtime.transcribe_enabled),
             'transcribe_backend': runtime.transcribe_backend,
             'transcribe_model': runtime.transcribe_model_path,
@@ -5418,6 +5613,27 @@ def api_settings():
         if candidate not in LLM_PROVIDER_CHOICES:
             candidate = runtime.lm_default_provider if runtime.lm_default_provider in LLM_PROVIDER_CHOICES else 'openai'
         _set('LM_DEFAULT_PROVIDER', candidate)
+    if 'rag_embedding_backend' in data:
+        backend = (data.get('rag_embedding_backend') or '').strip().lower()
+        _set('RAG_EMBEDDING_BACKEND', backend or runtime.rag_embedding_backend)
+    if 'rag_embedding_model' in data:
+        _set('RAG_EMBEDDING_MODEL', data.get('rag_embedding_model'))
+    if 'rag_embedding_dim' in data:
+        try:
+            _set('RAG_EMBEDDING_DIM', int(data.get('rag_embedding_dim')))
+        except Exception:
+            pass
+    if 'rag_embedding_batch' in data:
+        try:
+            _set('RAG_EMBEDDING_BATCH', int(data.get('rag_embedding_batch')))
+        except Exception:
+            pass
+    if 'rag_embedding_device' in data:
+        _set('RAG_EMBEDDING_DEVICE', (data.get('rag_embedding_device') or '').strip())
+    if 'rag_embedding_endpoint' in data:
+        _set('RAG_EMBEDDING_ENDPOINT', (data.get('rag_embedding_endpoint') or '').strip())
+    if 'rag_embedding_api_key' in data:
+        _set('RAG_EMBEDDING_API_KEY', data.get('rag_embedding_api_key') or '')
     if 'transcribe_enabled' in data:
         _set('TRANSCRIBE_ENABLED', data.get('transcribe_enabled'))
     if 'transcribe_backend' in data:
@@ -5485,10 +5701,24 @@ def api_settings():
         _set('LM_MAX_OUTPUT_TOKENS', data.get('lm_max_output_tokens'))
     if 'azure_openai_api_version' in data:
         _set('AZURE_OPENAI_API_VERSION', data.get('azure_openai_api_version'))
+    if 'rag_rerank_backend' in data:
+        _set('RAG_RERANK_BACKEND', data.get('rag_rerank_backend'))
+    if 'rag_rerank_model' in data:
+        _set('RAG_RERANK_MODEL', data.get('rag_rerank_model'))
+    if 'rag_rerank_device' in data:
+        _set('RAG_RERANK_DEVICE', data.get('rag_rerank_device'))
+    if 'rag_rerank_batch_size' in data:
+        _set('RAG_RERANK_BATCH_SIZE', data.get('rag_rerank_batch_size'))
+    if 'rag_rerank_max_length' in data:
+        _set('RAG_RERANK_MAX_LENGTH', data.get('rag_rerank_max_length'))
+    if 'rag_rerank_max_chars' in data:
+        _set('RAG_RERANK_MAX_CHARS', data.get('rag_rerank_max_chars'))
 
     if update_payload:
         runtime_settings_store.apply_updates(update_payload)
         _refresh_runtime_globals()
+        _ensure_rag_embedding_defaults()
+        _reset_rag_rerank_cache()
     after = runtime_settings_store.snapshot()
     runtime = _rt()
 
@@ -6960,6 +7190,357 @@ def _resolve_candidate_paths(file_obj: File) -> List[Path]:
     return resolved
 
 
+def _collect_text_for_rag(file_obj: File, *, limit_chars: int = 120_000) -> tuple[str, Optional[Path]]:
+    """Возвращает текст для RAG и путь к исходному файлу (если удалось определить)."""
+    if not file_obj:
+        return "", None
+    last_error: Exception | None = None
+    for candidate in _resolve_candidate_paths(file_obj):
+        try:
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            text = _extract_text_for_rag(candidate, limit_chars=limit_chars)
+            if text and text.strip():
+                return text, candidate
+        except Exception as exc:
+            last_error = exc
+    fallback = (file_obj.text_excerpt or "").strip()
+    if fallback:
+        return fallback, None
+    if last_error:
+        raise RuntimeError(f"Не удалось извлечь текст: {last_error}") from last_error
+    return "", None
+
+
+def _embed_missing_chunks_for_document(
+    document_id: int,
+    backend: EmbeddingBackend,
+    *,
+    batch_size: int = 32,
+    commit: bool = True,
+) -> int:
+    """Создаёт эмбеддинги для чанков документа, у которых они отсутствуют."""
+    if not document_id:
+        return 0
+    model_name = getattr(backend, "model_name", "unknown")
+    model_version = getattr(backend, "model_version", "unknown")
+    join_condition = and_(
+        RagChunkEmbedding.chunk_id == RagDocumentChunk.id,
+        RagChunkEmbedding.model_name == model_name,
+        RagChunkEmbedding.model_version == model_version,
+    )
+    pending_chunks: List[RagDocumentChunk] = (
+        db.session.query(RagDocumentChunk)
+        .outerjoin(RagChunkEmbedding, join_condition)
+        .filter(RagDocumentChunk.document_id == document_id, RagChunkEmbedding.id.is_(None))
+        .order_by(RagDocumentChunk.id.asc())
+        .all()
+    )
+    if not pending_chunks:
+        return 0
+    total_created = 0
+    batch_size = max(1, int(batch_size or 1))
+    for start in range(0, len(pending_chunks), batch_size):
+        batch = pending_chunks[start : start + batch_size]
+        texts = [chunk.content or "" for chunk in batch]
+        vectors = backend.embed_many(texts)
+        if len(vectors) != len(batch):
+            raise RuntimeError("Размера ответа backend эмбеддингов недостаточно для сохранения.")
+        for chunk, vector in zip(batch, vectors):
+            vector_bytes = vector_to_bytes(vector)
+            checksum = hashlib.sha256(vector_bytes).hexdigest()
+            embedding = RagChunkEmbedding(
+                chunk_id=chunk.id,
+                model_name=model_name,
+                model_version=model_version,
+                dim=len(vector),
+                vector=vector_bytes,
+                vector_checksum=checksum,
+            )
+            db.session.add(embedding)
+            total_created += 1
+        if commit:
+            db.session.commit()
+        else:
+            db.session.flush()
+    return total_created
+
+
+def _run_rag_collection_job(task_id: int, collection_id: int, options: dict[str, object]) -> None:
+    """Фоновая задача построения RAG-индекса для коллекции."""
+    try:
+        db.session.rollback()
+    except Exception:
+        db.session.remove()
+
+    task = TaskRecord.query.get(task_id)
+    if not task:
+        return
+
+    def _update_task(status: Optional[str] = None, progress: Optional[float] = None, error: Optional[str] = None, final: bool = False, payload_override: Optional[dict] = None) -> None:
+        payload = payload_override or summary
+        try:
+            task_ref = TaskRecord.query.get(task_id)
+            if not task_ref:
+                return
+            if status:
+                task_ref.status = status
+            if progress is not None:
+                task_ref.progress = max(0.0, min(1.0, float(progress)))
+            task_ref.payload = json.dumps(payload, ensure_ascii=False)
+            if status == 'running' and task_ref.started_at is None:
+                task_ref.started_at = datetime.utcnow()
+            if status in ('completed', 'error', 'cancelled'):
+                task_ref.finished_at = datetime.utcnow()
+            if error:
+                task_ref.error = error
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    user_id = options.get("user_id")
+    try:
+        runtime = runtime_settings_store.current
+    except Exception:
+        runtime = None
+
+    default_backend = (getattr(runtime, "rag_embedding_backend", "auto") or "auto").strip().lower()
+    default_model = getattr(runtime, "rag_embedding_model", None) or "intfloat/multilingual-e5-large"
+    default_dim = max(8, int(getattr(runtime, "rag_embedding_dim", 384) or 384))
+    default_batch = max(1, int(getattr(runtime, "rag_embedding_batch_size", 32) or 32))
+    default_device = getattr(runtime, "rag_embedding_device", None)
+    default_endpoint = getattr(runtime, "rag_embedding_endpoint", None) or getattr(runtime, "lmstudio_api_base", "")
+    default_api_key = getattr(runtime, "rag_embedding_api_key", None) or getattr(runtime, "lmstudio_api_key", "")
+
+    def _log_result(action: str, detail_payload: dict[str, object]) -> None:
+        try:
+            actor = User.query.get(int(user_id)) if user_id else None
+        except Exception:
+            actor = None
+        try:
+            _log_user_action(
+                actor,
+                action,
+                "collection",
+                collection_id,
+                detail=json.dumps(detail_payload, ensure_ascii=False),
+            )
+        except Exception:
+            pass
+
+    try:
+        collection = Collection.query.get(collection_id)
+        if not collection:
+            raise RuntimeError("Коллекция не найдена.")
+    except Exception as exc:
+        summary = {
+            "collection_id": collection_id,
+            "collection_name": None,
+            "total_files": 0,
+            "ingested": 0,
+            "skipped": 0,
+            "embedded": 0,
+            "failures": [
+                {"reason": "collection_missing", "message": str(exc)},
+            ],
+            "status": "error",
+        }
+        _update_task(status='error', progress=0.0, error=str(exc), final=True, payload_override=summary)
+        _log_result(
+            "collection_rag_reindex_failed",
+            {"reason": "collection_missing", "message": str(exc)},
+        )
+        return
+
+    chunk_config = ChunkConfig(
+        max_tokens=max(16, int(options.get("chunk_max_tokens", 700))),
+        overlap=max(0, int(options.get("chunk_overlap", 120))),
+        min_tokens=max(1, int(options.get("chunk_min_tokens", 80))),
+    )
+    skip_if_unchanged = bool(options.get("skip_if_unchanged", True))
+    limit_chars = max(1000, int(options.get("limit_chars", 120_000)))
+    embedding_backend_name = (
+        str(options.get("embedding_backend") or default_backend or "auto").strip().lower() or default_backend or "auto"
+    )
+    embedding_model_name = str(options.get("embedding_model_name") or default_model).strip() or default_model
+    embedding_dim = max(8, int(options.get("embedding_dim", default_dim)))
+    embedding_batch = max(1, int(options.get("embedding_batch_size", default_batch)))
+    embedding_normalize = bool(options.get("embedding_normalize", True))
+    embedding_device = options.get("embedding_device")
+    if not embedding_device and default_device:
+        embedding_device = default_device
+    embedding_endpoint = str(options.get("embedding_endpoint") or default_endpoint or "").strip()
+    embedding_api_key = str(options.get("embedding_api_key") or default_api_key or "")
+
+    try:
+        files = (
+            File.query.filter(File.collection_id == collection_id)
+            .order_by(File.id.asc())
+            .all()
+        )
+    except Exception as exc:
+        summary = {
+            "collection_id": collection_id,
+            "collection_name": collection.name,
+            "total_files": 0,
+            "ingested": 0,
+            "skipped": 0,
+            "embedded": 0,
+            "failures": [
+                {"reason": "files_query_failed", "message": str(exc)},
+            ],
+            "status": "error",
+        }
+        _update_task(status='error', progress=0.0, error=str(exc), final=True, payload_override=summary)
+        _log_result(
+            "collection_rag_reindex_failed",
+            {"reason": "files_query_failed", "message": str(exc)},
+        )
+        return
+
+    indexer = RagIndexer(chunk_config=chunk_config, normalizer_version=str(options.get("normalizer_version") or "v1"))
+
+    try:
+        backend = load_embedding_backend(
+            embedding_backend_name,
+            model_name=embedding_model_name,
+            dim=embedding_dim,
+            normalize=embedding_normalize,
+            batch_size=embedding_batch,
+            device=embedding_device,
+            base_url=embedding_endpoint or None,
+            api_key=embedding_api_key or None,
+        )
+    except Exception as exc:
+        summary = {
+            "collection_id": collection_id,
+            "collection_name": collection.name,
+            "total_files": len(files),
+            "ingested": 0,
+            "skipped": 0,
+            "embedded": 0,
+            "failures": [
+                {"reason": "backend_init_failed", "message": str(exc)},
+            ],
+            "status": "error",
+        }
+        _update_task(status='error', progress=0.0, error=str(exc), final=True, payload_override=summary)
+        _log_result(
+            "collection_rag_reindex_failed",
+            {"reason": "backend_init_failed", "message": str(exc)},
+        )
+        return
+
+    summary: dict[str, object] = {
+        "collection_id": collection_id,
+        "collection_name": collection.name,
+        "total_files": len(files),
+        "ingested": 0,
+        "skipped": 0,
+        "embedded": 0,
+        "failures": [],
+        "status": "running",
+        "embedding_backend": {
+            "name": getattr(backend, "name", embedding_backend_name),
+            "model_name": getattr(backend, "model_name", embedding_model_name),
+            "model_version": getattr(backend, "model_version", None),
+            "dim": getattr(backend, "dim", embedding_dim),
+            "endpoint": embedding_endpoint,
+        },
+        "options": {
+            "skip_if_unchanged": skip_if_unchanged,
+            "limit_chars": limit_chars,
+            "chunk_max_tokens": chunk_config.max_tokens,
+            "chunk_overlap": chunk_config.overlap,
+            "chunk_min_tokens": chunk_config.min_tokens,
+            "embedding_backend": embedding_backend_name,
+            "embedding_model_name": embedding_model_name,
+            "embedding_endpoint": embedding_endpoint,
+        },
+    }
+    _update_task(status='running', progress=0.0)
+
+    total_files = len(files) or 1
+    failure_entries: list[dict[str, object]] = []
+
+    for idx, file_obj in enumerate(files, start=1):
+        ingest_result: dict[str, object] | None = None
+        try:
+            text, source_path = _collect_text_for_rag(file_obj, limit_chars=limit_chars)
+            if not text.strip():
+                raise RuntimeError("Пустой текст после извлечения.")
+            metadata = {
+                "source": "api.collection_rag_reindex",
+                "source_path": str(source_path) if source_path else None,
+                "file_sha1": file_obj.sha1,
+                "collection_id": collection_id,
+                "file_id": file_obj.id,
+            }
+            ingest_result = indexer.ingest_document(
+                file_obj,
+                text,
+                metadata=metadata,
+                skip_if_unchanged=skip_if_unchanged,
+                commit=True,
+            )
+        except Exception as exc:
+            db.session.rollback()
+            failure_entries.append(
+                {"file_id": file_obj.id, "reason": "ingest_failed", "message": str(exc)}
+            )
+            continue
+
+        if ingest_result is None:
+            continue
+
+        if ingest_result.get("skipped"):
+            summary["skipped"] = int(summary.get("skipped", 0)) + 1
+        else:
+            summary["ingested"] = int(summary.get("ingested", 0)) + 1
+
+        document_id = int(ingest_result.get("document_id") or 0)
+        if document_id:
+            try:
+                created = _embed_missing_chunks_for_document(
+                    document_id,
+                    backend,
+                    batch_size=embedding_batch,
+                    commit=True,
+                )
+                summary["embedded"] = int(summary.get("embedded", 0)) + created
+            except Exception as exc:
+                db.session.rollback()
+                failure_entries.append(
+                    {"file_id": file_obj.id, "reason": "embed_failed", "message": str(exc)}
+                )
+
+        progress = idx / total_files
+        summary["failures"] = failure_entries[:20]
+        _update_task(status='running', progress=progress)
+
+    summary["status"] = "completed"
+    try:
+        backend.close()
+    except Exception:
+        pass
+
+    summary["failures"] = failure_entries[:20]
+    _update_task(status='completed', progress=1.0)
+
+    _log_result(
+        "collection_rag_reindex_done",
+        {
+            "ingested": summary.get("ingested"),
+            "skipped": summary.get("skipped"),
+            "embedded": summary.get("embedded"),
+            "failures": len(failure_entries),
+            "collection_name": collection.name,
+            "backend": embedding_backend_name,
+            "model": embedding_model_name,
+        },
+    )
+
+
 def _build_translation_hint(query_lang: Optional[str], section_lang: Optional[str]) -> str:
     q = (query_lang or "").lower()
     s = (section_lang or "").lower()
@@ -6970,6 +7551,718 @@ def _build_translation_hint(query_lang: Optional[str], section_lang: Optional[st
     if s == "ru":
         return f"Fragment language ru; respond in {q or 'user language'}, keep quotes на русском."
     return f"Фрагмент на {s}, ответ оставь на {q or 'языке запроса'}, цитаты — на оригинале."
+
+
+def _select_rag_embedding_variant(document_ids: Sequence[int]) -> Optional[tuple[str, Optional[str], int]]:
+    if not document_ids:
+        return None
+    variant = (
+        db.session.query(
+            RagChunkEmbedding.model_name,
+            RagChunkEmbedding.model_version,
+            RagChunkEmbedding.dim,
+        )
+        .join(RagDocumentChunk, RagDocumentChunk.id == RagChunkEmbedding.chunk_id)
+        .filter(RagDocumentChunk.document_id.in_(list(document_ids)))
+        .order_by(RagChunkEmbedding.id.desc())
+        .first()
+    )
+    if variant:
+        return variant
+    fallback_variant = (
+        db.session.query(
+            RagChunkEmbedding.model_name,
+            RagChunkEmbedding.model_version,
+            RagChunkEmbedding.dim,
+        )
+        .order_by(RagChunkEmbedding.id.desc())
+        .first()
+    )
+    return fallback_variant
+
+
+def _serialize_context_section(section: ContextSection) -> Dict[str, Any]:
+    return {
+        "doc_id": section.doc_id,
+        "chunk_id": section.chunk_id,
+        "title": section.title,
+        "language": section.language,
+        "translation_hint": section.translation_hint,
+        "score_dense": section.score_dense,
+        "score_sparse": section.score_sparse,
+        "combined_score": section.combined_score,
+        "reasoning_hint": section.reasoning_hint,
+        "token_estimate": section.token_estimate,
+        "preview": section.preview,
+        "content": section.content,
+        "url": section.url,
+        "extra": section.extra,
+    }
+
+
+def _summarize_search_hits(hit_records: Sequence[Dict[str, Any]]) -> str:
+    """Сводит типы совпадений классического поиска в компактную строку."""
+    if not hit_records:
+        return ""
+    mapping = {
+        "title": "название",
+        "author": "автор",
+        "keywords": "ключевые слова",
+        "excerpt": "выдержка",
+        "abstract": "аннотация",
+    }
+    summary: List[str] = []
+    seen: set[str] = set()
+    for hit in hit_records:
+        hit_type = str((hit or {}).get("type") or "").lower()
+        if not hit_type:
+            continue
+        if hit_type == "tag":
+            tag_key = str((hit or {}).get("key") or "").strip()
+            label = f"тег {tag_key}" if tag_key else "тег"
+        else:
+            label = mapping.get(hit_type, hit_type)
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        summary.append(label)
+        if len(summary) >= 5:
+            break
+    return ", ".join(summary)
+
+
+def _collect_file_metadata_lines(file_obj: Optional["File"], *, max_tags: int = 3) -> List[str]:
+    """Возвращает краткое описание файла для использования в контексте LLM."""
+    if not file_obj:
+        return []
+    parts: List[str] = []
+    if getattr(file_obj, "author", None):
+        parts.append(f"Автор: {file_obj.author}")
+    if getattr(file_obj, "year", None):
+        parts.append(f"Год: {file_obj.year}")
+    if getattr(file_obj, "material_type", None):
+        parts.append(f"Тип: {file_obj.material_type}")
+    if getattr(file_obj, "keywords", None):
+        kw = str(file_obj.keywords).strip()
+        if kw:
+            parts.append(f"Ключевые слова: {kw}")
+    tag_values: List[str] = []
+    try:
+        for tag in (getattr(file_obj, "tags", None) or []):
+            key = str(getattr(tag, "key", "") or "").strip()
+            value = str(getattr(tag, "value", "") or "").strip()
+            if not key or not value:
+                continue
+            tag_values.append(f"{key}:{value}")
+    except Exception:
+        tag_values = []
+    if tag_values:
+        deduped: List[str] = []
+        seen_tags: set[str] = set()
+        for item in tag_values:
+            if item in seen_tags:
+                continue
+            seen_tags.add(item)
+            deduped.append(item)
+        if deduped:
+            parts.append(f"Теги: {', '.join(deduped[:max_tags])}")
+    return parts
+
+
+def _build_result_metadata_summary(
+    file_obj: Optional["File"],
+    result_entry: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Комбинирует метаданные файла и сведения о совпадениях классического поиска."""
+    summary = _collect_file_metadata_lines(file_obj)
+    if not result_entry:
+        return summary
+    hits_summary = _summarize_search_hits(result_entry.get("hits") or [])
+    if hits_summary:
+        summary.append(f"Совпадения: {hits_summary}")
+    matched_terms = result_entry.get("matched_terms") or []
+    if matched_terms:
+        terms_preview = ", ".join(str(term) for term in matched_terms[:5])
+        if terms_preview:
+            summary.append(f"Термины: {terms_preview}")
+    sources = result_entry.get("snippet_sources") or []
+    if sources:
+        summary.append(f"Источники сниппетов: {', '.join(sources[:3])}")
+    return summary
+
+
+def _compose_snippet_based_answer(
+    query: str,
+    entries: Sequence[Dict[str, Any]],
+    *,
+    primary_terms: Sequence[str] | None = None,
+    anchor_terms: Sequence[str] | None = None,
+    term_idf: Optional[Mapping[str, float]] = None,
+    max_items: int = 5,
+    snippet_limit: int = 360,
+) -> tuple[str, int, List[Dict[str, Any]]]:
+    """Формирует безопасный ответ по сниппетам без генерации LLM."""
+    noise_terms = {
+        "кто",
+        "что",
+        "какой",
+        "какая",
+        "какие",
+        "каков",
+        "какова",
+        "каково",
+        "такой",
+        "такая",
+        "такие",
+        "такое",
+        "является",
+        "являлся",
+        "являлась",
+        "являются",
+        "есть",
+        "это",
+        "может",
+        "нужно",
+        "надо",
+        "биография",
+        "биографии",
+    }
+    usable_terms_raw = [
+        term.lower()
+        for term in (primary_terms or [])
+        if term and len(term) >= 3 and term.lower() not in noise_terms
+    ]
+    usable_terms: List[str] = []
+    if term_idf:
+        for term in usable_terms_raw:
+            if term_idf.get(term, 1.0) >= KEYWORD_IDF_MIN:
+                usable_terms.append(term)
+    else:
+        usable_terms = usable_terms_raw[:]
+    if not usable_terms:
+        usable_terms = [term for term in usable_terms_raw if len(term) >= 5]
+    anchor_terms_lower = [term.lower() for term in (anchor_terms or []) if term]
+    def _anchor_in_text(lower_text: str) -> bool:
+        if not anchor_terms_lower:
+            return True
+        for anchor in anchor_terms_lower:
+            if anchor and anchor in lower_text:
+                return True
+            if len(anchor) >= 5:
+                stem = anchor[:-2]
+                if stem and stem in lower_text:
+                    return True
+            if len(anchor) >= 6:
+                stem = anchor[:-3]
+                if stem and stem in lower_text:
+                    return True
+        return False
+    facts: List[str] = []
+    sources: List[str] = []
+    used_count = 0
+    seen_snippets: set[str] = set()
+    context_items: List[Dict[str, Any]] = []
+    for idx, res in enumerate(entries, start=1):
+        snippet_candidates: List[str] = []
+        snippet_candidates.extend(res.get("snippets") or [])
+        selected_snippets: List[str] = []
+        for candidate in snippet_candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            normalized = re.sub(r"\s+", " ", text)
+            if not normalized:
+                continue
+            lower = normalized.lower()
+            if usable_terms and not any(term in lower for term in usable_terms):
+                continue
+            if not _anchor_in_text(lower):
+                continue
+            if lower in seen_snippets:
+                continue
+            seen_snippets.add(lower)
+            trimmed = normalized[:max(snippet_limit, 360)].rstrip()
+            selected_snippets.append(trimmed)
+            if len(selected_snippets) >= 3:
+                break
+        if not selected_snippets:
+            if not anchor_terms_lower and snippet_candidates:
+                fallback_candidate = re.sub(r"\s+", " ", str(snippet_candidates[0] or "")).strip()
+                if fallback_candidate:
+                    selected_snippets.append(fallback_candidate[:max(snippet_limit, 360)].rstrip())
+            else:
+                continue
+        if not selected_snippets:
+            continue
+        primary_snippet = selected_snippets[0][:snippet_limit].rstrip(". ")
+        order = len(context_items) + 1
+        facts.append(f"- {primary_snippet} [{order}]")
+        title = (res.get("title") or res.get("rel_path") or f"file-{res.get('file_id')}") or ""
+        title = str(title).strip()
+        sources.append(f"- [{order}] {title}")
+        used_count += 1
+        context_items.append(
+            {
+                "order": order,
+                "snippet": primary_snippet,
+                "snippets": selected_snippets,
+                "title": title,
+                "file_id": int(res.get("file_id") or 0),
+                "meta": res,
+            }
+        )
+        if used_count >= max_items:
+            break
+    if not facts:
+        return "", 0, []
+    lines = ["Факты:", *facts, "Источники:", *sources]
+    return "\n".join(lines), used_count, context_items
+
+
+_SNIPPET_REF_RE = re.compile(r"\[(\d+)\]")
+
+
+def _validate_snippet_llm_answer(answer: str, allowed_ids: Sequence[int]) -> Tuple[bool, List[str]]:
+    text = (answer or "").strip()
+    issues: List[str] = []
+    if not text:
+        issues.append("пустой ответ")
+        return False, issues
+    cited = sorted({int(match.group(1)) for match in _SNIPPET_REF_RE.finditer(text)})
+    if not cited:
+        issues.append("нет ссылок [n]")
+    allowed_set = set(int(x) for x in allowed_ids)
+    invalid = [cid for cid in cited if cid not in allowed_set]
+    if invalid:
+        issues.append(f"неизвестные ссылки {invalid}")
+    return (not issues), issues
+
+
+def _generate_snippet_llm_summary(
+    query: str,
+    context_items: Sequence[Dict[str, Any]],
+    *,
+    progress: Optional["_ProgressLogger"] = None,
+    temperature: float = 0.1,
+    max_tokens: int = 320,
+) -> str:
+    if not context_items:
+        return ""
+    allowed_ids = [item["order"] for item in context_items]
+    context_lines: List[str] = []
+    for item in context_items:
+        title = item.get("title") or f"Источник {item.get('order')}"
+        snippets = item.get("snippets") or [item.get("snippet") or ""]
+        file_id = item.get("file_id")
+        meta = item.get("meta") or {}
+        hits = ", ".join(
+            sorted({hit.get("term") for hit in (meta.get("hits") or []) if hit.get("term")})
+        )
+        header = f"[{item['order']}] Источник: {title}"
+        if file_id:
+            header += f" (file_id={file_id})"
+        if hits:
+            header += f" | ключи: {hits}"
+        body_lines = []
+        for snip in snippets:
+            text = str(snip or "").strip()
+            if not text:
+                continue
+            body_lines.append(f"- {text}")
+        if not body_lines:
+            body_lines.append("- (фрагмент отсутствует)")
+        block = "\n".join([header] + body_lines)
+        context_lines.append(block)
+    system = (
+        "Ты отвечаешь на вопросы поиска. Используй ТОЛЬКО предоставленные сниппеты, "
+        "каждый помечен номером в квадратных скобках. Любой факт должен ссылаться на соответствующий номер. "
+        "Если фрагменты содержат факты — перечисли их. Фразу «Недостаточно информации» используй "
+        "только если ни один сниппет не даёт полезных сведений. Не придумывай новых фактов."
+    )
+    user = (
+        f"Вопрос: {query}\n"
+        "Доступные фрагменты:\n"
+        + "\n".join(context_lines)
+        + "\n\n"
+        "Сформулируй краткий ответ на русском языке. Каждый факт сопровождай ссылкой [n]. "
+        "Если информации недостаточно, ответь: 'Недостаточно информации в найденных источниках.'"
+    )
+    try:
+        answer = call_lmstudio_compose(system, user, temperature=temperature, max_tokens=max_tokens) or ""
+    except Exception:
+        return ""
+    answer = answer.strip()
+    if not answer:
+        return ""
+    answer, translated = _ensure_russian_text(answer, label='snippet-answer')
+    valid, issues = _validate_snippet_llm_answer(answer, allowed_ids)
+    if not valid:
+        if progress:
+            progress.add(f"LLM ответ по сниппетам отклонён: {', '.join(issues)}")
+        return ""
+    if progress:
+        note = "LLM ответ по сниппетам готов"
+        if translated:
+            note += ", выполнен перевод"
+        progress.add(note)
+    return answer
+
+
+def _prepare_rag_context(
+    query: str,
+    results: Sequence[Dict[str, Any]],
+    *,
+    language_filters: Optional[Sequence[str]],
+    max_chunks: int,
+    progress: Optional["_ProgressLogger"] = None,
+) -> tuple[Optional[Dict[str, Any]], list[str]]:
+    notes: list[str] = []
+    file_ids = [int(res.get('file_id')) for res in results if res.get('file_id')]
+    if not file_ids:
+        reason = "RAG: нет файлов с идентификаторами"
+        if progress:
+            progress.add(reason)
+        notes.append(reason)
+        return None, notes
+    result_lookup: Dict[int, Dict[str, Any]] = {
+        int(res.get("file_id")): res
+        for res in results
+        if res.get("file_id")
+    }
+    documents = (
+        db.session.query(RagDocument)
+        .filter(RagDocument.file_id.in_(file_ids), RagDocument.is_ready_for_rag == True)
+        .all()
+    )
+    doc_map = {doc.id: doc for doc in documents}
+    doc_ids = list(doc_map.keys())
+    if not doc_ids:
+        if progress:
+            progress.add("RAG: нет документов, готовых для RAG-индекса")
+        notes.append("Нет документов, подготовленных для RAG-индексации.")
+        return None, notes
+    variant = _select_rag_embedding_variant(doc_ids)
+    if not variant:
+        if progress:
+            progress.add("RAG: эмбеддинги для документов не найдены")
+        notes.append("Не найдены эмбеддинги для документов, используем fallback.")
+        return None, notes
+    model_name, model_version, dim = variant
+    backend_choice = 'auto'
+    version_token = (model_version or '').strip().lower()
+    if 'lm-studio' in version_token or version_token in {'lmstudio', 'lm_studio'}:
+        backend_choice = 'lm-studio'
+    elif version_token in {'openai', 'openai-api'}:
+        backend_choice = 'openai'
+    try:
+        backend = load_embedding_backend(
+            backend_choice,
+            model_name=model_name,
+            dim=dim or 384,
+        )
+    except Exception as exc:
+        if progress:
+            progress.add(f"RAG: не удалось загрузить backend '{model_name}', fallback hash ({exc})")
+        notes.append(f"Backend {model_name} недоступен ({exc}); используем hash fallback.")
+        try:
+            backend = load_embedding_backend(
+                'hash',
+                model_name=model_name,
+                dim=dim or 384,
+            )
+        except Exception:
+            backend = None
+    if backend is None:
+        if progress:
+            progress.add("RAG: не удалось инициализировать backend эмбеддингов")
+        notes.append("Не удалось инициализировать backend эмбеддингов.")
+        return None, notes
+    backend_name_label = ""
+    try:
+        vectors = backend.embed_many([query]) or []
+        if vectors:
+            query_vector = vectors[0]
+        else:
+            query_vector = [0.0] * (dim or 384)
+        backend_name_label = getattr(backend, "name", getattr(backend, "model_name", "embedding-backend"))
+    except Exception as exc:
+        if progress:
+            progress.add(f"RAG: не удалось вычислить эмбеддинг запроса ({exc})")
+        notes.append(f"Не удалось вычислить эмбеддинг запроса ({exc}).")
+        query_vector = [0.0] * (dim or 384)
+    finally:
+        try:
+            backend.close()
+        except Exception:
+            pass
+    if backend_name_label:
+        notes.append(f"Эмбеддинги: backend {backend_name_label}")
+    language_filters = [lang.lower() for lang in (language_filters or [])] or None
+    vector_retriever = VectorRetriever(
+        model_name=model_name,
+        model_version=model_version,
+        max_candidates=min(500, max_chunks * 40),
+    )
+    keyword_retriever = KeywordRetriever(
+        limit=300,
+        search_service=search_service,
+        expand_terms_fn=_expand_synonyms,
+        lemma_fn=_lemma,
+    )
+    rag_reranker = _get_rag_reranker()
+    selector = ContextSelector(
+        vector_retriever=vector_retriever,
+        keyword_retriever=keyword_retriever,
+        dense_weight=1.0,
+        sparse_weight=0.6,
+        doc_penalty=0.2,
+        max_per_document=2,
+        dense_top_k=max_chunks * 3,
+        sparse_limit=300,
+        max_total_tokens=_lm_safe_context_tokens(),
+        rerank_fn=rag_reranker,
+    )
+    contexts = selector.select(
+        query,
+        query_vector,
+        top_k=max_chunks,
+        languages=language_filters,
+        allowed_document_ids=doc_ids,
+    )
+    if rag_reranker:
+        cfg = getattr(rag_reranker, "_config", None)
+        if cfg and getattr(cfg, "model_name", None):
+            notes.append(f"RAG rerank: cross-encoder {cfg.model_name}")
+        else:
+            notes.append("RAG rerank: cross-encoder активен")
+    if not contexts:
+        if progress:
+            progress.add("RAG: контекст не подобран")
+        notes.append("Контекст RAG не подобран; используется классический режим.")
+        return None, notes
+    query_lang = detect_language(query)
+    sections: List[ContextSection] = []
+    allowed_refs: set[Tuple[int, int]] = set()
+    chunk_ids: List[int] = []
+    for idx, cand in enumerate(contexts, start=1):
+        doc = cand.document or doc_map.get(cand.chunk.document_id)
+        if doc is None:
+            continue
+        file_obj = getattr(doc, "file", None)
+        title = (getattr(file_obj, "title", None) or getattr(file_obj, "filename", None) or getattr(file_obj, "rel_path", None) or f"Документ {doc.id}").strip()
+        section_lang = cand.chunk.lang_primary or doc.lang_primary or ""
+        translation_hint = _build_translation_hint(query_lang, section_lang)
+        res_entry = None
+        if file_obj is not None:
+            res_entry = result_lookup.get(getattr(file_obj, "id", 0))
+        preview_text = cand.preview or ""
+        if not preview_text and res_entry:
+            snippets = list(res_entry.get("snippets") or [])
+            if res_entry.get("llm_snippet"):
+                snippets.append(res_entry["llm_snippet"])
+            if snippets:
+                snippet_text = str(snippets[0]).strip()
+                if snippet_text:
+                    preview_text = snippet_text[:200]
+        extra_fields: Dict[str, Any] = {
+            "section_path": cand.chunk.section_path or "",
+            "keywords": cand.chunk.keywords_top or "",
+        }
+        if file_obj is not None:
+            if getattr(file_obj, "author", None):
+                extra_fields["Автор"] = file_obj.author
+            if getattr(file_obj, "year", None):
+                extra_fields["Год"] = file_obj.year
+            if getattr(file_obj, "material_type", None):
+                extra_fields["Тип материала"] = file_obj.material_type
+            if getattr(file_obj, "keywords", None):
+                extra_fields["Ключевые слова файла"] = file_obj.keywords
+            tag_lines = _collect_file_metadata_lines(file_obj)
+            tag_strings = [line for line in tag_lines if line.startswith("Теги: ")]
+            if tag_strings:
+                extra_fields["Теги"] = tag_strings[0].replace("Теги: ", "", 1)
+        if cand.matched_terms:
+            extra_fields["Совпавшие термины"] = ", ".join(cand.matched_terms[:5])
+        if res_entry:
+            hits_summary = _summarize_search_hits(res_entry.get("hits") or [])
+            if hits_summary:
+                extra_fields["Совпадения поиска"] = hits_summary
+            matched_terms = res_entry.get("matched_terms") or []
+            if matched_terms:
+                extra_fields.setdefault(
+                    "Термины поиска",
+                    ", ".join(str(term) for term in matched_terms[:5]),
+                )
+            snippet_sources = res_entry.get("snippet_sources") or []
+            if snippet_sources:
+                extra_fields["Источники сниппетов"] = ", ".join(snippet_sources[:3])
+        llm_snippet = res_entry.get("llm_snippet") if res_entry else None
+        section = ContextSection(
+            doc_id=doc.id,
+            chunk_id=cand.chunk.id,
+            title=title,
+            language=section_lang,
+            token_estimate=cand.token_estimate,
+            score_dense=cand.dense_score,
+            score_sparse=cand.sparse_score,
+            combined_score=cand.combined_score,
+            reasoning_hint=cand.reasoning_hint,
+            preview=preview_text,
+            content=cand.chunk.content or "",
+            url=getattr(file_obj, "rel_path", None),
+            extra={
+                **extra_fields,
+                **({"LLM сниппет": llm_snippet} if llm_snippet else {}),
+            },
+            translation_hint=translation_hint,
+        )
+        sections.append(section)
+        allowed_refs.add((doc.id, cand.chunk.id))
+        chunk_ids.append(cand.chunk.id)
+        if progress:
+            progress.add(
+                f"RAG контекст [{idx}/{len(contexts)}]: doc={doc.id} chunk={cand.chunk.id} combined={cand.combined_score:.3f} hint={cand.reasoning_hint or '—'}"
+            )
+    if not sections:
+        notes.append("Контекст RAG не сформирован (нет подходящих секций).")
+        return None, notes
+    return {
+        "sections": sections,
+        "allowed_refs": allowed_refs,
+        "query_lang": query_lang,
+        "chunk_ids": chunk_ids,
+        "model_name": model_name,
+        "model_version": model_version,
+        "notes": notes,
+    }, notes
+
+
+def _store_rag_session(
+    *,
+    query: str,
+    query_lang: Optional[str],
+    chunk_ids: Sequence[int],
+    system_prompt: str,
+    user_prompt: str,
+    answer: str,
+    validation: "ValidationResult",
+    model_name: Optional[str],
+    params: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    try:
+        record = RagSession(
+            query=query,
+            query_lang=(query_lang or "")[:16],
+            chunk_ids=",".join(str(cid) for cid in sorted(set(chunk_ids))),
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            answer=answer,
+            validation=json.dumps(validation.as_dict(), ensure_ascii=False),
+            model_name=model_name,
+            params=json.dumps(params or {}, ensure_ascii=False),
+        )
+        db.session.add(record)
+        db.session.commit()
+        return record.id
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.warning("Не удалось сохранить RAG-сессию: %s", exc)
+        return None
+
+
+def _estimate_section_tokens(section: ContextSection) -> int:
+    estimate = getattr(section, "token_estimate", 0) or 0
+    if estimate > 0:
+        return int(estimate)
+    text = (section.content or "").strip()
+    if not text:
+        return 120
+    words = len(text.split())
+    return max(80, int(words * 1.6) + 80)
+
+
+def _total_section_tokens(sections: Sequence[ContextSection]) -> int:
+    total = 0
+    for section in sections:
+        total += _estimate_section_tokens(section)
+    return total
+
+
+def _generate_rag_answer(
+    query: str,
+    bundle: Dict[str, Any],
+    *,
+    temperature: float,
+    max_tokens: int,
+    progress: Optional["_ProgressLogger"] = None,
+) -> Tuple[str, "ValidationResult", Optional[int], str, str]:
+    sections: List[ContextSection] = list(bundle.get("sections") or [])
+    safe_limit = _lm_safe_context_tokens()
+    trimmed_sections = sections[:]
+    trimmed = False
+    while len(trimmed_sections) > 1 and _total_section_tokens(trimmed_sections) > safe_limit:
+        trimmed_sections = trimmed_sections[:-1]
+        trimmed = True
+    if trimmed and trimmed_sections:
+        notes_list = bundle.setdefault("notes", [])
+        note = f"Контекст RAG сокращён до {len(trimmed_sections)} секций (ограничение окна модели)."
+        notes_list.append(note)
+        if progress:
+            progress.add(f"RAG: контекст сокращён до {len(trimmed_sections)} секций (ограничение окна модели)")
+        allowed_refs_trimmed = {(sec.doc_id, sec.chunk_id) for sec in trimmed_sections}
+        bundle["sections"] = trimmed_sections
+        bundle["allowed_refs"] = allowed_refs_trimmed
+        bundle["chunk_ids"] = [sec.chunk_id for sec in trimmed_sections]
+        sections = trimmed_sections
+    else:
+        sections = bundle["sections"]
+    system_prompt = build_system_prompt()
+    user_prompt = build_user_prompt(query, sections)
+    if progress:
+        progress.add(f"RAG ответ: используем {len(sections)} чанков контекста")
+    try:
+        answer = call_lmstudio_compose(
+            system_prompt,
+            user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ).strip()
+    except Exception as exc:
+        if progress:
+            progress.add(f"RAG ответ: ошибка генерации ({exc})")
+        answer = ""
+    if not answer:
+        answer = fallback_answer()
+        if progress:
+            progress.add("RAG ответ: fallback без источников")
+    validation = validate_answer(answer, sorted(bundle["allowed_refs"]))
+    if validation.hallucination_warning and progress:
+        progress.add("RAG валидация: обнаружены потенциальные проблемы с цитатами")
+    if validation.missing_citations and progress:
+        progress.add("RAG валидация: некоторые факты без ссылок")
+    if validation.unknown_citations and progress:
+        progress.add(f"RAG валидация: неизвестные ссылки {validation.unknown_citations}")
+    if validation.extra_citations and progress:
+        progress.add(f"RAG валидация: лишние ссылки {validation.extra_citations}")
+    session_id = _store_rag_session(
+        query=query,
+        query_lang=bundle.get("query_lang"),
+        chunk_ids=bundle.get("chunk_ids") or [],
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        answer=answer,
+        validation=validation,
+        model_name=bundle.get("model_name"),
+        params={
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "model_version": bundle.get("model_version"),
+            "lm_model": getattr(_rt(), "lmstudio_model", None),
+        },
+    )
+    if session_id and progress:
+        progress.add(f"RAG сессия сохранена (id={session_id})")
+    return answer, validation, session_id, system_prompt, user_prompt
 
 
 @app.cli.command("init-db")
@@ -7102,7 +8395,7 @@ def rag_ingest_file_cli(
 
 
 @app.cli.command("rag-embed-chunks")
-@click.option("--backend", type=click.Choice(["auto", "hash", "sentence-transformers"]), default="auto", show_default=True)
+@click.option("--backend", type=click.Choice(["auto", "hash", "sentence-transformers", "lm-studio", "openai"]), default="auto", show_default=True)
 @click.option("--model-name", default="intfloat/multilingual-e5-large", show_default=True, help="Название модели/конфигурации.")
 @click.option("--model-version", default=None, help="Версия модели; по умолчанию берётся из backend.")
 @click.option("--dim", type=int, default=384, show_default=True, help="Размерность эмбеддингов (для hash backend).")
@@ -7111,6 +8404,9 @@ def rag_ingest_file_cli(
 @click.option("--min-chunk-id", type=int, default=None, help="Обрабатывать чанки с id >= указанного.")
 @click.option("--normalize/--no-normalize", default=True, show_default=True, help="Нормализовать векторы (L2).")
 @click.option("--device", default=None, help="Устройство для sentence-transformers (cpu/cuda:0/... ).")
+@click.option("--endpoint", default=None, help="URL OpenAI/LM Studio embeddings API (если отличается от настроек).")
+@click.option("--api-key", default=None, help="API ключ для embeddings API (если требуется).")
+@click.option("--timeout", type=float, default=None, help="Таймаут запросов к embeddings API, секунды.")
 @click.option("--commit/--no-commit", default=True, show_default=True, help="Сохранять изменения в базе данных.")
 def rag_embed_chunks_cli(
     backend: str,
@@ -7122,9 +8418,22 @@ def rag_embed_chunks_cli(
     min_chunk_id: Optional[int],
     normalize: bool,
     device: Optional[str],
+    endpoint: Optional[str],
+    api_key: Optional[str],
+    timeout: Optional[float],
     commit: bool,
 ) -> None:
     """Генерирует эмбеддинги для чанков RAG и сохраняет их в БД."""
+    try:
+        runtime = runtime_settings_store.current
+    except Exception:
+        runtime = None
+    resolved_endpoint = endpoint or (getattr(runtime, "rag_embedding_endpoint", None) if runtime else None) or (
+        getattr(runtime, "lmstudio_api_base", None) if runtime else None
+    )
+    resolved_api_key = api_key or (getattr(runtime, "rag_embedding_api_key", None) if runtime else None) or (
+        getattr(runtime, "lmstudio_api_key", None) if runtime else None
+    )
     engine = load_embedding_backend(
         backend,
         model_name=model_name,
@@ -7132,6 +8441,9 @@ def rag_embed_chunks_cli(
         normalize=normalize,
         batch_size=batch_size,
         device=device,
+        base_url=resolved_endpoint,
+        api_key=resolved_api_key,
+        timeout=timeout,
     )
     resolved_model_name = getattr(engine, "model_name", model_name)
     resolved_model_version = model_version or getattr(engine, "model_version", "unknown")
@@ -7270,7 +8582,12 @@ def rag_search_cli(
 @click.option("--min-sparse-score", type=float, default=0.0, show_default=True)
 @click.option("--min-combined-score", type=float, default=0.0, show_default=True)
 @click.option("--max-tokens", type=int, default=3500, show_default=True, help="Ограничение по суммарным токенам контекста (0 = без ограничения).")
-@click.option("--rerank-mode", type=click.Choice(["none", "combined", "dense", "sparse"]), default="none", show_default=True, help="Дополнительный реранж, например по dense-score.")
+@click.option("--rerank-mode", type=click.Choice(["none", "combined", "dense", "sparse", "cross-encoder"]), default="none", show_default=True, help="Дополнительный реранж, например по dense-score.")
+@click.option("--rerank-model", default=None, help="Название модели для cross-encoder rerank (например cross-encoder/ms-marco-MiniLM-L-6-v2).")
+@click.option("--rerank-device", default=None, help="Устройство для cross-encoder rerank (по умолчанию как --device).")
+@click.option("--rerank-batch-size", type=int, default=16, show_default=True, help="Batch size для cross-encoder rerank.")
+@click.option("--rerank-max-length", type=int, default=512, show_default=True, help="Максимальная длина входа CrossEncoder (токены).")
+@click.option("--rerank-max-chars", type=int, default=1200, show_default=True, help="Обрезка текста чанка перед cross-encoder rerank (символы).")
 @click.option("--lang", multiple=True, help="Ограничить языки чанков (повторяемая опция).")
 def rag_context_cli(
     query: str,
@@ -7294,6 +8611,11 @@ def rag_context_cli(
     min_combined_score: float,
     max_tokens: int,
     rerank_mode: str,
+    rerank_model: Optional[str],
+    rerank_device: Optional[str],
+    rerank_batch_size: int,
+    rerank_max_length: int,
+    rerank_max_chars: int,
     lang: Sequence[str],
 ) -> None:
     """Формирует комбинированный контекст (dense + keyword) для запроса."""
@@ -7323,7 +8645,12 @@ def rag_context_cli(
         model_version=resolved_model_version,
         max_candidates=max_candidates,
     )
-    keyword_retriever = KeywordRetriever(limit=sparse_limit)
+    keyword_retriever = KeywordRetriever(
+        limit=sparse_limit,
+        search_service=search_service,
+        expand_terms_fn=_expand_synonyms,
+        lemma_fn=_lemma,
+    )
     mode = (rerank_mode or "none").lower()
 
     def _make_rerank(mode_name: str):
@@ -7335,7 +8662,32 @@ def rag_context_cli(
             return lambda _q, items: sorted(items, key=lambda c: c.combined_score, reverse=True)
         return None
 
-    rerank_fn = _make_rerank(mode)
+    rerank_fn = None
+    rerank_instance = None
+    if mode == "cross-encoder":
+        if not rerank_model:
+            click.echo("Для cross-encoder режима требуется указать --rerank-model.")
+            return
+        try:
+            from agregator.rag.rerank import CrossEncoderConfig, load_reranker
+
+            rerank_instance = load_reranker(
+                "cross-encoder",
+                config=CrossEncoderConfig(
+                    model_name=rerank_model,
+                    device=rerank_device or device,
+                    batch_size=rerank_batch_size,
+                    max_length=rerank_max_length,
+                    truncate_chars=rerank_max_chars,
+                ),
+            )
+            rerank_fn = rerank_instance
+        except Exception as exc:
+            click.echo(f"Не удалось инициализировать cross-encoder rerank: {exc}")
+            return
+    else:
+        rerank_fn = _make_rerank(mode)
+
     selector = ContextSelector(
         vector_retriever=vector_retriever,
         keyword_retriever=keyword_retriever,
@@ -7358,6 +8710,11 @@ def rag_context_cli(
         languages=languages,
         max_total_tokens=max_tokens if max_tokens > 0 else None,
     )
+    if rerank_instance:
+        try:
+            rerank_instance.close()
+        except Exception:
+            pass
     if not contexts:
         click.echo("Контекст не подобран.")
         return
@@ -7426,12 +8783,20 @@ def rag_generate_cli(
             except Exception:
                 extra_meta = {}
         section_lang = (chunk.lang_primary or document.lang_primary or "").lower()
+        raw_token_estimate = extra_meta.get("token_estimate")
+        if raw_token_estimate is None:
+            raw_token_estimate = chunk.token_count
+        try:
+            token_estimate = int(raw_token_estimate or 0)
+        except (TypeError, ValueError):
+            token_estimate = 0
         sections.append(
             ContextSection(
                 doc_id=document.id,
                 chunk_id=chunk.id,
                 title=file_obj.title or file_obj.filename or f"Документ {file_obj.id}",
                 language=section_lang,
+                token_estimate=token_estimate,
                 score_dense=float(extra_meta.get("dense_score") or 0.0),
                 score_sparse=float(extra_meta.get("sparse_score") or 0.0),
                 combined_score=float(extra_meta.get("combined_score") or 0.0),
@@ -8061,6 +9426,136 @@ def api_collection_clear(collection_id: int):
     if errors:
         app.logger.warning(f"[collections] clear reported {len(errors)} issues for collection {collection_id}: {errors[:3]}")
     return jsonify({'ok': True, 'removed_files': removed_files, 'errors': errors})
+
+
+@app.route('/api/collections/<int:collection_id>/rag/reindex', methods=['POST'])
+@require_admin
+def api_collection_rag_reindex(collection_id: int):
+    col = Collection.query.get_or_404(collection_id)
+    try:
+        file_count = db.session.query(func.count(File.id)).filter(File.collection_id == collection_id).scalar() or 0
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Не удалось подсчитать файлы: {exc}'}), 500
+    if file_count == 0:
+        return jsonify({'ok': False, 'error': 'В коллекции нет файлов для RAG', 'error_code': 'collection_empty'}), 400
+
+    data = request.get_json(silent=True) or {}
+    runtime = runtime_settings_store.current
+    default_backend = (runtime.rag_embedding_backend or 'lm-studio').strip().lower() or 'lm-studio'
+    default_model = runtime.rag_embedding_model or 'nomic-ai/nomic-embed-text-v1.5-GGUF'
+    default_dim = max(8, int(runtime.rag_embedding_dim or 768))
+    default_batch = max(1, int(runtime.rag_embedding_batch_size or 32))
+    default_device = runtime.rag_embedding_device
+    default_endpoint = runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ''
+    default_api_key = runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ''
+
+    def _int_opt(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _bool_opt(value: object, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    chunk_max_tokens = max(16, _int_opt(data.get('max_tokens') or data.get('chunk_max_tokens'), 700))
+    chunk_overlap = max(0, _int_opt(data.get('overlap') or data.get('chunk_overlap'), 120))
+    chunk_min_tokens = max(1, _int_opt(data.get('min_tokens') or data.get('chunk_min_tokens'), 80))
+    limit_chars = max(1000, _int_opt(data.get('limit_chars'), 120_000))
+    skip_if_unchanged = _bool_opt(data.get('skip_if_unchanged'), True)
+    normalizer_version = str(data.get('normalizer_version') or 'v1').strip() or 'v1'
+
+    embedding_backend_raw = data.get('embedding_backend') or data.get('backend') or default_backend
+    embedding_backend = str(embedding_backend_raw).strip().lower() or default_backend
+    embedding_model_name = str(data.get('embedding_model_name') or data.get('model_name') or default_model).strip() or default_model
+    embedding_dim = max(8, _int_opt(data.get('embedding_dim'), default_dim))
+    embedding_batch_size = max(1, _int_opt(data.get('embedding_batch_size') or data.get('batch_size'), default_batch))
+    embedding_normalize = _bool_opt(data.get('embedding_normalize'), True)
+    device_value = data.get('embedding_device') or data.get('device')
+    embedding_device = None
+    if isinstance(device_value, str):
+        trimmed = device_value.strip()
+        embedding_device = trimmed or None
+    if embedding_device is None and default_device:
+        embedding_device = default_device
+    endpoint_value = data.get('embedding_endpoint') or data.get('endpoint')
+    if endpoint_value is None:
+        endpoint_value = default_endpoint
+    embedding_endpoint = str(endpoint_value or "").strip()
+    api_key_raw = data.get('embedding_api_key') or data.get('api_key')
+    if api_key_raw is None:
+        api_key_raw = default_api_key
+    embedding_api_key = str(api_key_raw or "")
+
+    user = _load_current_user()
+
+    options = {
+        "chunk_max_tokens": chunk_max_tokens,
+        "chunk_overlap": chunk_overlap,
+        "chunk_min_tokens": chunk_min_tokens,
+        "limit_chars": limit_chars,
+        "skip_if_unchanged": skip_if_unchanged,
+        "normalizer_version": normalizer_version,
+        "embedding_backend": embedding_backend,
+        "embedding_model_name": embedding_model_name,
+        "embedding_dim": embedding_dim,
+        "embedding_batch_size": embedding_batch_size,
+        "embedding_normalize": embedding_normalize,
+        "embedding_device": embedding_device,
+        "embedding_endpoint": embedding_endpoint,
+        "embedding_api_key": embedding_api_key,
+        "user_id": getattr(user, 'id', None),
+    }
+
+    payload = {
+        "collection_id": collection_id,
+        "collection_name": col.name,
+        "total_files": int(file_count),
+        "status": "queued",
+        "options": {
+            "chunk_max_tokens": chunk_max_tokens,
+            "chunk_overlap": chunk_overlap,
+            "chunk_min_tokens": chunk_min_tokens,
+            "limit_chars": limit_chars,
+            "skip_if_unchanged": skip_if_unchanged,
+            "embedding_backend": embedding_backend,
+            "embedding_model": embedding_model_name,
+            "embedding_endpoint": embedding_endpoint,
+        },
+    }
+
+    task = TaskRecord(
+        name='rag_collection',
+        status='queued',
+        payload=json.dumps(payload, ensure_ascii=False),
+        progress=0.0,
+    )
+    try:
+        db.session.add(task)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'ok': False, 'error': f'Не удалось создать задачу: {exc}'}), 500
+
+    try:
+        detail = json.dumps({"task_id": task.id, "files": int(file_count)}, ensure_ascii=False)
+        _log_user_action(user, 'collection_rag_reindex_enqueued', 'collection', collection_id, detail=detail)
+    except Exception:
+        pass
+
+    @copy_current_app_context
+    def _runner():
+        _run_rag_collection_job(task.id, collection_id, options)
+
+    get_task_queue().submit(_runner, description=f"rag-collection-{collection_id}")
+
+    return jsonify({'ok': True, 'task_id': task.id, 'files': int(file_count)})
 
 
 def _delete_collection_files(col_id: int, remove_fs: bool = True) -> tuple[int, list[str]]:
@@ -9153,6 +10648,99 @@ def _ai_expand_keywords(
     return res, lang_details
 
 
+def _plan_search_keywords(
+    query: str,
+    *,
+    base_terms: Sequence[str] | None = None,
+    ai_terms: Sequence[str] | None = None,
+    ttl_minutes: int = 15,
+) -> Dict[str, List[str]]:
+    """Запрашивает у LLM структурированный набор термов для классического поиска."""
+    q = (query or "").strip()
+    if not q:
+        return {"must": [], "phrases": [], "broad": []}
+    plan_key = _sha256(f"kw-plan::{q.lower()}")
+    now = _now()
+    cached = AI_KEYWORD_PLAN_CACHE.get(plan_key)
+    if cached and (now - cached[0]) < ttl_minutes * 60:
+        return cached[1]
+
+    base_preview = ", ".join(sorted({t.lower() for t in (base_terms or []) if t})[:8])
+    ai_preview = ", ".join(sorted({t.lower() for t in (ai_terms or []) if t})[:8])
+    system = (
+        "Ты помощник поиска. Получив вопрос, ты возвращаешь JSON с ключами 'must', "
+        "'phrases', 'broad'. Не добавляй комментариев. Каждое значение — список строк. "
+        "'must' — обязательные термины (точные фамилии, ключевые слова), чистые токены без пунктуации. "
+        "'phrases' — короткие фразы (2-4 слова), пригодные для полнотекстового поиска. "
+        "'broad' — синонимы и расширения, включая перевод на другой язык. "
+        "Если нечего добавить в категорию — верни пустой список."
+    )
+    user = (
+        f"Запрос: {q}\n"
+        f"Базовые токены: [{base_preview}]\n"
+        f"AI-термины: [{ai_preview}]\n"
+        "Ответь строго JSON-объектом, например "
+        "{\"must\": [\"термин\"], \"phrases\": [\"фраза\"], \"broad\": [\"синоним\"]}."
+    )
+    raw_response = ""
+    try:
+        raw_response = (call_lmstudio_compose(system, user, temperature=0.0, max_tokens=200) or "").strip()
+    except Exception:
+        raw_response = ""
+    data: Dict[str, List[str]] = {"must": [], "phrases": [], "broad": []}
+    parsed: Optional[Dict[str, object]] = None
+    if raw_response:
+        try:
+            parsed = json.loads(raw_response)
+        except Exception:
+            match = re.search(r"\{.*\}", raw_response, flags=re.S)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except Exception:
+                    parsed = None
+    if isinstance(parsed, dict):
+        def _coerce_list(value: object) -> List[str]:
+            if isinstance(value, list):
+                return [str(item) for item in value if str(item).strip()]
+            if isinstance(value, str):
+                return [value]
+            return []
+
+        for key in ("must", "phrases", "broad"):
+            items = _coerce_list(parsed.get(key))
+            normalized: List[str] = []
+            for item in items:
+                norm = _normalize_keyword_candidate(item)
+                if not norm:
+                    continue
+                if key == "phrases" and " " not in norm:
+                    # фразовые термины должны содержать пробел
+                    continue
+                normalized.append(norm)
+            data[key] = normalized
+    if not data["must"]:
+        data["must"] = [
+            _normalize_keyword_candidate(tok)
+            for tok in (base_terms or [])
+            if _normalize_keyword_candidate(tok)
+        ][:4]
+    if not data["phrases"]:
+        data["phrases"] = [
+            _normalize_keyword_candidate(term)
+            for term in (ai_terms or [])
+            if term and " " in term and _normalize_keyword_candidate(term)
+        ][:4]
+    if not data["broad"]:
+        data["broad"] = [
+            _normalize_keyword_candidate(term)
+            for term in (ai_terms or [])
+            if term and _normalize_keyword_candidate(term)
+        ][:6]
+    AI_KEYWORD_PLAN_CACHE[plan_key] = (now, data)
+    return data
+
+
 def _read_cached_excerpt_for_file(f: File) -> str:
     try:
         # Предпочитаем фрагмент из базы данных
@@ -9166,6 +10754,9 @@ def _read_cached_excerpt_for_file(f: File) -> str:
     except Exception:
         pass
     return ''
+
+
+SNIPPET_WINDOW_RADIUS = 220
 
 
 def _collect_snippets(text: str, terms: list[str], max_snips: int = 2) -> list[str]:
@@ -9187,8 +10778,8 @@ def _collect_snippets(text: str, terms: list[str], max_snips: int = 2) -> list[s
             if idx < 0:
                 break
             found_any = True
-            start = max(0, idx - 80)
-            end = min(len(t), idx + len(term) + 80)
+            start = max(0, idx - SNIPPET_WINDOW_RADIUS)
+            end = min(len(t), idx + len(term) + SNIPPET_WINDOW_RADIUS)
             windows.append((start, end))
             pos = idx + len(term)
         if not found_any and len(ql) >= 3:
@@ -9198,14 +10789,14 @@ def _collect_snippets(text: str, terms: list[str], max_snips: int = 2) -> list[s
                     continue
                 idx = tl.find(part)
                 if idx >= 0:
-                    start = max(0, idx - 80)
-                    end = min(len(t), idx + len(part) + 80)
+                    start = max(0, idx - SNIPPET_WINDOW_RADIUS)
+                    end = min(len(t), idx + len(part) + SNIPPET_WINDOW_RADIUS)
                     windows.append((start, end))
     # объединяем перекрывающиеся окна
     windows.sort()
     merged = []
     for w in windows:
-        if not merged or w[0] > merged[-1][1] + 20:
+        if not merged or w[0] > merged[-1][1] + 40:
             merged.append(list(w))
         else:
             merged[-1][1] = max(merged[-1][1], w[1])
@@ -9539,6 +11130,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     t_total_start = time.monotonic()
     stage_start = t_total_start
     durations: dict[str, float] = {}
+    file_lookup: Dict[int, File] = {}
     try:
         max_candidates = int(data.get('max_candidates') or 15)
     except Exception:
@@ -9578,7 +11170,14 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         requested_languages = dedup_langs
     else:
         requested_languages = []
+    rag_enabled = data.get('use_rag')
+    if rag_enabled is None:
+        rag_enabled = False
+    else:
+        rag_enabled = bool(rag_enabled)
     progress = _ProgressLogger(progress_cb)
+    if not rag_enabled:
+        progress.add("RAG: режим отключён настройками запроса")
     query_hash = _query_fingerprint(query, data)
     mandatory_terms = _extract_quoted_phrases(query)
     mandatory_set = set(mandatory_terms)
@@ -9645,22 +11244,49 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     # Расширяем и токенизируем
     keywords, lang_details = _ai_expand_keywords(query, multi_lang=all_languages, target_langs=requested_languages)
     base_tokens = _tokenize_query(query)
+    keyword_plan = _plan_search_keywords(
+        query,
+        base_terms=base_tokens,
+        ai_terms=keywords,
+    )
     extra_tokens: list[str] = []
     ai_phrase_terms: list[str] = []
     if lang_details:
         preview_langs = ', '.join(f"{code}(+{count})" for code, count in lang_details if count > 0)
         if preview_langs:
             progress.add(f"Доп. языки: {preview_langs}")
+    plan_must = [
+        term for term in keyword_plan.get("must", [])
+        if term and term not in mandatory_set
+    ]
+    plan_phrases = [
+        term for term in keyword_plan.get("phrases", []) if term
+    ]
+    plan_broad = [
+        term for term in keyword_plan.get("broad", []) if term
+    ]
+    plan_must_set = {term for term in plan_must}
+    for term in plan_phrases:
+        if term not in ai_phrase_terms and term not in mandatory_set:
+            ai_phrase_terms.append(term)
+    for term in plan_broad:
+        extra_tokens.extend(_tokenize_query(term))
     for w in keywords:
         normalized_kw = _normalize_keyword_candidate(w)
         if normalized_kw:
             if ' ' in normalized_kw and normalized_kw not in mandatory_set:
                 ai_phrase_terms.append(normalized_kw)
         extra_tokens.extend(_tokenize_query(w))
+    if plan_must:
+        progress.add("LLM ключи (строгие): " + ", ".join(plan_must[:6]) + ("…" if len(plan_must) > 6 else ""))
+    if plan_phrases:
+        progress.add("LLM фразы: " + ", ".join(plan_phrases[:6]) + ("…" if len(plan_phrases) > 6 else ""))
+    if plan_broad:
+        progress.add("LLM расширения: " + ", ".join(plan_broad[:6]) + ("…" if len(plan_broad) > 6 else ""))
     # уникальные термины (токены) с сохранением порядка, отдаём приоритет обязательным и LLM-фразам
     seen = set()
     terms: list[str] = []
-    ordered_candidates = mandatory_terms + ai_phrase_terms + base_tokens + extra_tokens
+    ordered_candidates = mandatory_terms + plan_must + ai_phrase_terms + base_tokens + extra_tokens + plan_broad
     for w in ordered_candidates:
         if not w:
             continue
@@ -9686,7 +11312,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     filtered_terms: list[str] = []
     removed_low_idf: list[str] = []
     for w in terms:
-        if w in mandatory_set:
+        if w in mandatory_set or w in plan_must_set:
             filtered_terms.append(w)
             continue
         if idf.get(w, 1.0) >= KEYWORD_IDF_MIN:
@@ -9744,16 +11370,84 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
             if term:
                 s.add(term)
 
+    # Дополнительные кандидаты через FTS по ключевым терминам (учёт вопросительных слов)
+    fts_candidates: List[int] = []
+    fts_seed_terms = sorted(terms, key=lambda t: idf.get(t, 0.0), reverse=True)
+    if not fts_seed_terms:
+        backup_tokens = _tokenize_query(query)
+        if backup_tokens:
+            fts_seed_terms = sorted(
+                backup_tokens,
+                key=lambda t: idf.get(t, 0.0),
+                reverse=True,
+            )
+    fts_seed_terms = [t for t in fts_seed_terms if len(t) >= 3][:5]
+    fts_seed_query = " ".join(fts_seed_terms) if fts_seed_terms else query.strip()
+    if fts_seed_query:
+        try:
+            fts_candidates = search_service.candidate_ids(fts_seed_query, limit=max(200, max_candidates * 10)) or []
+        except Exception:
+            fts_candidates = []
+    if fts_candidates:
+        base_term = fts_seed_terms[0] if fts_seed_terms else None
+        if base_term:
+            progress.add(f"FTS кандидаты: {len(fts_candidates)} (ядро: {base_term})")
+        else:
+            progress.add(f"FTS кандидаты: {len(fts_candidates)}")
+        fts_cap = min(len(fts_candidates), max_candidates * 10)
+        for fid in fts_candidates[:fts_cap]:
+            if base_term:
+                add_score(
+                    fid,
+                    AI_SCORE_FTS * idf.get(base_term, 1.0),
+                    {"type": "fts", "term": base_term},
+                    term=base_term,
+                )
+            else:
+                add_score(
+                    fid,
+                    AI_SCORE_FTS,
+                    {"type": "fts"},
+                )
+    else:
+        progress.add("FTS кандидаты: не обнаружены")
+
+    raw_query_clean = query.strip()
+    raw_fts_candidates: List[int] = []
+    if raw_query_clean:
+        try:
+            raw_fts_candidates = search_service.candidate_ids(raw_query_clean, limit=max(200, max_candidates * 10)) or []
+        except Exception:
+            raw_fts_candidates = []
+    if raw_fts_candidates:
+        primary_term = next((tok for tok in base_tokens if len(tok) >= 3), None)
+        if not primary_term and terms:
+            primary_term = next((tok for tok in terms if len(tok) >= 3), None)
+        label_term = primary_term or raw_query_clean.lower()
+        progress.add(f"FTS оригинальный запрос: {len(raw_fts_candidates)} кандидатов")
+        fts_raw_cap = min(len(raw_fts_candidates), max_candidates * 10)
+        for fid in raw_fts_candidates[:fts_raw_cap]:
+            add_score(
+                fid,
+                AI_SCORE_FTS_RAW * (idf.get(label_term, 1.0) if isinstance(label_term, str) else 1.0),
+                {"type": "fts_raw", "term": label_term},
+                term=str(label_term) if isinstance(label_term, str) else None,
+            )
+    else:
+        progress.add("FTS оригинальный запрос: не обнаружены")
+
     # Совпадения по тегам
     if use_tags:
         for w in terms:
             like = f"%{w}%"
             try:
-                q = db.session.query(Tag.file_id, Tag.key, Tag.value) \
-                    .join(File, Tag.file_id == File.id) \
-                    .join(Collection, File.collection_id == Collection.id) \
-                    .filter(Collection.searchable == True) \
+                q = (
+                    db.session.query(Tag.file_id, Tag.key, Tag.value)
+                    .join(File, Tag.file_id == File.id)
+                    .outerjoin(Collection, File.collection_id == Collection.id)
+                    .filter(or_(Collection.searchable == True, Collection.id.is_(None)))
                     .filter(or_(Tag.value.ilike(like), Tag.key.ilike(like)))
+                )
                 if collection_ids:
                     q = q.filter(File.collection_id.in_(collection_ids))
                 if material_types:
@@ -9777,16 +11471,27 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         for w in terms:
             like = f"%{w}%"
             try:
-                q = db.session.query(File.id, File.title, File.author, File.keywords, File.text_excerpt, File.abstract) \
-                    .join(Collection, File.collection_id == Collection.id) \
-                    .filter(Collection.searchable == True) \
-                    .filter(or_(
-                        File.title.ilike(like),
-                        File.author.ilike(like),
-                        File.keywords.ilike(like),
-                        File.text_excerpt.ilike(like),
-                        File.abstract.ilike(like),
-                    ))
+                q = (
+                    db.session.query(
+                        File.id,
+                        File.title,
+                        File.author,
+                        File.keywords,
+                        File.text_excerpt,
+                        File.abstract,
+                    )
+                    .outerjoin(Collection, File.collection_id == Collection.id)
+                    .filter(or_(Collection.searchable == True, Collection.id.is_(None)))
+                    .filter(
+                        or_(
+                            File.title.ilike(like),
+                            File.author.ilike(like),
+                            File.keywords.ilike(like),
+                            File.text_excerpt.ilike(like),
+                            File.abstract.ilike(like),
+                        )
+                    )
+                )
                 if collection_ids:
                     q = q.filter(File.collection_id.in_(collection_ids))
                 if material_types:
@@ -9812,6 +11517,12 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         progress.add(f"Метаданные: найдено кандидатов {len(scores)}")
     else:
         progress.add("Метаданные: пропущено (источник отключён)")
+    if plan_must:
+        coverage_lines: List[str] = []
+        for key in plan_must[:6]:
+            count = sum(1 for matched in term_hits.values() if key in matched)
+            coverage_lines.append(f"{key}:{count}")
+        progress.add("Покрытие must-термов: " + (", ".join(coverage_lines) or "нет совпадений"))
     if mandatory_set and scores:
         kept_scores: dict[int, float] = {}
         kept_hits: dict[int, list[dict]] = {}
@@ -9839,9 +11550,11 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     file_ids = list(scores.keys())
     results = []
     if file_ids:
-        q_files = File.query.join(Collection, File.collection_id == Collection.id) \
-            .filter(Collection.searchable == True) \
+        q_files = (
+            File.query.outerjoin(Collection, File.collection_id == Collection.id)
+            .filter(or_(Collection.searchable == True, Collection.id.is_(None)))
             .filter(File.id.in_(file_ids))
+        )
         if collection_ids:
             q_files = q_files.filter(File.collection_id.in_(collection_ids))
         if material_types:
@@ -9866,6 +11579,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                 continue
         q_files = q_files.all()
         id2file = {f.id: f for f in q_files}
+        file_lookup = id2file
         for fid, sc in scores.items():
             f = id2file.get(fid)
             if not f:
@@ -10054,44 +11768,94 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
 
     # Необязательный короткий ответ, используя сниппеты как контекст (поисковый промпт)
     answer = ""
-    if results:
+    rag_context_sections: List[ContextSection] = []
+    rag_validation: Optional[ValidationResult] = None
+    rag_session_id: Optional[int] = None
+    rag_bundle: Optional[Dict[str, Any]] = None
+    rag_notes: list[str] = []
+    context_chunk_limit = max(4, min(8, top_k * 2))
+    language_filters = requested_languages if requested_languages else None
+    if rag_enabled:
+        if results:
+            rag_bundle, rag_notes = _prepare_rag_context(
+                query,
+                results,
+                language_filters=language_filters,
+                max_chunks=context_chunk_limit,
+                progress=progress,
+            )
+        else:
+            rag_notes.append("Нет результатов поиска, RAG контекст пропущен.")
+    else:
+        pass
+    fallback_required = True
+    if rag_enabled and rag_bundle and rag_bundle.get("sections"):
+        fallback_required = False
+        rag_notes.extend(rag_bundle.get("notes", []))
         stage_start = time.monotonic()
-        try:
-            topn = results[:10]
-            lines = []
-            for i, r in enumerate(topn):
-                sn = " ".join((r.get('snippets') or []))[:400]
-                title = r.get('title') or r.get('rel_path') or f"file-{r.get('file_id')}"
-                lines.append(f"[{i+1}] {title}: {sn}")
-            progress.add(
-                f"LLM ответ: используем {len(topn)} фрагментов, top_k={top_k}, deep_search={'on' if deep_search else 'off'}, full_text={'on' if full_text else 'off'}"
+        answer, rag_validation, rag_session_id, _, _ = _generate_rag_answer(
+            query,
+            rag_bundle,
+            temperature=0.1,
+            max_tokens=min(350, _lm_max_output_tokens()),
+            progress=progress,
+        )
+        durations['llm_answer'] = time.monotonic() - stage_start
+        rag_context_sections = rag_bundle.get("sections", [])
+    if fallback_required:
+        stage_start = time.monotonic()
+        if rag_notes:
+            prefix = "RAG заметка" if not rag_enabled else "RAG fallback"
+            for note in rag_notes:
+                progress.add(f"{prefix}: {note}")
+        topn = results[:10]
+        snippet_context: List[Dict[str, Any]] = []
+        if topn:
+            core_terms = [term for term in base_tokens if len(term) >= 4] or [
+                term for term in terms if len(term) >= 4
+            ]
+            anchor_terms = [term for term in base_tokens if len(term) >= 3] or [query.lower()]
+            snippet_answer, used_count, snippet_context = _compose_snippet_based_answer(
+                query,
+                topn,
+                primary_terms=core_terms,
+                anchor_terms=anchor_terms,
+                term_idf=idf,
+                max_items=max(3, top_k),
             )
-            system = (
-                "Ты помощник поиска. Сформулируй краткий, фактический ответ на вопрос пользователя, "
-                "используя ТОЛЬКО предоставленные фрагменты. Не выдумывай и не обобщай сверх текста. "
-                "Ссылайся на источники квадратными скобками [n] там, где берешь факт. Не упоминай слова 'стенограмма' или подобные. "
-                "Отвечай строго на русском языке."
-            )
-            user_msg = (
-                f"Вопрос: {query}\n"
-                f"Фрагменты:\n" + "\n".join(lines) + "\n"
-                "Ответь на русском языке."
-            )
-            answer = (call_lmstudio_compose(system, user_msg, temperature=0.1, max_tokens=min(350, _lm_max_output_tokens())) or "").strip()
-            if answer:
-                answer, translated = _ensure_russian_text(answer, label='answer')
-                if translated:
-                    progress.add("LLM ответ: переведён на русский")
-                progress.add(f"LLM ответ готов ({len(answer)} символов)")
+            if snippet_answer:
+                llm_snippet_answer = _generate_snippet_llm_summary(
+                    query,
+                    snippet_context,
+                    progress=progress,
+                )
+                if llm_snippet_answer:
+                    if snippet_context and re.search(r"недостаточн[оы]", llm_snippet_answer, flags=re.IGNORECASE):
+                        # Считаем, что LLM осторожничает — используем консервативный ответ по сниппетам
+                        answer = snippet_answer
+                        progress.add("LLM ответ по сниппетам отклонён: сообщает о нехватке данных")
+                    else:
+                        answer = llm_snippet_answer
+                        progress.add(f"LLM ответ по сниппетам: использовано {len(snippet_context)} источников")
+                else:
+                    answer = snippet_answer
+                    progress.add(f"Сниппет-ответ: использовано {used_count} источников (LLM не применён)")
             else:
-                progress.add("LLM ответ пуст")
-            durations['llm_answer'] = time.monotonic() - stage_start
-            stage_start = time.monotonic()
-        except Exception:
-            answer = ""
-            progress.add("LLM ответ: ошибка генерации")
-            durations['llm_answer'] = time.monotonic() - stage_start
-            stage_start = time.monotonic()
+                answer = fallback_answer()
+                progress.add("Сниппет-ответ: подходящих фрагментов нет, возвращаем заглушку")
+        else:
+            answer = fallback_answer()
+            progress.add("Сниппет-ответ: список результатов пуст")
+        if snippet_context:
+            detail_refs = []
+            for item in snippet_context:
+                title = item.get("title") or f"источник {item.get('order')}"
+                detail_refs.append(f"[{item['order']}] {title}")
+            if detail_refs:
+                details_text = "Подробнее см.: " + "; ".join(detail_refs)
+                answer = (answer + "\n\n" + details_text) if answer else details_text
+        durations['llm_answer'] = time.monotonic() - stage_start
+        stage_start = time.monotonic()
 
     # Необязательно: лёгкое реранжирование топ-15 через LLM с контекстом сниппетов
     if _rt().ai_rerank_llm and results:
@@ -10158,26 +11922,62 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         except Exception:
             pass
 
+    term_usage_counts: Dict[str, int] = {}
+    for matched in term_hits.values():
+        for term in matched:
+            term_usage_counts[term] = term_usage_counts.get(term, 0) + 1
+    final_keywords: List[str] = []
+    seen_keywords: set[str] = set()
+    base_tokens_limit = base_tokens[:4]
+    for term in terms:
+        if term in seen_keywords:
+            continue
+        if (
+            term_usage_counts.get(term, 0) > 0
+            or term in mandatory_set
+            or term in base_tokens_limit
+        ):
+            final_keywords.append(term)
+            seen_keywords.add(term)
+    if not final_keywords:
+        for term in base_tokens + list(terms) + plan_must:
+            if term and term not in seen_keywords:
+                final_keywords.append(term)
+                seen_keywords.add(term)
+            if len(final_keywords) >= 6:
+                break
     filtered_keywords = sorted({w for w in filtered_out_terms if w})
     durations['total'] = time.monotonic() - t_total_start
+    rag_context_payload = [_serialize_context_section(section) for section in rag_context_sections]
     extra_meta = {
         'query_preview': query[:200],
         'answer_preview': (answer or '')[:400],
-        'keyword_count': len(terms),
+        'keyword_count': len(final_keywords),
         'filtered_keywords': filtered_keywords,
         'mandatory_terms': mandatory_terms,
     }
+    extra_meta.update({
+        'rag_context_count': len(rag_context_sections),
+        'rag_fallback': bool(rag_context_sections) is False and rag_enabled,
+        'rag_hallucination_warning': bool(rag_validation and rag_validation.hallucination_warning),
+    })
     _record_search_metric(query_hash, durations, user, extra_meta)
 
     return {
         "query": query,
         "query_hash": query_hash,
-        "keywords": terms,
+        "keywords": final_keywords,
         "filtered_keywords": filtered_keywords,
         "mandatory_terms": mandatory_terms,
         "answer": answer,
         "items": results,
         "progress": progress.lines,
+        "rag_context": rag_context_payload,
+        "rag_validation": rag_validation.as_dict() if rag_validation else None,
+        "rag_session_id": rag_session_id,
+        "rag_notes": rag_notes,
+        "rag_fallback": bool(rag_context_sections) is False and rag_enabled,
+        "rag_enabled": rag_enabled,
     }
 
 
@@ -10726,4 +12526,5 @@ if __name__ == "__main__":
         ensure_collections_schema()
         ensure_llm_schema()
         ensure_default_admin()
-    app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False, threaded=True)
+    port = int(os.environ.get("AGREGATOR_PORT") or os.environ.get("PORT", 5050))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)

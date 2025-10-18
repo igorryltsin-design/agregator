@@ -32,8 +32,27 @@ build_ui() {
 build_ui "frontend" "Frontend"
 build_ui "AiWord" "AiWord"
 
+choose_port() {
+  local desired="${1:-5050}"
+  local port="$desired"
+  local max=$((desired + 50))
+  while lsof -ti :"$port" >/dev/null 2>&1; do
+    log "Port $port is occupied, trying $((port + 1))"
+    port=$((port + 1))
+    if [ "$port" -gt "$max" ]; then
+      log "No free port found between $desired and $max. Aborting."
+      exit 1
+    fi
+  done
+  echo "$port"
+}
+
+DEFAULT_PORT="${AGREGATOR_PORT:-5050}"
+SELECTED_PORT="$(choose_port "$DEFAULT_PORT")"
+export AGREGATOR_PORT="$SELECTED_PORT"
+
 log "Initializing database and starting Flask..."
-log "UI: http://localhost:5050/app "
+log "UI: http://localhost:${SELECTED_PORT}/app "
 export PYTHONUNBUFFERED=1
 
 cmd=()
