@@ -289,6 +289,37 @@ def _lm_safe_context_tokens() -> int:
     return max(512, value)
 
 
+def _guess_tokenizer_for_model(model_name: Optional[str], provider: Optional[str]) -> str:
+    """Return a human-readable hint for the tokenizer based on model/provider."""
+    name = (model_name or '').strip().lower()
+    prov = (provider or '').strip().lower()
+
+    if not name and not prov:
+        return 'Авто (по модели)'
+
+    def _has(substrings: Iterable[str]) -> bool:
+        return any(sub in name for sub in substrings)
+
+    if prov in {'openai', 'azure_openai', 'openrouter'}:
+        if _has(('gpt-4o', 'o1', 'o3')):
+            return 'tiktoken · o200k_base'
+        if _has(('gpt-4.1', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5', 'gpt-4o-mini', 'text-embedding-3')):
+            return 'tiktoken · cl100k_base'
+        if _has(('text-embedding-ada-002', 'ada-002')):
+            return 'tiktoken · cl100k_base'
+        return 'tiktoken (авто)'
+
+    if prov == 'ollama':
+        if _has(('llama', 'mixtral', 'mistral', 'gemma', 'phi', 'qwen', 'zephyr')):
+            return 'SentencePiece / GGUF'
+        return 'Встроенный GGUF'
+
+    if _has(('gemma', 'mistral', 'mixtral', 'llama', 'phi', 'qwen', 'zephyr', 'command', 'falcon', 'aya', 'vicuna')):
+        return 'SentencePiece / BPE'
+
+    return 'Авто (по модели)'
+
+
 def _always_ocr_first_page_dissertation() -> bool:
     """Return flag for forcing OCR on the first page of dissertations."""
     try:
@@ -1117,33 +1148,45 @@ def _start_feedback_training_scheduler() -> None:
     global _FEEDBACK_THREAD_STARTED
     if _FEEDBACK_THREAD_STARTED:
         return
-    if FEEDBACK_TRAIN_INTERVAL_HOURS <= 0:
-        _FEEDBACK_THREAD_STARTED = True
-        return
 
-    interval = max(1.0, FEEDBACK_TRAIN_INTERVAL_HOURS) * 3600
-
-    def _queue_training(trigger: str) -> None:
+    def _queue_training(trigger: str, *, allow_duplicate: bool = False) -> None:
+        global FEEDBACK_LAST_TRIGGER_AT
         try:
             with app.app_context():
                 task_id, queued = _enqueue_feedback_training(
                     cutoff_days=FEEDBACK_TRAIN_CUTOFF_DAYS,
                     trigger=trigger,
                     submitted_by=None,
-                    allow_duplicate=False,
+                    allow_duplicate=allow_duplicate,
                 )
                 if queued:
+                    FEEDBACK_LAST_TRIGGER_AT = time.time()
                     app.logger.info("[ai-feedback] queued training task #%s (%s)", task_id, trigger)
                 else:
                     app.logger.info("[ai-feedback] training already running (task #%s)", task_id)
         except Exception:
             app.logger.exception("[ai-feedback] failed to queue training (%s)", trigger)
 
-    _queue_training('initial')
+    # Автозапуск даже при выключенном расписании
+    _queue_training('initial', allow_duplicate=False)
 
     def loop():
         while True:
-            time.sleep(interval)
+            interval_hours = 0.0
+            try:
+                interval_hours = max(0.0, float(FEEDBACK_TRAIN_INTERVAL_HOURS or 0.0))
+            except Exception:
+                interval_hours = 0.0
+            if interval_hours <= 0.0:
+                # Ждём сигнала о включении расписания
+                FEEDBACK_SCHEDULER_EVENT.wait(timeout=300)
+                FEEDBACK_SCHEDULER_EVENT.clear()
+                continue
+            wait_seconds = max(300.0, interval_hours * 3600.0)
+            triggered = FEEDBACK_SCHEDULER_EVENT.wait(timeout=wait_seconds)
+            if triggered:
+                FEEDBACK_SCHEDULER_EVENT.clear()
+                continue
             _queue_training('schedule')
 
     threading.Thread(target=loop, name='ai-feedback-trainer', daemon=True).start()
@@ -7288,6 +7331,31 @@ def api_admin_status_overview():
 
     # Runtime snapshot
     rt = runtime_settings_store.current
+    provider_default = (getattr(rt, 'lm_default_provider', None) or 'openai').strip() or 'openai'
+    llm_endpoints: list[dict[str, Any]] = []
+    try:
+        rows = (
+            LlmEndpoint.query
+            .order_by(LlmEndpoint.created_at.desc())
+            .limit(20)
+            .all()
+        )
+        for ep in rows:
+            endpoint_provider = (ep.provider or provider_default) or 'openai'
+            llm_endpoints.append({
+                'id': ep.id,
+                'name': ep.name,
+                'model': ep.model,
+                'provider': endpoint_provider,
+                'weight': float(ep.weight or 0.0),
+                'purposes': _llm_parse_purposes(ep.purpose),
+                'tokenizer_hint': _guess_tokenizer_for_model(ep.model, endpoint_provider),
+            })
+    except Exception as exc:
+        errors['llm_endpoints'] = str(exc)
+        warnings.append('Не удалось получить список LLM-эндпоинтов')
+        db.session.rollback()
+
     runtime_info = {
         'scan_root': str(rt.scan_root),
         'import_subdir': rt.import_subdir,
@@ -7297,7 +7365,21 @@ def api_admin_status_overview():
         'transcribe_enabled': bool(rt.transcribe_enabled),
         'images_vision_enabled': bool(rt.images_vision_enabled),
         'ai_query_variants_max': int(rt.ai_query_variants_max),
-        'lm_default_provider': rt.lm_default_provider,
+        'lm_default_provider': provider_default,
+        'lm_model': getattr(rt, 'lmstudio_model', None),
+        'lm_tokenizer': _guess_tokenizer_for_model(getattr(rt, 'lmstudio_model', None), provider_default),
+        'lm_max_input_chars': _lm_max_input_chars(),
+        'lm_max_output_tokens': _lm_max_output_tokens(),
+        'rag_embedding_backend': getattr(rt, 'rag_embedding_backend', None),
+        'rag_embedding_model': getattr(rt, 'rag_embedding_model', None),
+        'rag_embedding_dim': getattr(rt, 'rag_embedding_dim', None),
+        'rag_rerank_backend': getattr(rt, 'rag_rerank_backend', None),
+        'rag_rerank_model': getattr(rt, 'rag_rerank_model', None),
+        'rag_rerank_batch_size': getattr(rt, 'rag_rerank_batch_size', None),
+        'rag_rerank_max_length': getattr(rt, 'rag_rerank_max_length', None),
+        'rag_rerank_max_chars': getattr(rt, 'rag_rerank_max_chars', None),
+        'ai_rerank_llm': bool(getattr(rt, 'ai_rerank_llm', False)),
+        'llm_endpoints': llm_endpoints,
     }
     try:
         usage = shutil.disk_usage(rt.scan_root)
@@ -7318,16 +7400,29 @@ def api_admin_status_overview():
             'running': _CLEANUP_THREAD_STARTED,
             'interval_hours': CACHE_CLEANUP_INTERVAL_HOURS,
         },
-        'feedback_trainer': {
-            'enabled': FEEDBACK_TRAIN_INTERVAL_HOURS > 0,
-            'running': _FEEDBACK_THREAD_STARTED,
-            'interval_hours': FEEDBACK_TRAIN_INTERVAL_HOURS,
-        },
+    }
+    feedback_stats = _feedback_scheduler_status()
+    service_flags['feedback_trainer'] = {
+        'enabled': bool(feedback_stats.get('scheduler_enabled')),
+        'running': bool(feedback_stats.get('thread_started')),
+        'interval_hours': feedback_stats.get('interval_hours'),
+        'last_trigger_at': feedback_stats.get('last_trigger_at'),
+        'next_run_in_seconds': feedback_stats.get('next_run_in_seconds'),
+        'total_weighted': feedback_stats.get('total_weighted'),
     }
     if service_flags['cache_cleanup']['enabled'] and not service_flags['cache_cleanup']['running']:
         warnings.append('Поток очистки кэша не запущен')
     if service_flags['feedback_trainer']['enabled'] and not service_flags['feedback_trainer']['running']:
         warnings.append('Планировщик обучения AI-фидбэка не запущен')
+
+    cache_info = {
+        'llm': llm_cache_stats(),
+        'search': search_cache_stats(),
+    }
+    if not cache_info['llm'].get('enabled'):
+        warnings.append('Кэш LLM выключен – время ответов может увеличиться')
+    if not cache_info['search'].get('enabled'):
+        warnings.append('Кэш поиска выключен – увеличится нагрузка на БД')
 
     rag_ready = None
     rag_pending = None
@@ -7372,6 +7467,8 @@ def api_admin_status_overview():
         'scan': scan_info,
         'runtime': runtime_info,
         'services': service_flags,
+        'feedback': feedback_stats,
+        'cache': cache_info,
         'rag': rag_overview,
     }
     return jsonify(payload)
@@ -7523,9 +7620,7 @@ def api_admin_feedback_model():
     })
 
 
-@admin_bp.route('/ai-search/feedback/status', methods=['GET'])
-@require_admin
-def api_admin_feedback_status():
+def _feedback_scheduler_status() -> dict[str, Any]:
     scheduler_enabled = FEEDBACK_TRAIN_INTERVAL_HOURS > 0
     try:
         total_weighted = db.session.query(func.count(AiSearchFeedbackModel.file_id)).scalar() or 0
@@ -7540,17 +7635,130 @@ def api_admin_feedback_status():
         TaskRecord.status.notin_(TASK_FINAL_STATUSES),
     ).order_by(TaskRecord.created_at.desc()).first()
     last_task = TaskRecord.query.filter(TaskRecord.name == 'feedback_train').order_by(TaskRecord.created_at.desc()).first()
-    return jsonify({
+    now_ts = time.time()
+    try:
+        interval_hours = max(0.0, float(FEEDBACK_TRAIN_INTERVAL_HOURS or 0.0))
+    except Exception:
+        interval_hours = 0.0
+    next_run_seconds: Optional[float] = None
+    if scheduler_enabled and interval_hours > 0.0:
+        interval_seconds = max(60.0, interval_hours * 3600.0)
+        if FEEDBACK_LAST_TRIGGER_AT > 0:
+            elapsed = max(0.0, now_ts - FEEDBACK_LAST_TRIGGER_AT)
+            next_run_seconds = max(0.0, interval_seconds - elapsed)
+        else:
+            next_run_seconds = interval_seconds
+    return {
         'ok': True,
         'scheduler_enabled': scheduler_enabled,
-        'interval_hours': FEEDBACK_TRAIN_INTERVAL_HOURS,
+        'interval_hours': interval_hours,
         'cutoff_days': FEEDBACK_TRAIN_CUTOFF_DAYS,
         'thread_started': _FEEDBACK_THREAD_STARTED,
         'total_weighted': int(total_weighted),
         'last_updated_at': last_updated.isoformat() if last_updated else None,
         'active_task': _task_to_dict(active_task) if active_task else None,
         'last_task': _task_to_dict(last_task) if last_task else None,
-    })
+        'last_trigger_at': _isoformat_ts(FEEDBACK_LAST_TRIGGER_AT),
+        'next_run_in_seconds': next_run_seconds,
+    }
+
+
+@admin_bp.route('/ai-search/feedback/status', methods=['GET'])
+@require_admin
+def api_admin_feedback_status():
+    return jsonify(_feedback_scheduler_status())
+
+
+@admin_bp.route('/ai-search/feedback/scheduler', methods=['POST'])
+@require_admin
+def api_admin_feedback_scheduler():
+    payload = request.get_json(silent=True) or {}
+    updates: Dict[str, Any] = {}
+
+    interval_value: Optional[float] = None
+    if 'interval_hours' in payload:
+        try:
+            interval_value = max(0.0, float(payload.get('interval_hours') or 0.0))
+        except Exception:
+            return jsonify({'ok': False, 'error': 'invalid_interval'}), 400
+
+    cutoff_value: Optional[int] = None
+    if 'cutoff_days' in payload:
+        try:
+            cutoff_value = max(1, int(payload.get('cutoff_days') or 1))
+        except Exception:
+            return jsonify({'ok': False, 'error': 'invalid_cutoff'}), 400
+
+    enabled_flag = payload.get('enabled')
+    if enabled_flag is not None:
+        enabled_bool = bool(enabled_flag)
+        if not enabled_bool:
+            updates['AI_FEEDBACK_TRAIN_INTERVAL_HOURS'] = 0.0
+        else:
+            target_interval = interval_value
+            if target_interval is None:
+                current_interval = getattr(runtime_settings_store.current, 'feedback_train_interval_hours', 0.0)
+                if current_interval <= 0:
+                    current_interval = 6.0
+                target_interval = current_interval
+            updates['AI_FEEDBACK_TRAIN_INTERVAL_HOURS'] = max(0.25, float(target_interval))
+    elif interval_value is not None:
+        updates['AI_FEEDBACK_TRAIN_INTERVAL_HOURS'] = interval_value
+
+    if cutoff_value is not None:
+        updates['AI_FEEDBACK_TRAIN_CUTOFF_DAYS'] = cutoff_value
+
+    updates_applied = False
+    if updates:
+        runtime_settings_store.apply_updates(updates)
+        runtime_settings_store.current.apply_env()
+        runtime_settings_store.current.apply_to_flask_config(current_app)
+        _refresh_runtime_globals()
+        updates_applied = True
+
+    FEEDBACK_SCHEDULER_EVENT.set()
+
+    run_now = bool(payload.get('run_now'))
+    manual_task = None
+    if run_now:
+        current_user = _load_current_user()
+        try:
+            task_id, queued = _enqueue_feedback_training(
+                cutoff_days=FEEDBACK_TRAIN_CUTOFF_DAYS,
+                trigger='manual_toggle',
+                submitted_by=getattr(current_user, 'id', None),
+                allow_duplicate=False,
+            )
+            if queued:
+                global FEEDBACK_LAST_TRIGGER_AT
+                FEEDBACK_LAST_TRIGGER_AT = time.time()
+            manual_task = {'task_id': task_id, 'queued': queued}
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'queue_failed:{exc}'}), 500
+
+    status = _feedback_scheduler_status()
+    status['updated'] = updates_applied
+    if manual_task is not None:
+        status['manual_task'] = manual_task
+    return jsonify(status)
+
+
+@admin_bp.route('/cache/llm', methods=['DELETE'])
+@require_admin
+def api_admin_cache_llm_clear():
+    before = llm_cache_stats()
+    llm_cache_clear()
+    after = llm_cache_stats()
+    return jsonify({'ok': True, 'before': before, 'after': after})
+
+
+@admin_bp.route('/cache/search', methods=['DELETE'])
+@require_admin
+def api_admin_cache_search_clear():
+    before = search_cache_stats()
+    search_cache_clear()
+    after = search_cache_stats()
+    return jsonify({'ok': True, 'before': before, 'after': after})
 
 # ------------------- Statistics & Visualization -------------------
 from collections import Counter, defaultdict
@@ -8845,6 +9053,8 @@ def _prepare_rag_context(
     language_filters: Optional[Sequence[str]],
     max_chunks: int,
     progress: Optional["_ProgressLogger"] = None,
+    variant_boost: int | float | None = None,
+    dense_boost: float | int | None = None,
 ) -> tuple[Optional[Dict[str, Any]], list[str]]:
     notes: list[str] = []
     file_ids = [int(res.get('file_id')) for res in results if res.get('file_id')]
@@ -8883,6 +9093,11 @@ def _prepare_rag_context(
             if fid and fid in global_authority_scores:
                 file_authority_scores[int(fid)] = float(global_authority_scores.get(fid, 0.0))
     file_feedback_scores: Dict[int, float] = {}
+    try:
+        feedback_weights_lookup = _get_feedback_weights()
+    except Exception as exc:
+        app.logger.debug("Feedback weights fetch failed in RAG context: %s", exc)
+        feedback_weights_lookup = {}
     if feedback_weights_lookup:
         for doc in documents:
             fid = getattr(doc, 'file_id', None)
@@ -14393,7 +14608,7 @@ if hasattr(app, "before_serving"):
 
 @app.before_request
 def _ensure_background_jobs_started():
-    if (not _CLEANUP_THREAD_STARTED) or (FEEDBACK_TRAIN_INTERVAL_HOURS > 0 and not _FEEDBACK_THREAD_STARTED):
+    if (not _CLEANUP_THREAD_STARTED) or (not _FEEDBACK_THREAD_STARTED):
         _initialize_background_jobs()
 
 

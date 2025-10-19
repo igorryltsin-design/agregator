@@ -222,6 +222,9 @@ Agregator — локальное веб-приложение для хранен
 | `/api/admin/ai-search/feedback/train` | `POST` | Перестроение весов на основании пользовательского фидбэка. |
 | `/api/admin/ai-search/feedback/model` | `GET` | Текущая сводка весов фидбэка (топ положительных/отрицательных). |
 | `/api/admin/ai-search/feedback/status` | `GET` | Статус планировщика и активных задач обучения фидбэка. |
+| `/api/admin/ai-search/feedback/scheduler` | `POST` | Включение/выключение автотренера и мгновенный запуск. |
+| `/api/admin/cache/llm` | `DELETE` | Очистка кэша ответов LLM. |
+| `/api/admin/cache/search` | `DELETE` | Очистка кэша результатов поиска. |
 | `/api/import/*` | `GET`, `POST` | Очередь задач, прогресс сканирования, отмена операций. |
 | `/api/settings/*` | `GET`, `PUT` | Runtime-настройки (OCR, LLM, пути, лимиты). |
 | `/scan/*` | `POST /start`, `POST /cancel`, `GET /status` | Управление полносканированием библиотеки. |

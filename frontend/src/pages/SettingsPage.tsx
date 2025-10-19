@@ -968,15 +968,19 @@ export default function SettingsPage() {
     </div>
 
       <div className="card p-3">
-        <div className="fw-semibold mb-1">Типы документов и эвристики</div>
-        <div className="text-muted mb-3" style={{ fontSize: 13 }}>Настройте ключевые слова, расширения и специальные правила для автоматического определения типа документов.</div>
-        <MaterialTypesEditor
-          materialTypes={materialTypes}
-          onChange={updateMaterialType}
-          onRemove={removeMaterialType}
-          onAdd={addMaterialType}
-          duplicateKeys={duplicateMaterialKeys}
-        />
+        <details>
+          <summary className="fw-semibold">Типы документов и эвристики</summary>
+          <div className="text-muted mt-2 mb-3" style={{ fontSize: 13 }}>Настройте ключевые слова, расширения и специальные правила для автоматического определения типа документов.</div>
+          <div className="mt-2">
+            <MaterialTypesEditor
+              materialTypes={materialTypes}
+              onChange={updateMaterialType}
+              onRemove={removeMaterialType}
+              onAdd={addMaterialType}
+              duplicateKeys={duplicateMaterialKeys}
+            />
+          </div>
+        </details>
       </div>
 
       <div className="card p-3">

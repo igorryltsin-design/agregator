@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAuth } from '../ui/Auth'
 import LoadingState from '../ui/LoadingState'
 
@@ -111,6 +111,8 @@ export default function AdminAiMetricsPage() {
   const [feedbackModel, setFeedbackModel] = useState<{ total: number; positive: FeedbackModelEntry[]; negative: FeedbackModelEntry[] } | null>(null)
   const [feedbackStatus, setFeedbackStatus] = useState<FeedbackStatus | null>(null)
   const [statusError, setStatusError] = useState('')
+  const [feedbackVisible, setFeedbackVisible] = useState(false)
+  const feedbackSectionRef = useRef<HTMLDivElement | null>(null)
 
   const loadMetrics = useCallback(async (limit = 100) => {
     if (!isAdmin) return
@@ -255,9 +257,13 @@ const loadFeedbackModel = useCallback(async (limit = 30) => {
     URL.revokeObjectURL(url)
   }, [metrics, summary, feedbackModel, feedbackStatus])
 
-  const refreshFeedback = useCallback(() => {
-    loadFeedbackModel()
-    loadFeedbackStatus()
+  const refreshFeedback = useCallback(async () => {
+    setFeedbackVisible(true)
+    await loadFeedbackModel()
+    await loadFeedbackStatus()
+    window.requestAnimationFrame(() => {
+      feedbackSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
   }, [loadFeedbackModel, loadFeedbackStatus])
 
   useEffect(() => {
@@ -378,71 +384,75 @@ const loadFeedbackModel = useCallback(async (limit = 30) => {
             <div className="fw-semibold" style={{ fontSize: 18 }}>{formatMs(card.value)}</div>
           </div>
         ))}
-            {!loading && summaryCards.length === 0 && !error && (
-              <div className="text-muted">Нет агрегированных данных</div>
-            )}
+        {!loading && summaryCards.length === 0 && !error && (
+          <div className="text-muted">Нет агрегированных данных</div>
+        )}
       </div>
-      {feedbackLoading && <div className="text-muted mb-3">Загрузка весов фидбэка…</div>}
-      {feedbackModel && feedbackModel.total === 0 && !feedbackLoading && (
-        <div className="text-muted mb-3">Фидбэк ещё не собран.</div>
-      )}
-      {feedbackStatus && feedbackStatus.total_weighted > 0 && (
-        <div className="text-muted mb-3" style={{ fontSize: 12 }}>
-          Всего документов с весами: {feedbackStatus.total_weighted}.
-          {lastTaskStats && (
-            <>
-              {' '}Последний прогон: файлов {((lastTaskStats as any).files) ?? '—'},
-              обновлено {((lastTaskStats as any).updated) ?? '—'}, завершено {feedbackStatus.last_task?.finished_at ? formatDateTime(feedbackStatus.last_task.finished_at) : '—'}.
-            </>
+      {feedbackVisible && (
+        <div ref={feedbackSectionRef} className="mb-3">
+          {feedbackLoading && <div className="text-muted mb-3">Загрузка весов фидбэка…</div>}
+          {feedbackModel && feedbackModel.total === 0 && !feedbackLoading && (
+            <div className="text-muted mb-3">Фидбэк ещё не собран.</div>
           )}
-        </div>
-      )}
-      {feedbackModel && (feedbackModel.positive.length > 0 || feedbackModel.negative.length > 0) && (
-        <div className="row g-3 mb-3">
-          <div className="col-12 col-xl-6">
-            <div className="card p-3 h-100">
-              <div className="fw-semibold mb-2">Лучшие документы по фидбэку</div>
-              <ol className="mb-0 ps-3">
-                {feedbackModel.positive.map(entry => (
-                  <li key={`pos-${entry.file_id}`} className="mb-2">
-                    <div className="d-flex justify-content-between align-items-center" style={{ fontSize: 14 }}>
-                      <span>{entry.title}</span>
-                      <span className="text-success">{formatWeight(entry.weight)}</span>
-                    </div>
-                    <div className="text-secondary" style={{ fontSize: 12 }}>
-                      👍 {entry.positive} · 👎 {entry.negative} · кликов {entry.clicks}
-                    </div>
-                    {entry.updated_at && (
-                      <div className="text-muted" style={{ fontSize: 11 }}>Обновлено {formatDateTime(entry.updated_at)}</div>
-                    )}
-                  </li>
-                ))}
-                {feedbackModel.positive.length === 0 && <li className="text-muted">Нет положительных оценок</li>}
-              </ol>
+          {feedbackStatus && feedbackStatus.total_weighted > 0 && (
+            <div className="text-muted mb-3" style={{ fontSize: 12 }}>
+              Всего документов с весами: {feedbackStatus.total_weighted}.
+              {lastTaskStats && (
+                <>
+                  {' '}Последний прогон: файлов {((lastTaskStats as any).files) ?? '—'},
+                  обновлено {((lastTaskStats as any).updated) ?? '—'}, завершено {feedbackStatus.last_task?.finished_at ? formatDateTime(feedbackStatus.last_task.finished_at) : '—'}.
+                </>
+              )}
             </div>
-          </div>
-          <div className="col-12 col-xl-6">
-            <div className="card p-3 h-100">
-              <div className="fw-semibold mb-2">Документы с отрицательным весом</div>
-              <ol className="mb-0 ps-3">
-                {feedbackModel.negative.map(entry => (
-                  <li key={`neg-${entry.file_id}`} className="mb-2">
-                    <div className="d-flex justify-content-between align-items-center" style={{ fontSize: 14 }}>
-                      <span>{entry.title}</span>
-                      <span className="text-danger">{formatWeight(entry.weight)}</span>
-                    </div>
-                    <div className="text-secondary" style={{ fontSize: 12 }}>
-                      👍 {entry.positive} · 👎 {entry.negative} · кликов {entry.clicks}
-                    </div>
-                    {entry.updated_at && (
-                      <div className="text-muted" style={{ fontSize: 11 }}>Обновлено {formatDateTime(entry.updated_at)}</div>
-                    )}
-                  </li>
-                ))}
-                {feedbackModel.negative.length === 0 && <li className="text-muted">Нет отрицательных оценок</li>}
-              </ol>
+          )}
+          {feedbackModel && (feedbackModel.positive.length > 0 || feedbackModel.negative.length > 0) && (
+            <div className="row g-3 mb-3">
+              <div className="col-12 col-xl-6">
+                <div className="card p-3 h-100">
+                  <div className="fw-semibold mb-2">Лучшие документы по фидбэку</div>
+                  <ol className="mb-0 ps-3">
+                    {feedbackModel.positive.map(entry => (
+                      <li key={`pos-${entry.file_id}`} className="mb-2">
+                        <div className="d-flex justify-content-between align-items-center" style={{ fontSize: 14 }}>
+                          <span>{entry.title}</span>
+                          <span className="text-success">{formatWeight(entry.weight)}</span>
+                        </div>
+                        <div className="text-secondary" style={{ fontSize: 12 }}>
+                          👍 {entry.positive} · 👎 {entry.negative} · кликов {entry.clicks}
+                        </div>
+                        {entry.updated_at && (
+                          <div className="text-muted" style={{ fontSize: 11 }}>Обновлено {formatDateTime(entry.updated_at)}</div>
+                        )}
+                      </li>
+                    ))}
+                    {feedbackModel.positive.length === 0 && <li className="text-muted">Нет положительных оценок</li>}
+                  </ol>
+                </div>
+              </div>
+              <div className="col-12 col-xl-6">
+                <div className="card p-3 h-100">
+                  <div className="fw-semibold mb-2">Документы с отрицательным весом</div>
+                  <ol className="mb-0 ps-3">
+                    {feedbackModel.negative.map(entry => (
+                      <li key={`neg-${entry.file_id}`} className="mb-2">
+                        <div className="d-flex justify-content-between align-items-center" style={{ fontSize: 14 }}>
+                          <span>{entry.title}</span>
+                          <span className="text-danger">{formatWeight(entry.weight)}</span>
+                        </div>
+                        <div className="text-secondary" style={{ fontSize: 12 }}>
+                          👍 {entry.positive} · 👎 {entry.negative} · кликов {entry.clicks}
+                        </div>
+                        {entry.updated_at && (
+                          <div className="text-muted" style={{ fontSize: 11 }}>Обновлено {formatDateTime(entry.updated_at)}</div>
+                        )}
+                      </li>
+                    ))}
+                    {feedbackModel.negative.length === 0 && <li className="text-muted">Нет отрицательных оценок</li>}
+                  </ol>
+                </div>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       )}
       <div className="table-responsive">
