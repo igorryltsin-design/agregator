@@ -8914,6 +8914,11 @@ def rag_context_cli(
         expand_terms_fn=_expand_synonyms,
         lemma_fn=_lemma,
     )
+    try:
+        authority_scores_cli = _compute_authority_scores(None)
+    except Exception:
+        authority_scores_cli = {}
+    query_terms_cli = _tokenize_query(query)
     mode = (rerank_mode or "none").lower()
 
     def _make_rerank(mode_name: str):
@@ -8972,6 +8977,8 @@ def rag_context_cli(
         top_k=top_k,
         languages=languages,
         max_total_tokens=max_tokens if max_tokens > 0 else None,
+        query_terms=query_terms_cli,
+        authority_scores=authority_scores_cli if authority_scores_cli else None,
     )
     if rerank_instance:
         try:
