@@ -16,3 +16,4 @@ catalogue.db
 catalogue.db-journal
 *.db
 catalogue.db
+*.db

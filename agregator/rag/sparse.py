@@ -7,7 +7,7 @@ from typing import Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
 from sqlalchemy import or_, text
 from sqlalchemy.orm import Session, joinedload
 
-from models import RagDocument, RagDocumentChunk, db
+from models import File, RagDocument, RagDocumentChunk, db
 
 if TYPE_CHECKING:  # pragma: no cover - только для подсказок типов
     from agregator.services.search import SearchService  # noqa: F401
@@ -57,8 +57,16 @@ class KeywordRetriever:
         languages: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         max_per_document: Optional[int] = None,
+        query_terms: Optional[Sequence[str]] = None,
     ) -> List[KeywordMatch]:
-        raw_terms = [t for t in _tokenize(query) if len(t) >= self.min_term_length]
+        base_terms = [
+            str(term).lower()
+            for term in (query_terms or [])
+            if isinstance(term, str) and len(term) >= self.min_term_length
+        ]
+        raw_terms = base_terms + [t for t in _tokenize(query) if len(t) >= self.min_term_length]
+        raw_terms = [term.lower() for term in raw_terms]
+        raw_terms = list(dict.fromkeys(raw_terms))
         if not raw_terms:
             return []
         primary_terms: List[str] = raw_terms
@@ -149,7 +157,12 @@ class KeywordRetriever:
         if not like_conditions:
             return []
         query_obj = self.session.query(RagDocumentChunk).options(
-            joinedload(RagDocumentChunk.document).joinedload(RagDocument.file)
+            joinedload(RagDocumentChunk.document)
+            .joinedload(RagDocument.file)
+            .joinedload(File.collection),
+            joinedload(RagDocumentChunk.document)
+            .joinedload(RagDocument.file)
+            .joinedload(File.tags),
         )
         query_obj = query_obj.filter(or_(*like_conditions))
         if candidate_files:

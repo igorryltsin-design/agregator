@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import DOMPurify from 'dompurify'
 import { materialTypeRu, materialTypeSlug } from '../../utils/locale'
 import { useToasts } from '../../ui/Toasts'
-import type { CollectionOption, FacetData, FileItem, ProgressItem, RagContextEntry, RagValidationResult, Tag } from './types'
+import type { CollectionOption, FacetData, FileItem, ProgressItem, RagContextEntry, RagRisk, RagSourceEntry, RagValidationResult, Tag } from './types'
 
 const AI_ANSWER_ALLOWED_TAGS = ['a', 'b', 'strong', 'em', 'i', 'code', 'pre', 'p', 'br', 'ul', 'ol', 'li', 'span', 'div']
 const AI_ANSWER_ALLOWED_ATTRS = ['href', 'title', 'target', 'rel', 'class']
@@ -93,6 +93,9 @@ export function useCatalogueState() {
   const [ragNotes, setRagNotes] = useState<string[]>([])
   const [ragFallback, setRagFallback] = useState<boolean>(false)
   const [ragSessionId, setRagSessionId] = useState<number | null>(null)
+  const [ragRisk, setRagRisk] = useState<RagRisk | null>(null)
+  const [ragSources, setRagSources] = useState<RagSourceEntry[]>([])
+  const [ragRetry, setRagRetry] = useState<boolean>(false)
   const [ragHintVisible, setRagHintVisible] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true
     try {
@@ -357,6 +360,15 @@ export function useCatalogueState() {
     setAiQueryHash('')
     setFeedbackStatus({})
     setAiAllLanguages(false)
+    setRagContext([])
+    setRagValidation(null)
+    setRagWarnings([])
+    setRagNotes([])
+    setRagFallback(false)
+    setRagSessionId(null)
+    setRagRisk(null)
+    setRagSources([])
+    setRagRetry(false)
     stopSpeakingAnswer()
   }, [stopSpeakingAnswer])
 
@@ -647,14 +659,64 @@ export function useCatalogueState() {
       setLocalPage(1)
     }
 
+    const applySearchResult = async (data: any) => {
+      if (cancelled) return
+      if (!data || typeof data !== 'object') return
+      setAiQueryHash(String(data.query_hash || ''))
+      const items = Array.isArray(data.items) ? data.items : []
+      const progressLines = Array.isArray(data.progress) && data.progress.length ? data.progress : ['Поиск завершён']
+      setAiProgress(progressLines)
+      if (cancelled) return
+      setAiSources(items)
+      setAiAnswer(data.answer || '')
+      setAiKeywords(Array.isArray(data.keywords) ? data.keywords : [])
+      setAiFilteredKeywords(Array.isArray(data.filtered_keywords) ? data.filtered_keywords : [])
+      const ragContextData: RagContextEntry[] = Array.isArray(data.rag_context) ? data.rag_context : []
+      setRagContext(ragContextData)
+      const ragValidationData: RagValidationResult | null = data.rag_validation && typeof data.rag_validation === 'object' ? data.rag_validation : null
+        setRagValidation(ragValidationData)
+        const ragRiskData: RagRisk | null = data.rag_risk && typeof data.rag_risk === 'object' ? data.rag_risk : null
+        setRagRisk(ragRiskData)
+        const ragSourcesData: RagSourceEntry[] = Array.isArray(data.rag_sources) ? data.rag_sources : []
+        setRagSources(ragSourcesData)
+        setRagRetry(Boolean(data.rag_retry))
+      const sessionId = typeof data.rag_session_id === 'number' ? data.rag_session_id : null
+      setRagSessionId(sessionId)
+      setRagFallback(Boolean(data.rag_fallback))
+      const ragNotesRaw: string[] = Array.isArray(data.rag_notes)
+        ? data.rag_notes.map((note: any) => String(note))
+        : []
+      const warnings: string[] = []
+      if (ragValidationData?.hallucination_warning) warnings.push('Ответ содержит предупреждения по проверке фактов.')
+      if (ragValidationData?.missing_citations) warnings.push('Некоторые факты в ответе представлены без ссылок на источники.')
+      if (ragValidationData?.unknown_citations?.length) {
+        const list = ragValidationData.unknown_citations.map(([doc, chunk]) => `[${doc}:${chunk}]`).join(', ')
+        warnings.push(`Есть ссылки, отсутствующие в контексте: ${list}`)
+      }
+      if (ragValidationData?.extra_citations?.length) {
+        const list = ragValidationData.extra_citations.map(([doc, chunk]) => `[${doc}:${chunk}]`).join(', ')
+        warnings.push(`Ответ содержит лишние ссылки: ${list}`)
+      }
+      const noteWarningRegex = /(не найден|не найдены|не удалось|нет документов|fallback|пропущен|контекст не|backend)/i
+      const noteWarnings = ragNotesRaw.filter(note => noteWarningRegex.test(note))
+      const infoNotes = ragNotesRaw.filter(note => !noteWarningRegex.test(note))
+      warnings.push(...noteWarnings)
+      setRagWarnings(warnings)
+      setRagNotes(infoNotes)
+      await hydrateItems(items)
+    }
+
     const runAiSearch = async (payload: any) => {
       abortCurrent()
       const localController = new AbortController()
       controller = localController
       try {
-        const resp = await fetch('/api/ai-search', {
+        const resp = await fetch('/api/ai-search?stream=1', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/x-ndjson, application/json',
+          },
           body: JSON.stringify(payload),
           signal: localController.signal,
         })
@@ -662,47 +724,65 @@ export function useCatalogueState() {
           const text = await resp.text().catch(() => '')
           throw new Error(text || `HTTP ${resp.status}`)
         }
-        const data = await resp.json()
-        if (cancelled) return
-        setAiQueryHash(String(data.query_hash || ''))
-        const items = Array.isArray(data.items) ? data.items : []
-        const progressLines = Array.isArray(data.progress) && data.progress.length ? data.progress : ['Поиск завершён']
-        setAiProgress(progressLines)
-        if (cancelled) return
-        setAiSources(items)
-        setAiAnswer(data.answer || '')
-        setAiKeywords(Array.isArray(data.keywords) ? data.keywords : [])
-        setAiFilteredKeywords(Array.isArray(data.filtered_keywords) ? data.filtered_keywords : [])
-        const ragContextData: RagContextEntry[] = Array.isArray(data.rag_context) ? data.rag_context : []
-        setRagContext(ragContextData)
-        const ragValidationData: RagValidationResult | null = data.rag_validation && typeof data.rag_validation === 'object' ? data.rag_validation : null
-        setRagValidation(ragValidationData)
-        const sessionId = typeof data.rag_session_id === 'number' ? data.rag_session_id : null
-        setRagSessionId(sessionId)
-        setRagFallback(Boolean(data.rag_fallback))
-        const ragNotesRaw: string[] = Array.isArray(data.rag_notes)
-          ? data.rag_notes.map((note: any) => String(note))
-          : []
-        const warnings: string[] = []
-        if (ragValidationData?.hallucination_warning) warnings.push('Ответ содержит предупреждения по проверке фактов.')
-        if (ragValidationData?.missing_citations) warnings.push('Некоторые факты в ответе представлены без ссылок на источники.')
-        if (ragValidationData?.unknown_citations?.length) {
-          const list = ragValidationData.unknown_citations.map(([doc, chunk]) => `[${doc}:${chunk}]`).join(', ')
-          warnings.push(`Есть ссылки, отсутствующие в контексте: ${list}`)
+        const contentType = (resp.headers.get('Content-Type') || '').toLowerCase()
+        const reader = typeof resp.body?.getReader === 'function' ? resp.body.getReader() : null
+        const supportsStream = reader && contentType.includes('application/x-ndjson')
+        if (supportsStream && reader) {
+          const decoder = new TextDecoder()
+          let buffer = ''
+          let receivedComplete = false
+          while (true) {
+            const { value, done } = await reader.read()
+            if (cancelled) {
+              reader.cancel().catch(() => null)
+              return
+            }
+            if (value) {
+              buffer += decoder.decode(value, { stream: !done })
+            } else if (done) {
+              buffer += decoder.decode()
+            }
+            let newlineIndex = buffer.indexOf('\n')
+            while (newlineIndex >= 0) {
+              const rawLine = buffer.slice(0, newlineIndex).trim()
+              buffer = buffer.slice(newlineIndex + 1)
+              if (rawLine) {
+                let parsed: any = null
+                try {
+                  parsed = JSON.parse(rawLine)
+                } catch (parseError) {
+                  console.warn('ai-search stream parse error', parseError, rawLine)
+                  parsed = null
+                }
+                if (parsed && parsed.type === 'progress' && typeof parsed.line === 'string') {
+                  if (!cancelled) {
+                    setAiProgress(prev => (prev.includes(parsed.line) ? prev : [...prev, parsed.line]))
+                  }
+                } else if (parsed && parsed.type === 'complete' && parsed.data) {
+                  receivedComplete = true
+                  await applySearchResult(parsed.data)
+                } else if (parsed && parsed.type === 'error') {
+                  const message = typeof parsed.error === 'string' ? parsed.error : (parsed.message || 'Ошибка поиска')
+                  throw new Error(message)
+                }
+              }
+              newlineIndex = buffer.indexOf('\n')
+            }
+            if (done) {
+              break
+            }
+          }
+          if (!receivedComplete) {
+            throw new Error('Ответ поиска не получен')
+          }
+        } else {
+          const data = await resp.json()
+          await applySearchResult(data)
         }
-        if (ragValidationData?.extra_citations?.length) {
-          const list = ragValidationData.extra_citations.map(([doc, chunk]) => `[${doc}:${chunk}]`).join(', ')
-          warnings.push(`Ответ содержит лишние ссылки: ${list}`)
-        }
-        const noteWarningRegex = /(не найден|не найдены|не удалось|нет документов|fallback|пропущен|контекст не|backend)/i
-        const noteWarnings = ragNotesRaw.filter(note => noteWarningRegex.test(note))
-        const infoNotes = ragNotesRaw.filter(note => !noteWarningRegex.test(note))
-        warnings.push(...noteWarnings)
-        setRagWarnings(warnings)
-        setRagNotes(infoNotes)
-        await hydrateItems(items)
       } catch (error: any) {
         if (cancelled || (error && error.name === 'AbortError')) return
+        setRagRisk(null)
+        setRagSources([])
         throw error
       } finally {
         if (controller === localController) {
@@ -729,6 +809,9 @@ export function useCatalogueState() {
           setRagNotes([])
           setRagFallback(false)
           setRagSessionId(null)
+          setRagRisk(null)
+          setRagSources([])
+          setRagRetry(false)
           const payload: any = { query: dq, top_k: aiTopK, deep_search: aiDeepSearch }
           payload.sources = { tags: aiUseTags, text: aiUseText }
           payload.max_candidates = aiMaxCandidates
@@ -763,6 +846,8 @@ export function useCatalogueState() {
             setRagNotes([])
             setRagFallback(false)
             setRagSessionId(null)
+            setRagRisk(null)
+            setRagSources([])
           }
         } else {
           if (aiMode) {
@@ -782,6 +867,8 @@ export function useCatalogueState() {
             setRagNotes([])
             setRagFallback(false)
             setRagSessionId(null)
+            setRagRisk(null)
+            setRagSources([])
             setLocalPage(page)
             return
           }
@@ -795,6 +882,8 @@ export function useCatalogueState() {
           setRagNotes([])
           setRagFallback(false)
           setRagSessionId(null)
+          setRagRisk(null)
+          setRagSources([])
           const p = new URLSearchParams(params)
           p.set('limit', String(perPage))
           p.set('offset', String(offset))
@@ -817,7 +906,11 @@ export function useCatalogueState() {
             setRagContext([])
             setRagValidation(null)
             setRagWarnings([])
+            setRagNotes([])
+            setRagFallback(false)
             setRagSessionId(null)
+            setRagRisk(null)
+            setRagSources([])
           }
         }
       } finally {
@@ -926,7 +1019,12 @@ export function useCatalogueState() {
     setRagContext([])
     setRagValidation(null)
     setRagWarnings([])
+    setRagNotes([])
     setRagSessionId(null)
+    setRagFallback(false)
+    setRagRisk(null)
+    setRagSources([])
+    setRagRetry(false)
     setAiMode(false)
     setAiProgress([])
     setSp(params)
@@ -940,7 +1038,7 @@ export function useCatalogueState() {
     ai: {
       aiMode, setAiMode, aiLoading, aiProgress, progressItems, aiAnswer, safeAiAnswer, aiAnswerPlain,
       aiKeywords, aiSources, aiFilteredKeywords, aiQueryHash, feedbackStatus,
-      ragContext, ragValidation, ragWarnings, ragNotes, ragFallback, ragSessionId,
+      ragContext, ragValidation, ragRisk, ragSources, ragRetry, ragWarnings, ragNotes, ragFallback, ragSessionId,
       aiTopK, setAiTopK, aiDeepSearch, setAiDeepSearch, aiUseTags, setAiUseTags,
       aiUseText, setAiUseText, aiMaxCandidates, setAiMaxCandidates, aiChunkChars, setAiChunkChars,
       aiMaxChunks, setAiMaxChunks, aiMaxSnippets, setAiMaxSnippets, aiFullText, setAiFullText,

@@ -32,6 +32,7 @@ export type RagContextEntry = {
   chunk_id: number
   title: string
   language: string
+  section_path?: string | null
   translation_hint?: string
   score_dense?: number
   score_sparse?: number
@@ -42,6 +43,34 @@ export type RagContextEntry = {
   content?: string
   url?: string | null
   extra?: Record<string, unknown>
+}
+
+export type RagSourceEntry = {
+  doc_id: number
+  chunk_id: number
+  title: string
+  section_path?: string | null
+  combined_score?: number
+}
+
+export type RagRiskSection = {
+  doc_id: number
+  chunk_id: number
+  combined_score?: number
+  reasoning_hint?: string
+}
+
+export type RagRisk = {
+  score?: number
+  level?: string
+  reasons?: string[]
+  flagged_refs?: { doc_id: number; chunk_id: number }[]
+  hallucination_warning?: boolean
+  top_sections?: RagRiskSection[]
+}
+
+export type RagSearchResponse = {
+  rag_retry?: boolean
 }
 
 export type RagValidationResult = {

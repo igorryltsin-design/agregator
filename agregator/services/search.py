@@ -231,7 +231,16 @@ class SearchService:
         if not cleaned:
             return None
         cleaned = cleaned[:8]
-        return ' '.join(f'{token}*' for token in cleaned)
+        base_terms = ' '.join(f'{token}*' for token in cleaned)
+        if len(cleaned) >= 2:
+            near_clauses = []
+            for idx in range(len(cleaned) - 1):
+                left = cleaned[idx]
+                right = cleaned[idx + 1]
+                near_clauses.append(f"{left} NEAR/5 {right}")
+            compound = " OR ".join(near_clauses + ([base_terms] if base_terms else []))
+            return compound or base_terms
+        return base_terms
 
     def candidate_ids(self, query: str, limit: int = 4000) -> Optional[List[int]]:
         match_expr = self._fts_match_query(query)

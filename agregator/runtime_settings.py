@@ -151,6 +151,9 @@ class RuntimeSettings:
     rag_embedding_device: Optional[str] = None
     rag_embedding_endpoint: str = ""
     rag_embedding_api_key: str = ""
+    ai_query_variants_max: int = 0
+    ai_rag_retry_enabled: bool = True
+    ai_rag_retry_threshold: float = 0.6
     rag_rerank_backend: str = "none"
     rag_rerank_model: str = ""
     rag_rerank_device: Optional[str] = None
@@ -196,6 +199,9 @@ class RuntimeSettings:
             rag_rerank_batch_size=config.rag_rerank_batch_size,
             rag_rerank_max_length=config.rag_rerank_max_length,
             rag_rerank_max_chars=config.rag_rerank_max_chars,
+            ai_query_variants_max=config.ai_query_variants_max,
+            ai_rag_retry_enabled=config.ai_rag_retry_enabled,
+            ai_rag_retry_threshold=config.ai_rag_retry_threshold,
             transcribe_enabled=config.transcribe_enabled,
             transcribe_backend=config.transcribe_backend,
             transcribe_model_path=config.transcribe_model_path,
@@ -256,6 +262,7 @@ class RuntimeSettings:
             "RAG_RERANK_BATCH_SIZE": int(self.rag_rerank_batch_size),
             "RAG_RERANK_MAX_LENGTH": int(self.rag_rerank_max_length),
             "RAG_RERANK_MAX_CHARS": int(self.rag_rerank_max_chars),
+            "AI_QUERY_VARIANTS_MAX": int(self.ai_query_variants_max),
             "TRANSCRIBE_ENABLED": bool(self.transcribe_enabled),
             "TRANSCRIBE_BACKEND": self.transcribe_backend,
             "TRANSCRIBE_MODEL_PATH": self.transcribe_model_path,
@@ -278,6 +285,8 @@ class RuntimeSettings:
             "ALWAYS_OCR_FIRST_PAGE_DISSERTATION": bool(self.always_ocr_first_page_dissertation),
             "PROMPTS": dict(self.prompts),
             "AI_RERANK_LLM": bool(self.ai_rerank_llm),
+            "AI_RAG_RETRY_ENABLED": bool(self.ai_rag_retry_enabled),
+            "AI_RAG_RETRY_THRESHOLD": float(self.ai_rag_retry_threshold),
             "LLM_CACHE_ENABLED": bool(self.llm_cache_enabled),
             "LLM_CACHE_TTL_SECONDS": int(self.llm_cache_ttl_seconds),
             "LLM_CACHE_MAX_ITEMS": int(self.llm_cache_max_items),
@@ -390,6 +399,18 @@ class RuntimeSettings:
             elif key == "RAG_RERANK_MAX_CHARS":
                 try:
                     self.rag_rerank_max_chars = max(200, int(raw))
+                except Exception:
+                    pass
+            elif key == "AI_QUERY_VARIANTS_MAX":
+                try:
+                    self.ai_query_variants_max = max(0, int(raw))
+                except Exception:
+                    pass
+            elif key == "AI_RAG_RETRY_ENABLED":
+                self.ai_rag_retry_enabled = _coerce_bool(raw, default=self.ai_rag_retry_enabled)
+            elif key == "AI_RAG_RETRY_THRESHOLD":
+                try:
+                    self.ai_rag_retry_threshold = max(0.0, min(1.0, float(raw)))
                 except Exception:
                     pass
             elif key == "TRANSCRIBE_ENABLED":

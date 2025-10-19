@@ -50,6 +50,9 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
     aiSources,
     ragContext,
     ragValidation,
+    ragRetry,
+    ragRisk,
+    ragSources,
     ragWarnings,
     ragNotes,
     ragFallback,
@@ -71,6 +74,31 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
   }
   const formatScore = (value?: number) => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(3) : '—')
   const hasWarnings = Array.isArray(ragWarnings) && ragWarnings.length > 0
+  const flaggedRefs = React.useMemo(() => {
+    if (!ragRisk?.flagged_refs?.length) return new Set<string>()
+    return new Set(ragRisk.flagged_refs.map(ref => `${ref.doc_id}:${ref.chunk_id}`))
+  }, [ragRisk])
+  const riskLevelMap: Record<string, { label: string; badge: string }> = {
+    high: { label: 'Высокий', badge: 'danger' },
+    medium: { label: 'Средний', badge: 'warning' },
+    low: { label: 'Низкий', badge: 'success' },
+  }
+  const riskLevelKey = typeof ragRisk?.level === 'string' ? ragRisk.level.toLowerCase() : 'low'
+  const riskMeta = riskLevelMap[riskLevelKey] || riskLevelMap.low
+  const riskReasonLabels: Record<string, string> = {
+    no_context: 'Контекст не сформирован',
+    empty_answer: 'Ответ пустой',
+    missing_citations: 'Факты без ссылок',
+    unknown_citations: 'Неизвестные ссылки',
+    extra_citations: 'Лишние ссылки',
+    hallucination_warning: 'Валидация LLM предупредила о риске',
+    low_coverage: 'Число ссылок меньше числа блоков контекста',
+  }
+  const riskReasons = ragRisk?.reasons?.map(reason => riskReasonLabels[reason] || reason) || []
+  const displayedSources = ragSources?.length ? ragSources.slice(0, Math.min(8, ragSources.length)) : []
+  const riskScorePct = typeof ragRisk?.score === 'number' ? Math.round(ragRisk.score * 100) : null
+  const flaggedList = ragRisk?.flagged_refs?.length ? ragRisk.flagged_refs.map(ref => `[${ref.doc_id}:${ref.chunk_id}]`).join(', ') : ''
+  const topRiskSections = ragRisk?.top_sections || []
 
   return (
     <>
@@ -470,39 +498,118 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
         </div>
       )}
 
-      {aiUseRag && !!ragContext?.length && (
+      {aiUseRag && (ragContext?.length || ragRisk || displayedSources.length) && (
         <div className="card p-3 mb-2">
-          <div className="fw-semibold mb-2">Контекст RAG</div>
-          <ol className="mb-0 ps-3">
-            {ragContext.map((entry, idx) => (
-              <li key={`${entry.doc_id}-${entry.chunk_id}-${idx}`} className="mb-3">
-                <div className="fw-semibold">[{idx + 1}] {entry.title || `Документ ${entry.doc_id}`}</div>
-                <div className="text-muted" style={{ fontSize: '0.8rem' }}>
-                  doc {entry.doc_id}, chunk {entry.chunk_id}
-                  {entry.language ? ` · lang ${entry.language}` : ''}
-                  {typeof entry.score_dense === 'number' ? ` · dense ${formatScore(entry.score_dense)}` : ''}
-                  {typeof entry.score_sparse === 'number' ? ` · sparse ${formatScore(entry.score_sparse)}` : ''}
-                  {typeof entry.combined_score === 'number' ? ` · combined ${formatScore(entry.combined_score)}` : ''}
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <div className="fw-semibold">Контекст RAG</div>
+            {ragRisk && (
+              <span className={`badge bg-${riskMeta.badge}`}>Риск: {riskMeta.label}{typeof riskScorePct === 'number' ? ` · ${riskScorePct}%` : ''}</span>
+            )}
+          </div>
+          {ragRisk && (
+            <div className={`alert alert-${riskMeta.badge} mb-3`} role="status">
+              <div className="fw-semibold">Оценка риска ответа</div>
+              {typeof riskScorePct === 'number' && (
+                <div className="small">Индекс риска: {riskScorePct}%</div>
+              )}
+              {ragRetry && (
+                <div className="small text-success mt-1">Выполнен автоповтор RAG с расширенным контекстом.</div>
+              )}
+              {riskReasons.length > 0 && (
+                <div className="small mt-1">Причины: {riskReasons.join(', ')}</div>
+              )}
+              {flaggedList && (
+                <div className="small mt-1">Проверьте ссылки: {flaggedList}</div>
+              )}
+              {topRiskSections.length > 0 && (
+                <div className="small mt-2">
+                  <div className="fw-semibold" style={{ fontSize: '0.8rem' }}>Ключевые секции</div>
+                  <ul className="mb-0 ps-3">
+                    {topRiskSections.map((sec, index) => (
+                      <li key={`${sec.doc_id}-${sec.chunk_id}-${index}`}>
+                        doc {sec.doc_id}, chunk {sec.chunk_id}
+                        {typeof sec.combined_score === 'number' ? ` · score ${formatScore(sec.combined_score)}` : ''}
+                        {sec.reasoning_hint && (
+                          <div className="text-muted">{sec.reasoning_hint}</div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
                 </div>
-                {entry.translation_hint && (
-                  <div className="text-warning" style={{ fontSize: '0.8rem' }}>{entry.translation_hint}</div>
-                )}
-                {entry.preview && (
-                  <div className="text-muted" style={{ fontSize: '0.85rem' }} dangerouslySetInnerHTML={renderMultiline(entry.preview, 400)} />
-                )}
-                {entry.content && (
-                  <div className="mt-1" style={{ fontSize: '0.85rem', background: 'rgba(0,0,0,0.03)', borderRadius: 4, padding: '8px 10px' }}
-                    dangerouslySetInnerHTML={renderMultiline(entry.content, 800)}
-                  />
-                )}
-                {entry.url && (
-                  <div className="mt-1">
-                    <a href={`/preview/${encodeURIComponent(entry.url)}?embedded=1`} target="_blank" rel="noopener">Открыть документ</a>
-                  </div>
-                )}
-              </li>
-            ))}
-          </ol>
+              )}
+            </div>
+          )}
+          {displayedSources.length > 0 && (
+            <div className="mb-3">
+              <div className="fw-semibold" style={{ fontSize: '0.9rem' }}>Использованные разделы</div>
+              <ol className="mb-0 ps-3">
+                {displayedSources.map((source, index) => (
+                  <li key={`${source.doc_id}-${source.chunk_id}-${index}`} className="text-muted" style={{ fontSize: '0.85rem' }}>
+                    doc {source.doc_id}, chunk {source.chunk_id}
+                    {source.section_path ? ` · ${source.section_path}` : ''}
+                    {typeof source.combined_score === 'number' ? ` · score ${formatScore(source.combined_score)}` : ''}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+          {ragContext?.length ? (
+            <ol className="mb-0 ps-3">
+              {ragContext.map((entry, idx) => {
+                const flagged = flaggedRefs.has(`${entry.doc_id}:${entry.chunk_id}`)
+                const extra = entry.extra && typeof entry.extra === 'object' ? entry.extra : {}
+                const keywordsText = typeof (extra as any)?.keywords === 'string' ? String((extra as any).keywords) : ''
+                const extraEntries = Object.entries(extra || {}).filter(([key, value]) => {
+                  if (key === 'section_path' || key === 'keywords' || key === 'LLM сниппет') return false
+                  return typeof value === 'string' && value
+                }) as [string, string][]
+                return (
+                  <li key={`${entry.doc_id}-${entry.chunk_id}-${idx}`} className="mb-3">
+                    <div className="fw-semibold">[{idx + 1}] {entry.title || `Документ ${entry.doc_id}`}</div>
+                    <div className="text-muted" style={{ fontSize: '0.8rem' }}>
+                      doc {entry.doc_id}, chunk {entry.chunk_id}
+                      {entry.language ? ` · lang ${entry.language}` : ''}
+                      {typeof entry.score_dense === 'number' ? ` · dense ${formatScore(entry.score_dense)}` : ''}
+                      {typeof entry.score_sparse === 'number' ? ` · sparse ${formatScore(entry.score_sparse)}` : ''}
+                      {typeof entry.combined_score === 'number' ? ` · combined ${formatScore(entry.combined_score)}` : ''}
+                      {flagged && <span className="badge bg-danger-subtle text-danger ms-2">Проверить цитату</span>}
+                    </div>
+                    {entry.section_path && (
+                      <div className="text-muted" style={{ fontSize: '0.8rem' }}>Раздел: {entry.section_path}</div>
+                    )}
+                    {entry.translation_hint && (
+                      <div className="text-warning" style={{ fontSize: '0.8rem' }}>{entry.translation_hint}</div>
+                    )}
+                    {keywordsText && (
+                      <div className="text-muted" style={{ fontSize: '0.8rem' }}>Ключевые слова: {keywordsText}</div>
+                    )}
+                    {extraEntries.length > 0 && (
+                      <ul className="mb-1" style={{ fontSize: '0.75rem', color: '#6c757d' }}>
+                        {extraEntries.map(([key, value]) => (
+                          <li key={key}><strong>{key}:</strong> {value}</li>
+                        ))}
+                      </ul>
+                    )}
+                    {entry.preview && (
+                      <div className="text-muted" style={{ fontSize: '0.85rem' }} dangerouslySetInnerHTML={renderMultiline(entry.preview, 400)} />
+                    )}
+                    {entry.content && (
+                      <div className="mt-1" style={{ fontSize: '0.85rem', background: 'rgba(0,0,0,0.03)', borderRadius: 4, padding: '8px 10px' }}
+                        dangerouslySetInnerHTML={renderMultiline(entry.content, 800)}
+                      />
+                    )}
+                    {entry.url && (
+                      <div className="mt-1">
+                        <a href={`/preview/${encodeURIComponent(entry.url)}?embedded=1`} target="_blank" rel="noopener">Открыть документ</a>
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
+            </ol>
+          ) : (
+            <div className="text-muted" style={{ fontSize: '0.85rem' }}>Контекст не сформирован.</div>
+          )}
         </div>
       )}
     </>

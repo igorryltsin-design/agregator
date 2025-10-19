@@ -83,6 +83,9 @@ class AppConfig:
     prompts: Dict[str, str]
     summarize_audio: bool
     audio_keywords_llm: bool
+    ai_query_variants_max: int
+    ai_rag_retry_enabled: bool
+    ai_rag_retry_threshold: float
     fw_cache_dir: Path
     settings_store_path: Path
     search_facet_tag_keys: Optional[List[str]]
@@ -351,6 +354,9 @@ class AppConfig:
             lmstudio_model=os.getenv("LMSTUDIO_MODEL", "google/gemma-3n-e4b"),
             lmstudio_api_key=os.getenv("LMSTUDIO_API_KEY", ""),
             lm_default_provider=(os.getenv("LM_PROVIDER") or "openai").strip().lower() or "openai",
+            ai_query_variants_max=int(os.getenv("AI_QUERY_VARIANTS_MAX", "1") or 1),
+            ai_rag_retry_enabled=_getenv_bool("AI_RAG_RETRY_ENABLED", True),
+            ai_rag_retry_threshold=float(os.getenv("AI_RAG_RETRY_THRESHOLD", "0.6") or 0.6),
             rag_embedding_backend=(os.getenv("RAG_EMBEDDING_BACKEND") or "lm-studio").strip().lower() or "lm-studio",
             rag_embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5-GGUF"),
             rag_embedding_dim=int(os.getenv("RAG_EMBEDDING_DIM", "768") or 768),

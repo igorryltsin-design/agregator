@@ -44,6 +44,7 @@ export default function AdminCollectionsPage() {
   const [clearLoading, setClearLoading] = useState(false)
   const [exportLoading, setExportLoading] = useState(false)
   const [ragLoading, setRagLoading] = useState(false)
+  const [ragDeleteLoading, setRagDeleteLoading] = useState(false)
   const [memberForm, setMemberForm] = useState<{ username: string; role: string; userId: number | null }>({ username: '', role: 'viewer', userId: null })
   const [memberOptions, setMemberOptions] = useState<UserSuggestion[]>([])
   const [memberLookupLoading, setMemberLookupLoading] = useState(false)
@@ -212,6 +213,30 @@ export default function AdminCollectionsPage() {
       toasts.push('Ошибка при запуске RAG индексации', 'error')
     } finally {
       setRagLoading(false)
+    }
+  }
+
+  const deleteRagIndex = async () => {
+    if (!selectedId) return
+    if (!confirm('Удалить RAG индекс для всех файлов выбранной коллекции?')) return
+    setRagDeleteLoading(true)
+    try {
+      const r = await fetch(`/api/collections/${selectedId}/rag/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        const message = typeof data.message === 'string' ? data.message : 'RAG индекс удалён.'
+        toasts.push(message, data?.removed_documents ? 'success' : 'info')
+      } else {
+        toasts.push(data?.error || 'Не удалось удалить RAG индекс', 'error')
+      }
+    } catch {
+      toasts.push('Ошибка при удалении RAG индекса', 'error')
+    } finally {
+      setRagDeleteLoading(false)
     }
   }
 
@@ -458,19 +483,27 @@ export default function AdminCollectionsPage() {
                   </button>
                   {isAdmin && (
                     <div className="btn-group btn-group-sm">
-                      <button
-                        type="button"
-                        className="btn btn-outline-secondary"
-                        onClick={rebuildRag}
-                        disabled={ragLoading}
-                      >
-                        {ragLoading ? '...' : 'RAG индекс'}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline-secondary"
-                        onClick={rescanCollection}
-                        disabled={rescanLoading}
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary"
+                    onClick={rebuildRag}
+                    disabled={ragLoading}
+                  >
+                    {ragLoading ? '...' : 'RAG индекс'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-danger"
+                    onClick={deleteRagIndex}
+                    disabled={ragDeleteLoading}
+                  >
+                    {ragDeleteLoading ? '...' : 'Удалить RAG'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary"
+                    onClick={rescanCollection}
+                    disabled={rescanLoading}
                       >
                         {rescanLoading ? '...' : 'Пересканировать'}
                       </button>

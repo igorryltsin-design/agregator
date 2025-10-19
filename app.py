@@ -7,15 +7,16 @@ import hmac
 import logging
 from logging.handlers import RotatingFileHandler
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 import itertools
 import copy
+import queue
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
 
 import click
-from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app, has_app_context
+from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app, has_app_context, stream_with_context
 from functools import wraps
 from werkzeug.utils import secure_filename
 import sqlite3
@@ -144,6 +145,7 @@ from agregator.rag import (
     ValidationResult,
     RagIndexer,
     VectorRetriever,
+    RetrievedChunk,
     EmbeddingBackend,
     load_embedding_backend,
     vector_to_bytes,
@@ -152,6 +154,7 @@ from agregator.rag import (
     fallback_answer,
     validate_answer,
     detect_language,
+    extract_citations,
 )
 try:
     import docx
@@ -311,6 +314,7 @@ def _refresh_runtime_globals() -> None:
             'DEFAULT_USE_LLM',
             'DEFAULT_PRUNE',
             'AI_RERANK_LLM',
+            'AI_RAG_RETRY_ENABLED',
             'LLM_CACHE_ENABLED',
             'LLM_CACHE_ONLY_MODE',
             'SEARCH_CACHE_ENABLED',
@@ -352,6 +356,8 @@ _RUNTIME_ATTR_MAP = {
     'ALWAYS_OCR_FIRST_PAGE_DISSERTATION': 'always_ocr_first_page_dissertation',
     'PROMPTS': 'prompts',
     'AI_RERANK_LLM': 'ai_rerank_llm',
+    'AI_RAG_RETRY_ENABLED': 'ai_rag_retry_enabled',
+    'AI_RAG_RETRY_THRESHOLD': 'ai_rag_retry_threshold',
     'LLM_CACHE_ENABLED': 'llm_cache_enabled',
     'LLM_CACHE_TTL_SECONDS': 'llm_cache_ttl_seconds',
     'LLM_CACHE_MAX_ITEMS': 'llm_cache_max_items',
@@ -362,6 +368,7 @@ _RUNTIME_ATTR_MAP = {
     'LM_MAX_INPUT_CHARS': 'lm_max_input_chars',
     'LM_MAX_OUTPUT_TOKENS': 'lm_max_output_tokens',
     'AZURE_OPENAI_API_VERSION': 'azure_openai_api_version',
+    'AI_QUERY_VARIANTS_MAX': 'ai_query_variants_max',
     'SEARCH_FACET_TAG_KEYS': 'search_facet_tag_keys',
     'GRAPH_FACET_TAG_KEYS': 'graph_facet_tag_keys',
     'SEARCH_FACET_INCLUDE_TYPES': 'search_facet_include_types',
@@ -446,6 +453,7 @@ _RUNTIME_ATTR_MAP = {
     'LM_MAX_INPUT_CHARS': 'lm_max_input_chars',
     'LM_MAX_OUTPUT_TOKENS': 'lm_max_output_tokens',
     'AZURE_OPENAI_API_VERSION': 'azure_openai_api_version',
+    'AI_QUERY_VARIANTS_MAX': 'ai_query_variants_max',
     'SEARCH_FACET_TAG_KEYS': 'search_facet_tag_keys',
     'GRAPH_FACET_TAG_KEYS': 'graph_facet_tag_keys',
     'SEARCH_FACET_INCLUDE_TYPES': 'search_facet_include_types',
@@ -903,6 +911,17 @@ def _row_text_for_search(f: File) -> str:
 # Простое кэширующее хранилище в памяти для расширения ключевых слов ИИ
 AI_EXPAND_CACHE: dict[str, tuple[float, list[str], list[tuple[str, int]]]] = {}
 AI_KEYWORD_PLAN_CACHE: dict[str, tuple[float, Dict[str, List[str]]]] = {}
+QUERY_VARIANT_CACHE: dict[str, tuple[float, List[str]]] = {}
+AUTHORITY_GRAPH_CACHE: dict[str, tuple[float, Dict[int, float]]] = {}
+
+try:
+    QUERY_VARIANT_TTL = float(os.getenv("AI_QUERY_VARIANT_TTL", "600") or 600.0)
+except Exception:
+    QUERY_VARIANT_TTL = 600.0
+try:
+    AUTHORITY_GRAPH_TTL = float(os.getenv("AI_AUTHORITY_TTL", "1800") or 1800.0)
+except Exception:
+    AUTHORITY_GRAPH_TTL = 1800.0
 
 # Весовые коэффициенты и параметры оценки (можно менять через переменные окружения)
 def _getf(name: str, default: float) -> float:
@@ -5681,6 +5700,12 @@ def api_settings():
         _set('PROMPTS', data.get('prompts'))
     if 'ai_rerank_llm' in data:
         _set('AI_RERANK_LLM', data.get('ai_rerank_llm'))
+    if 'ai_query_variants_max' in data:
+        _set('AI_QUERY_VARIANTS_MAX', data.get('ai_query_variants_max'))
+    if 'ai_rag_retry_enabled' in data:
+        _set('AI_RAG_RETRY_ENABLED', data.get('ai_rag_retry_enabled'))
+    if 'ai_rag_retry_threshold' in data:
+        _set('AI_RAG_RETRY_THRESHOLD', data.get('ai_rag_retry_threshold'))
     if 'llm_cache_enabled' in data:
         _set('LLM_CACHE_ENABLED', data.get('llm_cache_enabled'))
     if 'llm_cache_ttl_seconds' in data:
@@ -7140,6 +7165,31 @@ def _read_text_file_with_fallback(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def _sanitize_plain_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _CONTROL_CHAR_RE.sub(" ", text)
+    cleaned = "".join(ch if ch.isprintable() or ch in "\n\r\t" else " " for ch in cleaned)
+    cleaned = cleaned.replace("\ufffd", " ")
+    return cleaned
+
+
+def _looks_like_binary_text(text: str) -> bool:
+    if not text:
+        return False
+    sample = text[:4000]
+    nulls = sample.count("\x00")
+    if nulls > 0:
+        return True
+    control = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\n\r\t")
+    if control / max(1, len(sample)) > 0.1:
+        return True
+    return False
+
+
 def _extract_text_for_rag(path: Path, *, limit_chars: int = 120_000) -> str:
     ext = path.suffix.lower().lstrip(".")
     if ext == "pdf":
@@ -7199,8 +7249,13 @@ def _collect_text_for_rag(file_obj: File, *, limit_chars: int = 120_000) -> tupl
         try:
             if not candidate.exists() or not candidate.is_file():
                 continue
-            text = _extract_text_for_rag(candidate, limit_chars=limit_chars)
-            if text and text.strip():
+            raw_text = _extract_text_for_rag(candidate, limit_chars=limit_chars)
+            if _looks_like_binary_text(raw_text or ""):
+                continue
+            text = _sanitize_plain_text(raw_text)
+            if not text.strip():
+                continue
+            if text:
                 return text, candidate
         except Exception as exc:
             last_error = exc
@@ -7587,6 +7642,7 @@ def _serialize_context_section(section: ContextSection) -> Dict[str, Any]:
         "chunk_id": section.chunk_id,
         "title": section.title,
         "language": section.language,
+        "section_path": section.extra.get("Раздел") or section.extra.get("section_path"),
         "translation_hint": section.translation_hint,
         "score_dense": section.score_dense,
         "score_sparse": section.score_sparse,
@@ -7597,6 +7653,66 @@ def _serialize_context_section(section: ContextSection) -> Dict[str, Any]:
         "content": section.content,
         "url": section.url,
         "extra": section.extra,
+    }
+
+
+def _assess_rag_risk(
+    answer_text: str,
+    validation: "ValidationResult",
+    sections: Sequence[ContextSection],
+) -> Dict[str, Any]:
+    risk_score = 0.0
+    reasons: List[str] = []
+    if not sections:
+        risk_score += 0.5
+        reasons.append("no_context")
+    if validation.is_empty:
+        risk_score += 0.5
+        reasons.append("empty_answer")
+    if validation.missing_citations:
+        risk_score += 0.25
+        reasons.append("missing_citations")
+    if validation.unknown_citations:
+        risk_score += 0.25
+        reasons.append("unknown_citations")
+    if validation.extra_citations:
+        risk_score += 0.15
+        reasons.append("extra_citations")
+    if validation.hallucination_warning and "hallucination_warning" not in reasons:
+        risk_score += 0.15
+        reasons.append("hallucination_warning")
+    citations_total = len(extract_citations(answer_text))
+    if sections and citations_total < len(sections) // 2:
+        risk_score += 0.1
+        reasons.append("low_coverage")
+    risk_score = min(1.0, risk_score)
+    if risk_score >= 0.6:
+        level = "high"
+    elif risk_score >= 0.3:
+        level = "medium"
+    else:
+        level = "low"
+    flagged_refs = sorted({(int(doc), int(chunk)) for doc, chunk in validation.unknown_citations + validation.extra_citations})
+    flagged = [
+        {"doc_id": doc_id, "chunk_id": chunk_id}
+        for doc_id, chunk_id in flagged_refs
+    ]
+    top_sections = [
+        {
+            "doc_id": sec.doc_id,
+            "chunk_id": sec.chunk_id,
+            "combined_score": round(sec.combined_score, 4),
+            "reasoning_hint": sec.reasoning_hint,
+        }
+        for sec in sections[:5]
+    ]
+    return {
+        "score": round(risk_score, 3),
+        "level": level,
+        "reasons": reasons,
+        "flagged_refs": flagged,
+        "hallucination_warning": bool(validation.hallucination_warning),
+        "top_sections": top_sections,
     }
 
 
@@ -7941,6 +8057,17 @@ def _prepare_rag_context(
             progress.add("RAG: нет документов, готовых для RAG-индекса")
         notes.append("Нет документов, подготовленных для RAG-индексации.")
         return None, notes
+    allowed_scope = getattr(g, 'allowed_collection_ids', None)
+    try:
+        global_authority_scores = _compute_authority_scores(allowed_scope)
+    except Exception:
+        global_authority_scores = {}
+    file_authority_scores: Dict[int, float] = {}
+    if global_authority_scores:
+        for doc in documents:
+            fid = getattr(doc, 'file_id', None)
+            if fid and fid in global_authority_scores:
+                file_authority_scores[int(fid)] = float(global_authority_scores.get(fid, 0.0))
     variant = _select_rag_embedding_variant(doc_ids)
     if not variant:
         if progress:
@@ -7977,19 +8104,44 @@ def _prepare_rag_context(
             progress.add("RAG: не удалось инициализировать backend эмбеддингов")
         notes.append("Не удалось инициализировать backend эмбеддингов.")
         return None, notes
+    variant_limit = max(0, int(getattr(_rt(), "ai_query_variants_max", 0) or 0))
+    if variant_boost:
+        variant_limit += max(0, int(variant_boost))
+    variant_limit = min(variant_limit, 6)
+    query_variants: List[str] = [query]
+    if variant_limit > 0:
+        try:
+            extra_variants = _generate_query_variants(query, max_variants=variant_limit)
+        except Exception as exc:
+            app.logger.debug("Query variants generation error: %s", exc)
+            extra_variants = []
+        seen_variants = {query.strip().lower()}
+        for variant_text in extra_variants:
+            normalized_variant = variant_text.strip()
+            if not normalized_variant:
+                continue
+            lower = normalized_variant.lower()
+            if lower in seen_variants:
+                continue
+            seen_variants.add(lower)
+            query_variants.append(normalized_variant)
     backend_name_label = ""
+    vector_map: Dict[str, Sequence[float]] = {}
     try:
-        vectors = backend.embed_many([query]) or []
-        if vectors:
-            query_vector = vectors[0]
-        else:
-            query_vector = [0.0] * (dim or 384)
+        vectors = backend.embed_many(query_variants) or []
+        for text, vec in zip(query_variants, vectors):
+            vector_map[text] = vec
+        query_vector = vector_map.get(query)
+        if query_vector is None:
+            query_vector = vectors[0] if vectors else [0.0] * (dim or 384)
         backend_name_label = getattr(backend, "name", getattr(backend, "model_name", "embedding-backend"))
     except Exception as exc:
         if progress:
             progress.add(f"RAG: не удалось вычислить эмбеддинг запроса ({exc})")
         notes.append(f"Не удалось вычислить эмбеддинг запроса ({exc}).")
         query_vector = [0.0] * (dim or 384)
+        vector_map = {query: query_vector}
+        query_variants = [query]
     finally:
         try:
             backend.close()
@@ -7998,13 +8150,19 @@ def _prepare_rag_context(
     if backend_name_label:
         notes.append(f"Эмбеддинги: backend {backend_name_label}")
     language_filters = [lang.lower() for lang in (language_filters or [])] or None
+    query_terms: List[str] = []
+    for variant_text in query_variants:
+        for token in _tokenize_query(variant_text):
+            if token not in query_terms:
+                query_terms.append(token)
+    dense_multiplier = max(1.0, float(dense_boost or 1.0))
     vector_retriever = VectorRetriever(
         model_name=model_name,
         model_version=model_version,
-        max_candidates=min(500, max_chunks * 40),
+        max_candidates=min(500, int(max_chunks * 40 * dense_multiplier)),
     )
     keyword_retriever = KeywordRetriever(
-        limit=300,
+        limit=int(300 * dense_multiplier),
         search_service=search_service,
         expand_terms_fn=_expand_synonyms,
         lemma_fn=_lemma,
@@ -8017,17 +8175,36 @@ def _prepare_rag_context(
         sparse_weight=0.6,
         doc_penalty=0.2,
         max_per_document=2,
-        dense_top_k=max_chunks * 3,
-        sparse_limit=300,
+        dense_top_k=max(1, int(max_chunks * 3 * dense_multiplier)),
+        sparse_limit=int(300 * dense_multiplier),
         max_total_tokens=_lm_safe_context_tokens(),
         rerank_fn=rag_reranker,
     )
+    dense_hits_override: Optional[List[RetrievedChunk]] = None
+    if len(query_variants) > 1:
+        variant_pairs: List[Tuple[str, Sequence[float]]] = []
+        for text in query_variants:
+            vec = vector_map.get(text)
+            if vec:
+                variant_pairs.append((text, vec))
+        if len(variant_pairs) > 1:
+            dense_hits_override = _rrf_combine_dense_hits(
+                vector_retriever,
+                variant_pairs,
+                allowed_document_ids=doc_ids,
+                top_k=max(1, int(max_chunks * 3 * dense_multiplier)),
+            )
+            if dense_hits_override:
+                notes.append(f"RAG: использовано {len(variant_pairs)} формулировок запроса")
     contexts = selector.select(
         query,
         query_vector,
         top_k=max_chunks,
         languages=language_filters,
         allowed_document_ids=doc_ids,
+        precomputed_dense_hits=dense_hits_override,
+        query_terms=query_terms,
+        authority_scores=file_authority_scores if file_authority_scores else None,
     )
     if rag_reranker:
         cfg = getattr(rag_reranker, "_config", None)
@@ -8065,9 +8242,19 @@ def _prepare_rag_context(
                 if snippet_text:
                     preview_text = snippet_text[:200]
         extra_fields: Dict[str, Any] = {
-            "section_path": cand.chunk.section_path or "",
+            "section_path": cand.section_path or cand.chunk.section_path or "",
             "keywords": cand.chunk.keywords_top or "",
         }
+        if cand.section_path:
+            extra_fields["Раздел"] = cand.section_path
+        if cand.structure_bonus:
+            extra_fields["Структурный вес"] = f"{cand.structure_bonus:.3f}"
+        if cand.metadata_bonus:
+            extra_fields["Метаданные вес"] = f"{cand.metadata_bonus:.3f}"
+        if cand.metadata_hits:
+            extra_fields["Совпадения метаданных"] = ", ".join(cand.metadata_hits[:5])
+        if cand.authority_bonus:
+            extra_fields["Вес авторитета"] = f"{cand.authority_bonus:.3f}"
         if file_obj is not None:
             if getattr(file_obj, "author", None):
                 extra_fields["Автор"] = file_obj.author
@@ -8148,8 +8335,15 @@ def _store_rag_session(
     validation: "ValidationResult",
     model_name: Optional[str],
     params: Optional[Dict[str, Any]],
+    sources: Sequence[Dict[str, Any]],
+    risk: Dict[str, Any],
 ) -> Optional[int]:
     try:
+        validation_payload = {
+            "validation": validation.as_dict(),
+            "risk": risk,
+            "sources": list(sources),
+        }
         record = RagSession(
             query=query,
             query_lang=(query_lang or "")[:16],
@@ -8157,7 +8351,7 @@ def _store_rag_session(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             answer=answer,
-            validation=json.dumps(validation.as_dict(), ensure_ascii=False),
+            validation=json.dumps(validation_payload, ensure_ascii=False),
             model_name=model_name,
             params=json.dumps(params or {}, ensure_ascii=False),
         )
@@ -8244,6 +8438,19 @@ def _generate_rag_answer(
         progress.add(f"RAG валидация: неизвестные ссылки {validation.unknown_citations}")
     if validation.extra_citations and progress:
         progress.add(f"RAG валидация: лишние ссылки {validation.extra_citations}")
+    sources_payload = [
+        {
+            "doc_id": sec.doc_id,
+            "chunk_id": sec.chunk_id,
+            "title": sec.title,
+            "section_path": sec.extra.get("Раздел") or sec.extra.get("section_path"),
+            "combined_score": round(sec.combined_score, 4),
+        }
+        for sec in sections
+    ]
+    risk_info = _assess_rag_risk(answer, validation, sections)
+    bundle["risk"] = risk_info
+    bundle["sources"] = sources_payload
     session_id = _store_rag_session(
         query=query,
         query_lang=bundle.get("query_lang"),
@@ -8259,6 +8466,8 @@ def _generate_rag_answer(
             "model_version": bundle.get("model_version"),
             "lm_model": getattr(_rt(), "lmstudio_model", None),
         },
+        sources=sources_payload,
+        risk=risk_info,
     )
     if session_id and progress:
         progress.add(f"RAG сессия сохранена (id={session_id})")
@@ -8311,6 +8520,60 @@ def init_db():
             added += 1
     db.session.commit()
     print(f"DB initialized. Added {added} tag schema rows (existing preserved).")
+
+
+def _delete_rag_index_for_collection(collection_id: int) -> Dict[str, int]:
+    files: List[File] = list(File.query.filter(File.collection_id == collection_id).all())
+    stats = {
+        "affected_files": 0,
+        "removed_documents": 0,
+        "removed_chunks": 0,
+        "removed_embeddings": 0,
+        "removed_versions": 0,
+        "removed_snippets": 0,
+    }
+    if not files:
+        return stats
+    file_ids = [f.id for f in files if getattr(f, "id", None)]
+    for file_obj in files:
+        doc = getattr(file_obj, "rag_document", None)
+        if not doc:
+            continue
+        stats["affected_files"] += 1
+        chunk_ids = [chunk.id for chunk in list(getattr(doc, "chunks", []) or []) if chunk.id]
+        if chunk_ids:
+            deleted_embeddings = (
+                db.session.query(RagChunkEmbedding)
+                .filter(RagChunkEmbedding.chunk_id.in_(chunk_ids))
+                .delete(synchronize_session=False)
+            )
+            stats["removed_embeddings"] += int(deleted_embeddings or 0)
+            deleted_chunks = (
+                db.session.query(RagDocumentChunk)
+                .filter(RagDocumentChunk.document_id == doc.id)
+                .delete(synchronize_session=False)
+            )
+            stats["removed_chunks"] += int(deleted_chunks or 0)
+        deleted_versions = (
+            db.session.query(RagDocumentVersion)
+            .filter(RagDocumentVersion.document_id == doc.id)
+            .delete(synchronize_session=False)
+        )
+        stats["removed_versions"] += int(deleted_versions or 0)
+        db.session.delete(doc)
+        try:
+            file_obj.rag_document = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        stats["removed_documents"] += 1
+    if file_ids:
+        deleted_snippets = (
+            db.session.query(AiSearchSnippetCache)
+            .filter(AiSearchSnippetCache.file_id.in_(file_ids))
+            .delete(synchronize_session=False)
+        )
+        stats["removed_snippets"] += int(deleted_snippets or 0)
+    return stats
 
 
 @app.cli.command("rag-ingest-file")
@@ -9426,6 +9689,31 @@ def api_collection_clear(collection_id: int):
     if errors:
         app.logger.warning(f"[collections] clear reported {len(errors)} issues for collection {collection_id}: {errors[:3]}")
     return jsonify({'ok': True, 'removed_files': removed_files, 'errors': errors})
+
+
+@app.route('/api/collections/<int:collection_id>/rag/delete', methods=['POST'])
+@require_admin
+def api_collection_rag_delete(collection_id: int):
+    col = Collection.query.get_or_404(collection_id)
+    try:
+        stats = _delete_rag_index_for_collection(collection_id)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.exception("Failed to delete RAG index for collection %s", collection_id)
+        return jsonify({'ok': False, 'error': f'Не удалось удалить RAG индекс: {exc}'}), 500
+    actor = _load_current_user()
+    try:
+        detail = json.dumps(stats, ensure_ascii=False)
+    except Exception:
+        detail = None
+    _log_user_action(actor, 'collection_rag_delete', 'collection', col.id, detail=detail)
+    if stats.get('removed_documents'):
+        message = f"Удалено RAG документов: {stats['removed_documents']}, чанков: {stats.get('removed_chunks', 0)}"
+    else:
+        message = 'RAG индекс для коллекции не найден.'
+    stats.update({'ok': True, 'message': message})
+    return jsonify(stats)
 
 
 @app.route('/api/collections/<int:collection_id>/rag/reindex', methods=['POST'])
@@ -10741,6 +11029,270 @@ def _plan_search_keywords(
     return data
 
 
+def _generate_query_variants(query: str, *, max_variants: int = 2) -> List[str]:
+    max_variants = max(0, int(max_variants or 0))
+    query = (query or "").strip()
+    if not query or max_variants <= 0:
+        return []
+    key = query.lower()
+    now = time.monotonic()
+    cached = QUERY_VARIANT_CACHE.get(key)
+    if cached and (now - cached[0]) < QUERY_VARIANT_TTL:
+        cached_list = cached[1]
+        return cached_list[:max_variants]
+
+    system = (
+        "Ты помощник интеллектуального поиска. Получив исходный вопрос, "
+        "верни JSON-массив из 1-3 альтернативных формулировок, которые сохраняют смысл, "
+        "могут использовать синонимы и уточнять ключевые сущности. Без комментариев."
+    )
+    user = (
+        f"Запрос: {query}\n"
+        f"Сформируй до {max_variants} разных формулировок (если невозможно — верни пустой массив)."
+    )
+    variants: List[str] = []
+    raw = ""
+    try:
+        raw = call_lmstudio_compose(system, user, temperature=0.15, max_tokens=160)
+    except Exception as exc:
+        app.logger.debug("Query variant generation failed: %s", exc)
+        raw = ""
+    parsed = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            match = re.search(r"\[.*\]", raw, flags=re.S)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except Exception:
+                    parsed = None
+    if isinstance(parsed, list):
+        variants = [str(item).strip() for item in parsed if str(item).strip()]
+    if not variants and raw:
+        for line in raw.splitlines():
+            candidate = line.strip().lstrip("-•0123456789. ")
+            if candidate:
+                variants.append(candidate)
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for candidate in variants:
+        cand = candidate.strip()
+        if not cand:
+            continue
+        lower = cand.lower()
+        if lower == key or lower in seen:
+            continue
+        seen.add(lower)
+        normalized.append(cand)
+        if len(normalized) >= max_variants:
+            break
+    if not normalized and len(query.split()) > 2:
+        # fallback: переставляем порядок слов и добавляем ключевую фразу
+        tokens = query.split()
+        alt = " ".join(sorted(tokens, key=str.lower))
+        if alt.lower() != key:
+            normalized.append(alt)
+    QUERY_VARIANT_CACHE[key] = (now, normalized)
+    return normalized
+
+
+def _normalize_author_name(name: str) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"\s+", " ", raw)
+    return cleaned.lower()
+
+
+def _normalize_tag_value(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"\s+", " ", raw)
+    return cleaned.lower()
+
+
+def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = None) -> Dict[int, float]:
+    scope_key = "*"
+    allowed_set: Optional[frozenset[int]] = None
+    if allowed_collections is not None:
+        allowed_set = frozenset(int(cid) for cid in allowed_collections)
+        scope_key = ",".join(str(cid) for cid in sorted(allowed_set)) or "none"
+    now = time.monotonic()
+    cached = AUTHORITY_GRAPH_CACHE.get(scope_key)
+    if cached and (now - cached[0]) < AUTHORITY_GRAPH_TTL:
+        return dict(cached[1])
+
+    try:
+        file_query = File.query.outerjoin(Collection, File.collection_id == Collection.id)
+        if allowed_set is not None:
+            if not allowed_set:
+                AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
+                return {}
+            file_query = file_query.filter(File.collection_id.in_(allowed_set))
+        else:
+            file_query = file_query.filter(or_(Collection.searchable == True, Collection.id.is_(None)))
+        files = file_query.all()
+    except Exception as exc:
+        app.logger.debug("Authority graph: failed to fetch files (%s)", exc)
+        files = []
+
+    if not files:
+        AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
+        return {}
+
+    graph: Dict[int, Dict[int, float]] = defaultdict(dict)
+    nodes: set[int] = set()
+    collection_groups: Dict[int, List[int]] = defaultdict(list)
+    author_groups: Dict[str, List[int]] = defaultdict(list)
+    keyword_groups: Dict[str, List[int]] = defaultdict(list)
+
+    for f in files:
+        if not getattr(f, "id", None):
+            continue
+        fid = int(f.id)
+        nodes.add(fid)
+        if f.collection_id:
+            collection_groups[int(f.collection_id)].append(fid)
+        author_clean = _normalize_author_name(f.author or "")
+        if author_clean:
+            author_groups[author_clean].append(fid)
+        keywords_field = (f.keywords or "").strip()
+        if keywords_field:
+            for token in re.split(r"[,;\n]+", keywords_field):
+                kw = _normalize_tag_value(token)
+                if kw:
+                    keyword_groups[kw].append(fid)
+
+    try:
+        tag_query = db.session.query(Tag.file_id, Tag.value).join(File, Tag.file_id == File.id)
+        if allowed_set is not None:
+            tag_query = tag_query.filter(Tag.file_id.in_(nodes))
+        rows = tag_query.all()
+    except Exception:
+        rows = []
+    tag_groups: Dict[str, List[int]] = defaultdict(list)
+    for fid, value in rows:
+        fid = int(fid)
+        if fid not in nodes:
+            continue
+        normalized = _normalize_tag_value(value or "")
+        if normalized:
+            tag_groups[normalized].append(fid)
+
+    def _add_group(group: List[int], weight: float) -> None:
+        if len(group) < 2:
+            return
+        capped = group[:200]
+        for i, a in enumerate(capped):
+            for b in capped[i + 1:]:
+                if a == b:
+                    continue
+                graph[a][b] = graph[a].get(b, 0.0) + weight
+                graph[b][a] = graph[b].get(a, 0.0) + weight
+
+    for members in collection_groups.values():
+        _add_group(members, 0.4)
+    for members in author_groups.values():
+        _add_group(members, 0.8)
+    for members in keyword_groups.values():
+        _add_group(members, 0.3)
+    for members in tag_groups.values():
+        _add_group(members, 0.6)
+
+    if not graph:
+        AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
+        return {}
+
+    damping = 0.85
+    max_iter = 20
+    min_delta = 1e-6
+    all_nodes = set(graph.keys())
+    for neighbors in graph.values():
+        all_nodes.update(neighbors.keys())
+    N = len(all_nodes)
+    if N == 0:
+        AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
+        return {}
+    base = (1.0 - damping) / N
+    scores = {node: 1.0 / N for node in all_nodes}
+    for _ in range(max_iter):
+        new_scores = {node: base for node in all_nodes}
+        for node in all_nodes:
+            neighbors = graph.get(node, {})
+            if not neighbors:
+                share = scores[node] * damping / N
+                for target in new_scores:
+                    new_scores[target] += share
+                continue
+            weight_sum = sum(neighbors.values()) or 1.0
+            for target, weight in neighbors.items():
+                new_scores[target] += damping * scores[node] * (weight / weight_sum)
+        diff = sum(abs(new_scores[n] - scores.get(n, 0.0)) for n in all_nodes)
+        scores = new_scores
+        if diff < min_delta:
+            break
+    max_score = max(scores.values()) if scores else 1.0
+    normalized_scores = {node: float(score) / max_score for node, score in scores.items() if score > 0}
+    AUTHORITY_GRAPH_CACHE[scope_key] = (now, normalized_scores)
+    return normalized_scores
+def _rrf_combine_dense_hits(
+    vector_retriever: VectorRetriever,
+    variant_vectors: Sequence[Tuple[str, Sequence[float]]],
+    *,
+    allowed_document_ids: Optional[Sequence[int]],
+    top_k: int,
+) -> List[RetrievedChunk]:
+    rrf_k = 60
+    aggregate: Dict[int, Dict[str, object]] = {}
+    for _variant, vector in variant_vectors:
+        if not vector:
+            continue
+        hits = vector_retriever.search_by_vector(
+            vector,
+            top_k=top_k,
+            allowed_document_ids=allowed_document_ids,
+        )
+        for rank, hit in enumerate(hits, start=1):
+            weight = 1.0 / (rrf_k + rank)
+            entry = aggregate.setdefault(
+                hit.chunk.id,
+                {
+                    "chunk": hit.chunk,
+                    "document": hit.document,
+                    "lang": hit.lang,
+                    "keywords": hit.keywords,
+                    "preview": hit.preview,
+                    "score": 0.0,
+                    "best": hit.score,
+                },
+            )
+            entry["score"] = float(entry.get("score", 0.0)) + weight
+            entry["best"] = max(float(entry.get("best", 0.0)), float(hit.score or 0.0))
+    if not aggregate:
+        return []
+    aggregated_items = sorted(
+        aggregate.values(),
+        key=lambda item: (float(item.get("score", 0.0)), float(item.get("best", 0.0))),
+        reverse=True,
+    )
+    combined: List[RetrievedChunk] = []
+    for item in aggregated_items:
+        combined.append(
+            RetrievedChunk(
+                chunk=item["chunk"],
+                document=item.get("document"),
+                score=float(item.get("score", 0.0)),
+                lang=item.get("lang"),
+                keywords=item.get("keywords"),
+                preview=item.get("preview"),
+            )
+        )
+    return combined
+
+
 def _read_cached_excerpt_for_file(f: File) -> str:
     try:
         # Предпочитаем фрагмент из базы данных
@@ -11773,6 +12325,9 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     rag_session_id: Optional[int] = None
     rag_bundle: Optional[Dict[str, Any]] = None
     rag_notes: list[str] = []
+    rag_risk_info: Optional[Dict[str, Any]] = None
+    rag_sources_payload: List[Dict[str, Any]] = []
+    rag_auto_retry_attempted = False
     context_chunk_limit = max(4, min(8, top_k * 2))
     language_filters = requested_languages if requested_languages else None
     if rag_enabled:
@@ -11802,6 +12357,51 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         )
         durations['llm_answer'] = time.monotonic() - stage_start
         rag_context_sections = rag_bundle.get("sections", [])
+        rag_risk_info = rag_bundle.get("risk")
+        rag_sources_payload = rag_bundle.get("sources", [])
+        retry_enabled = bool(getattr(_rt(), "ai_rag_retry_enabled", True))
+        retry_threshold = float(getattr(_rt(), "ai_rag_retry_threshold", 0.6) or 0.6)
+        initial_score = float(rag_risk_info.get("score", 0.0)) if rag_risk_info else 0.0
+        if retry_enabled and initial_score >= retry_threshold:
+            rag_auto_retry_attempted = True
+            if progress:
+                progress.add(f"RAG автоповтор: риск {initial_score:.2f} ≥ порога {retry_threshold:.2f}, расширяем контекст")
+            rag_notes.append("Автоповтор RAG: риск ответа высокий, расширяем контекст.")
+            retry_chunk_limit = min(max(6, context_chunk_limit + 2), max(6, top_k * 3))
+            retry_bundle, retry_extra_notes = _prepare_rag_context(
+                query,
+                results,
+                language_filters=language_filters,
+                max_chunks=retry_chunk_limit,
+                progress=progress,
+                variant_boost=1,
+                dense_boost=1.4,
+            )
+            if retry_bundle and retry_bundle.get("sections"):
+                rag_notes.extend(retry_extra_notes)
+                stage_start = time.monotonic()
+                answer, rag_validation, rag_session_id, _, _ = _generate_rag_answer(
+                    query,
+                    retry_bundle,
+                    temperature=0.1,
+                    max_tokens=min(350, _lm_max_output_tokens()),
+                    progress=progress,
+                )
+                durations['llm_answer'] = time.monotonic() - stage_start
+                rag_bundle = retry_bundle
+                rag_context_sections = retry_bundle.get("sections", [])
+                rag_risk_info = retry_bundle.get("risk")
+                rag_sources_payload = retry_bundle.get("sources", [])
+                if rag_risk_info:
+                    if progress:
+                        progress.add(f"RAG автоповтор: новый риск {float(rag_risk_info.get('score', 0.0)):.2f}")
+                    rag_notes.append("Автоповтор RAG выполнен: получен обновлённый ответ.")
+                else:
+                    rag_notes.append("Автоповтор RAG выполнен: риск не определён.")
+            else:
+                if progress:
+                    progress.add("RAG автоповтор: не удалось сформировать дополнительный контекст")
+                rag_notes.append("Автоповтор RAG: не удалось подобрать дополнительный контекст.")
     if fallback_required:
         stage_start = time.monotonic()
         if rag_notes:
@@ -11960,6 +12560,8 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         'rag_context_count': len(rag_context_sections),
         'rag_fallback': bool(rag_context_sections) is False and rag_enabled,
         'rag_hallucination_warning': bool(rag_validation and rag_validation.hallucination_warning),
+        'rag_risk_score': float(rag_risk_info.get('score', 0.0)) if rag_risk_info else 0.0,
+        'rag_auto_retry': bool(rag_auto_retry_attempted),
     })
     _record_search_metric(query_hash, durations, user, extra_meta)
 
@@ -11974,10 +12576,13 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         "progress": progress.lines,
         "rag_context": rag_context_payload,
         "rag_validation": rag_validation.as_dict() if rag_validation else None,
+        "rag_risk": rag_risk_info,
+        "rag_sources": rag_sources_payload,
         "rag_session_id": rag_session_id,
         "rag_notes": rag_notes,
         "rag_fallback": bool(rag_context_sections) is False and rag_enabled,
         "rag_enabled": rag_enabled,
+        "rag_retry": bool(rag_auto_retry_attempted),
     }
 
 
@@ -12352,6 +12957,60 @@ def _pipeline_cors_preflight() -> Response:
     return _add_pipeline_cors_headers(response)
 
 
+def _ai_search_stream_response(data: dict) -> Response:
+    """
+    Stream AI search progress via NDJSON events so the frontend can update in real time.
+    """
+    message_queue: queue.Queue = queue.Queue()
+
+    def push(kind: str, payload: Any = None) -> None:
+        message_queue.put((kind, payload))
+
+    def encode(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+    @copy_current_app_context
+    def run_search() -> None:
+        try:
+            result = _ai_search_core(
+                data,
+                progress_cb=lambda line: push('progress', str(line)),
+            )
+            push('complete', {"ok": True, **result})
+        except ValueError as exc:
+            push('error', {"ok": False, "error": str(exc), "status": 400})
+        except Exception as exc:
+            logger.exception("AI search failed", exc_info=True)
+            push('error', {"ok": False, "error": str(exc), "status": 500})
+        finally:
+            push('done')
+
+    threading.Thread(target=run_search, daemon=True).start()
+
+    @stream_with_context
+    def event_stream():
+        while True:
+            try:
+                kind, payload = message_queue.get()
+            except Exception:
+                break
+            if kind == 'done':
+                break
+            if kind == 'progress':
+                yield encode({"type": "progress", "line": str(payload or "")})
+                continue
+            if kind == 'complete':
+                payload = payload or {}
+                yield encode({"type": "complete", "data": payload})
+                continue
+            if kind == 'error':
+                payload = payload or {}
+                yield encode({"type": "error", **payload})
+                continue
+
+    return Response(event_stream(), mimetype="application/x-ndjson")
+
+
 @app.route('/api/training/problem-pipeline', methods=['POST', 'OPTIONS'])
 def api_training_problem_pipeline():
     if request.method == 'OPTIONS':
@@ -12457,6 +13116,10 @@ def api_ai_search():
         )
     except Exception:
         pass
+    stream_flag = str(request.args.get('stream') or '').strip().lower()
+    accept_header = (request.headers.get('Accept') or '').lower()
+    if stream_flag in {'1', 'true', 'yes'} or 'application/x-ndjson' in accept_header:
+        return _ai_search_stream_response(data)
     try:
         result = _ai_search_core(data)
     except ValueError as exc:

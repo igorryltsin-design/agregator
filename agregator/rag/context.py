@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
 from models import RagDocument, RagDocumentChunk
 from .retrieval import RetrievedChunk, VectorRetriever
 from .sparse import KeywordMatch, KeywordRetriever
+
+QUERY_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-я0-9ёЁ]+")
 
 
 @dataclass(slots=True)
@@ -20,6 +24,11 @@ class ContextCandidate:
     adjusted_score: float = 0.0
     matched_terms: List[str] = field(default_factory=list)
     reasoning_hint: str = ""
+    section_path: str = ""
+    structure_bonus: float = 0.0
+    metadata_bonus: float = 0.0
+    metadata_hits: List[str] = field(default_factory=list)
+    authority_bonus: float = 0.0
 
 
 class ContextSelector:
@@ -71,12 +80,18 @@ class ContextSelector:
         languages: Optional[Sequence[str]] = None,
         max_total_tokens: Optional[int] = None,
         allowed_document_ids: Optional[Sequence[int]] = None,
+        precomputed_dense_hits: Optional[Sequence[RetrievedChunk]] = None,
+        query_terms: Optional[Sequence[str]] = None,
+        authority_scores: Optional[Dict[int, float]] = None,
     ) -> List[ContextCandidate]:
-        dense_hits = self.vector_retriever.search_by_vector(
-            query_vector,
-            top_k=self.dense_top_k,
-            allowed_document_ids=allowed_document_ids,
-        )
+        if precomputed_dense_hits is not None:
+            dense_hits = list(precomputed_dense_hits)
+        else:
+            dense_hits = self.vector_retriever.search_by_vector(
+                query_vector,
+                top_k=self.dense_top_k,
+                allowed_document_ids=allowed_document_ids,
+            )
         if languages:
             languages_set = {lang.lower() for lang in languages}
             dense_hits = [
@@ -91,8 +106,15 @@ class ContextSelector:
                 languages=languages,
                 limit=self.sparse_limit,
                 max_per_document=self.max_per_document * 2,
+                query_terms=query_terms,
             )
-        candidates = self._combine_hits(dense_hits, sparse_hits, top_k=top_k, query=query)
+        candidates = self._combine_hits(
+            dense_hits,
+            sparse_hits,
+            top_k=top_k,
+            query=query,
+            authority_scores=authority_scores,
+        )
         for cand in candidates:
             self._estimate_tokens(cand)
         token_limit = max_total_tokens if max_total_tokens is not None else self.max_total_tokens
@@ -107,6 +129,7 @@ class ContextSelector:
         *,
         top_k: int,
         query: str,
+        authority_scores: Optional[Dict[int, float]] = None,
     ) -> List[ContextCandidate]:
         candidates: Dict[int, ContextCandidate] = {}
 
@@ -119,9 +142,14 @@ class ContextSelector:
                     chunk=chunk,
                     document=doc,
                     preview=self._make_preview(chunk),
+                    section_path=(chunk.section_path or "").strip(),
                 ),
             )
             cand.dense_score = max(cand.dense_score, hit.score)
+            if not cand.section_path and getattr(chunk, "section_path", None):
+                cand.section_path = (chunk.section_path or "").strip()
+            if doc and doc.file_id and authority_scores:
+                cand.authority_bonus = max(cand.authority_bonus, float(authority_scores.get(doc.file_id, 0.0)))
 
         for match in sparse_hits:
             chunk = match.chunk
@@ -132,19 +160,29 @@ class ContextSelector:
                     chunk=chunk,
                     document=doc,
                     preview=self._make_preview(chunk),
+                    section_path=(chunk.section_path or "").strip(),
                 ),
             )
             if not cand.preview:
                 cand.preview = self._make_preview(chunk)
+            if not cand.section_path and getattr(chunk, "section_path", None):
+                cand.section_path = (chunk.section_path or "").strip()
             cand.sparse_score = max(cand.sparse_score, match.score)
             if match.matched_terms:
                 cand.matched_terms = match.matched_terms
+            if doc and doc.file_id and authority_scores:
+                cand.authority_bonus = max(cand.authority_bonus, float(authority_scores.get(doc.file_id, 0.0)))
 
         filtered: List[ContextCandidate] = []
+        query_terms = self._query_terms(query)
         for cand in candidates.values():
+            self._enrich_candidate(cand, query_terms)
             cand.combined_score = (
                 self.dense_weight * cand.dense_score
                 + self.sparse_weight * cand.sparse_score
+                + cand.structure_bonus
+                + cand.metadata_bonus
+                + cand.authority_bonus
             )
             cand.reasoning_hint = self._build_reasoning_hint(cand)
             if not self._passes_thresholds(cand):
@@ -212,6 +250,19 @@ class ContextSelector:
                 terms = ", ".join(cand.matched_terms[:4])
                 parts.append(f"keywords={terms}")
             parts.append(f"sparse={cand.sparse_score:.3f}")
+        if cand.structure_bonus:
+            parts.append(f"struct=+{cand.structure_bonus:.3f}")
+        if cand.metadata_bonus:
+            parts.append(f"meta=+{cand.metadata_bonus:.3f}")
+            if cand.metadata_hits:
+                parts.append(f"hits={', '.join(cand.metadata_hits[:3])}")
+        if cand.authority_bonus:
+            parts.append(f"authority=+{cand.authority_bonus:.3f}")
+        if cand.section_path:
+            section = cand.section_path.replace("\n", " ").strip()
+            if len(section) > 80:
+                section = section[:77] + "…"
+            parts.append(f"section=\"{section}\"")
         preview = (cand.chunk.preview or "")[:120].replace("\n", " ").strip()
         if preview:
             parts.append(f"preview=\"{preview}\"")
@@ -223,6 +274,101 @@ class ContextSelector:
         if not raw:
             return ""
         return raw[:200].replace("\n", " ").strip()
+
+    @staticmethod
+    def _parse_chunk_meta(chunk: RagDocumentChunk) -> Dict[str, object]:
+        meta_raw = getattr(chunk, "meta", None)
+        if not meta_raw:
+            return {}
+        if isinstance(meta_raw, dict):
+            return meta_raw
+        try:
+            return json.loads(meta_raw)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _query_terms(query: str) -> List[str]:
+        seen: set[str] = set()
+        terms: List[str] = []
+        for match in QUERY_TOKEN_RE.finditer(query or ""):
+            token = match.group(0).lower()
+            if token and token not in seen:
+                seen.add(token)
+                terms.append(token)
+        return terms
+
+    def _structure_bonus(self, cand: ContextCandidate, meta: Dict[str, object]) -> float:
+        bonus = 0.0
+        distance = meta.get("heading_distance")
+        try:
+            dist_val = max(0, int(distance))
+            bonus += max(0.0, 0.12 - 0.02 * dist_val)
+        except Exception:
+            pass
+        level = meta.get("heading_level")
+        try:
+            level_val = max(1, int(level))
+            bonus += max(0.0, 0.08 * (3 - min(level_val, 3)))
+        except Exception:
+            pass
+        if cand.section_path:
+            bonus += 0.02
+        return max(0.0, bonus)
+
+    def _metadata_bonus(self, cand: ContextCandidate, query_terms: Sequence[str]) -> tuple[float, List[str]]:
+        doc = cand.document or getattr(cand.chunk, "document", None)
+        if doc is None:
+            return 0.0, []
+        file_obj = getattr(doc, "file", None)
+        if file_obj is None or not query_terms:
+            return 0.0, []
+        haystack: List[str] = []
+
+        def _push(value: Optional[str]) -> None:
+            if not value:
+                return
+            haystack.append(str(value).lower())
+
+        _push(getattr(file_obj, "title", None))
+        _push(getattr(file_obj, "keywords", None))
+        _push(getattr(file_obj, "material_type", None))
+        collection = getattr(file_obj, "collection", None)
+        if collection is not None:
+            _push(getattr(collection, "name", None))
+            _push(getattr(collection, "slug", None))
+        tags = getattr(file_obj, "tags", None) or []
+        for tag in tags:
+            _push(getattr(tag, "key", None))
+            _push(getattr(tag, "value", None))
+        haystack = [item for item in haystack if item]
+        if not haystack:
+            return 0.0, []
+
+        matched: List[str] = []
+        for term in query_terms:
+            if not term:
+                continue
+            for item in haystack:
+                if term in item:
+                    matched.append(term)
+                    break
+        if not matched:
+            return 0.0, []
+        unique_hits = list(dict.fromkeys(matched))
+        bonus = min(0.25, 0.06 * len(unique_hits))
+        return bonus, unique_hits
+
+    def _enrich_candidate(self, cand: ContextCandidate, query_terms: Sequence[str]) -> None:
+        meta = self._parse_chunk_meta(cand.chunk)
+        if not cand.section_path:
+            path = meta.get("heading_path")
+            if isinstance(path, list):
+                cand.section_path = " / ".join(str(part) for part in path if part).strip()
+        cand.structure_bonus = self._structure_bonus(cand, meta)
+        meta_bonus, hits = self._metadata_bonus(cand, query_terms)
+        cand.metadata_bonus = meta_bonus
+        cand.metadata_hits = hits
 
     def _passes_thresholds(self, cand: ContextCandidate) -> bool:
         if cand.dense_score and cand.dense_score < self.min_dense_score:

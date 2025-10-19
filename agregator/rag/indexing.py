@@ -107,6 +107,7 @@ GENERIC_STOPWORDS = {
 }
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_HEADING_NUMERIC_RE = re.compile(r"^(\d+(?:\.\d+)*)[\s).:-]")
 
 try:  # pragma: no cover - optional dependency
     from razdel import sentenize as _sentenize  # type: ignore
@@ -332,29 +333,39 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
     if not text:
         return []
     cfg = config or ChunkConfig()
-    segments = _segment_text(text)
-    if not segments:
-        segments = [line.strip() for line in text.splitlines() if line.strip()] or [text.strip()]
-    segment_tokens_list: List[List[str]] = []
-    for segment in segments:
-        tokens = segment.split()
-        if tokens:
-            segment_tokens_list.append(tokens)
-    if not segment_tokens_list:
-        return []
-    tokens: List[str] = [token for seg in segment_tokens_list for token in seg]
+    segment_infos = _segment_text(text)
+    if not segment_infos:
+        fallback = text.strip()
+        if not fallback:
+            return []
+        tokens = fallback.split()
+        if not tokens:
+            return []
+        segment_infos = [
+            SegmentInfo(
+                text=fallback,
+                tokens=tokens,
+                path=(),
+                heading_level=None,
+                is_heading=False,
+                distance_from_heading=0,
+            )
+        ]
+
+    tokens: List[str] = []
+    segment_ranges: List[Tuple[int, int, SegmentInfo]] = []
+    cursor = 0
+    for info in segment_infos:
+        seg_tokens = info.tokens or [tok for tok in info.text.split() if tok]
+        start_idx = cursor
+        if seg_tokens:
+            tokens.extend(seg_tokens)
+            cursor += len(seg_tokens)
+        segment_ranges.append((start_idx, cursor, info))
     total_tokens = len(tokens)
     if total_tokens == 0:
         return []
-    segment_ranges: List[Tuple[int, int]] = []
-    cursor = 0
-    for seg_tokens in segment_tokens_list:
-        start_idx = cursor
-        cursor += len(seg_tokens)
-        segment_ranges.append((start_idx, cursor))
-    breakpoints = [end for _, end in segment_ranges]
-    if breakpoints[-1] != total_tokens:
-        breakpoints.append(total_tokens)
+    breakpoints = sorted({end for _, end, _ in segment_ranges if end > 0} | {total_tokens})
 
     max_tokens = max(cfg.max_tokens, 1)
     overlap = min(cfg.overlap, max_tokens - 1) if max_tokens > 1 else 0
@@ -366,7 +377,7 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
         seg_start = None
         seg_end = None
         count = 0
-        for idx, (seg_start_token, seg_end_token) in enumerate(segment_ranges):
+        for idx, (seg_start_token, seg_end_token, _info) in enumerate(segment_ranges):
             if seg_end_token <= start_token:
                 continue
             if seg_start_token >= end_token:
@@ -379,7 +390,7 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
             seg_start = 0
         if seg_end is None:
             seg_end = seg_start
-        return seg_start, seg_end, count
+        return seg_start, seg_end, count or 1
 
     def _align_breakpoint(start_token: int, raw_end: int) -> int:
         candidate = raw_end
@@ -413,6 +424,15 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
         if not text_chunk:
             start = end if end > start else end + 1
             continue
+
+        segment_indices = [
+            idx
+            for idx, (seg_start_token, seg_end_token, _info) in enumerate(segment_ranges)
+            if seg_end_token > start and seg_start_token < end
+        ]
+        if not segment_indices:
+            segment_indices = [len(segment_ranges) - 1]
+
         if len(chunk_tokens) < cfg.min_tokens and chunks:
             prev = chunks[-1]
             prev_start = int(prev.meta.get("token_start", 0))
@@ -422,6 +442,17 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
                 start = end if end > start else end + 1
                 continue
             seg_start_idx, seg_end_idx, seg_count = _segment_span(prev_start, end)
+            span_infos = [info for _, _, info in segment_ranges[seg_start_idx : seg_end_idx + 1]]
+            heading_path: Tuple[str, ...] = ()
+            heading_level = None
+            heading_distance = None
+            for info in reversed(span_infos):
+                if info.path:
+                    heading_path = info.path
+                    heading_level = info.heading_level or len(info.path)
+                    break
+            if span_infos:
+                heading_distance = min(info.distance_from_heading for info in span_infos)
             lang = detect_language(merged_text)
             chunks[-1] = ChunkData(
                 ordinal=prev.ordinal,
@@ -432,7 +463,7 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
                 keywords=extract_keywords(merged_text, lang, cfg.keyword_count),
                 lang_primary=lang,
                 content_hash=sha256(merged_text.encode("utf-8")).hexdigest(),
-                section_path=None,
+                section_path=" / ".join(heading_path) if heading_path else prev.section_path,
                 meta={
                     **prev.meta,
                     "token_end": end,
@@ -440,6 +471,9 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
                     "segments": seg_count,
                     "segment_start": seg_start_idx,
                     "segment_end": seg_end_idx,
+                    "heading_path": list(heading_path),
+                    "heading_level": heading_level,
+                    "heading_distance": heading_distance,
                 },
             )
             next_start = max(prev_start, end - overlap)
@@ -447,8 +481,22 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
                 next_start = end
             start = min(next_start, total_tokens)
             continue
+
         ordinal += 1
         seg_start_idx, seg_end_idx, seg_count = _segment_span(start, end)
+        span_infos = [info for _, _, info in segment_ranges[seg_start_idx : seg_end_idx + 1]]
+        heading_path: Tuple[str, ...] = ()
+        heading_level = None
+        heading_distance = None
+        for info in reversed(span_infos):
+            if info.path:
+                heading_path = info.path
+                heading_level = info.heading_level or len(info.path)
+                break
+        if span_infos:
+            heading_distance = min(info.distance_from_heading for info in span_infos)
+        section_path = " / ".join(heading_path) if heading_path else None
+
         lang = detect_language(text_chunk)
         keywords = extract_keywords(text_chunk, lang, cfg.keyword_count)
         chunks.append(
@@ -461,7 +509,7 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
                 keywords=keywords,
                 lang_primary=lang,
                 content_hash=sha256(text_chunk.encode("utf-8")).hexdigest(),
-                section_path=None,
+                section_path=section_path,
                 meta={
                     "token_start": start,
                     "token_end": end,
@@ -470,6 +518,9 @@ def chunk_text(text: str, *, config: Optional[ChunkConfig] = None) -> List[Chunk
                     "segments": seg_count,
                     "segment_start": seg_start_idx,
                     "segment_end": seg_end_idx,
+                    "heading_path": list(heading_path),
+                    "heading_level": heading_level,
+                    "heading_distance": heading_distance,
                 },
             )
         )

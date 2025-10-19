@@ -62,6 +62,9 @@ type Settings = {
   prompts?: Record<string, string>
   prompt_defaults?: Record<string, string>
   ai_rerank_llm?: boolean
+  ai_rag_retry_enabled?: boolean
+  ai_rag_retry_threshold?: number
+  ai_query_variants_max?: number
   collections?: Collection[]
   llm_endpoints?: LlmEndpointInfo[]
   llm_purposes?: LlmPurposeOption[]
@@ -253,6 +256,9 @@ const normalizeSettings = (raw: any): Settings => {
     prompts,
     prompt_defaults: promptDefaults,
     ai_rerank_llm: boolVal(raw?.ai_rerank_llm, false),
+    ai_query_variants_max: Number.isFinite(raw?.ai_query_variants_max) ? Number(raw.ai_query_variants_max) : 0,
+    ai_rag_retry_enabled: boolVal(raw?.ai_rag_retry_enabled, true),
+    ai_rag_retry_threshold: Number.isFinite(raw?.ai_rag_retry_threshold) ? Number(raw.ai_rag_retry_threshold) : 0.6,
     collections,
     llm_endpoints: Array.isArray(raw?.llm_endpoints)
       ? raw.llm_endpoints.map((ep: any) => ({
@@ -592,6 +598,9 @@ export default function SettingsPage() {
         searchable: !!col.searchable,
         graphable: !!col.graphable,
       }))
+      payload.ai_query_variants_max = Math.max(0, Math.min(3, parseInt(String(payload.ai_query_variants_max ?? 0), 10) || 0))
+      payload.ai_rag_retry_enabled = !!payload.ai_rag_retry_enabled
+      payload.ai_rag_retry_threshold = Math.max(0, Math.min(1, parseFloat(String(payload.ai_rag_retry_threshold ?? 0.6)) || 0.6))
       payload.rag_embedding_dim = Math.max(1, parseInt(String(payload.rag_embedding_dim || 0), 10) || 1)
       payload.rag_embedding_batch = Math.max(1, parseInt(String(payload.rag_embedding_batch || 0), 10) || 1)
       payload.rag_embedding_device = (payload.rag_embedding_device || '').trim()
@@ -916,6 +925,44 @@ export default function SettingsPage() {
               <input className="form-check-input" type="checkbox" id="rerank" checked={!!s.ai_rerank_llm} onChange={e => setS({ ...s, ai_rerank_llm: e.target.checked })} />
               <label className="form-check-label" htmlFor="rerank">LLM‑реранжирование поиска</label>
             </div>
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Переформулировки запроса (0–3)</label>
+            <input
+              className="form-control"
+              type="number"
+              min={0}
+              max={3}
+              value={s.ai_query_variants_max ?? 0}
+              onChange={e => {
+                const next = Math.max(0, Math.min(3, parseInt(e.target.value || '0', 10) || 0))
+                setS({ ...s, ai_query_variants_max: next })
+              }}
+            />
+            <div className="form-text">Сколько вариантов запроса генерировать для RAG. 0 — без перефразировок.</div>
+          </div>
+          <div className="col-md-3 d-flex align-items-center">
+            <div className="form-check form-switch">
+              <input className="form-check-input" type="checkbox" id="ragRetry" checked={!!s.ai_rag_retry_enabled} onChange={e => setS({ ...s, ai_rag_retry_enabled: e.target.checked })} />
+              <label className="form-check-label" htmlFor="ragRetry">Автоповтор RAG при высоком риске</label>
+            </div>
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Порог риска (0–1)</label>
+            <input
+              className="form-control"
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={typeof s.ai_rag_retry_threshold === 'number' ? s.ai_rag_retry_threshold : 0.6}
+              onChange={e => {
+                const raw = parseFloat(e.target.value || '0')
+                const next = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0.6
+                setS({ ...s, ai_rag_retry_threshold: next })
+              }}
+            />
+            <div className="form-text">Если риск ≥ порога, система попробует переформулировать запрос и расширить контекст.</div>
           </div>
       </div>
     </div>

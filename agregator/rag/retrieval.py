@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, literal
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
-from models import RagChunkEmbedding, RagDocument, RagDocumentChunk, db
+from models import File, RagChunkEmbedding, RagDocument, RagDocumentChunk, db
 from .utils import bytes_to_vector, vector_to_bytes
 
 
@@ -136,10 +136,19 @@ class VectorRetriever:
         if not scored:
             return []
         top = heapq.nlargest(top_k, scored, key=lambda pair: pair[0])
-        documents = {
-            doc.id: doc
-            for doc in self.session.query(RagDocument).filter(RagDocument.id.in_({c.document_id for _, c in top if c.document_id}))
-        }
+        doc_ids = {c.document_id for _, c in top if c.document_id}
+        documents = {}
+        if doc_ids:
+            fetched = (
+                self.session.query(RagDocument)
+                .options(
+                    joinedload(RagDocument.file).joinedload(File.collection),
+                    joinedload(RagDocument.file).joinedload(File.tags),
+                )
+                .filter(RagDocument.id.in_(doc_ids))
+                .all()
+            )
+            documents = {doc.id: doc for doc in fetched}
         result: List[RetrievedChunk] = []
         for score, chunk in top:
             result.append(
