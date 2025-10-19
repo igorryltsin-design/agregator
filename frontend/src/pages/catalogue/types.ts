@@ -14,9 +14,19 @@ export type FileItem = {
 
 export type CollectionOption = { id: number; name: string }
 
+export type FacetSuggestion = {
+  kind: 'author' | 'year' | 'tag'
+  value: string
+  label: string
+  key?: string
+}
+
 export type FacetData = {
   types: [string | null, number][]
   tag_facets: Record<string, [string, number][]>
+  authors: [string, number][]
+  years: [string, number][]
+  suggestions: FacetSuggestion[]
   include_types?: boolean
   allowed_keys?: string[] | null
 }

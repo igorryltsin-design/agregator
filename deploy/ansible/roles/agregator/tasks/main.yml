@@ -1,0 +1,81 @@
+- name: Include default variables
+  include_vars: "{{ playbook_dir }}/roles/agregator/vars/defaults.yml"
+  ignore_errors: yes
+
+- name: Ensure system user exists
+  ansible.builtin.user:
+    name: "{{ agregator_service_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+  when: agregator_manage_user | bool
+
+- name: Ensure base directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ agregator_service_user }}"
+    group: "{{ agregator_service_group }}"
+    mode: "0755"
+  loop:
+    - "{{ agregator_root }}"
+    - "{{ agregator_root }}/releases"
+    - "{{ agregator_root }}/shared"
+    - "{{ agregator_root }}/shared/env"
+    - "{{ agregator_root }}/shared/data"
+    - "{{ agregator_root }}/shared/logs"
+
+- name: Upload release artifact
+  ansible.builtin.copy:
+    src: "{{ agregator_release_tarball }}"
+    dest: "/tmp/agregator-{{ agregator_release_id }}.tar.gz"
+    mode: "0644"
+
+- name: Unpack release
+  ansible.builtin.unarchive:
+    src: "/tmp/agregator-{{ agregator_release_id }}.tar.gz"
+    dest: "{{ agregator_root }}/releases"
+    remote_src: true
+    creates: "{{ agregator_root }}/releases/{{ agregator_release_id }}"
+
+- name: Create virtual environment
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ agregator_root }}/releases/{{ agregator_release_id }}/.venv"
+    creates: "{{ agregator_root }}/releases/{{ agregator_release_id }}/.venv/bin/activate"
+
+- name: Install Python requirements
+  ansible.builtin.command:
+    cmd: "{{ agregator_root }}/releases/{{ agregator_release_id }}/.venv/bin/pip install --upgrade pip -r requirements.txt"
+    chdir: "{{ agregator_root }}/releases/{{ agregator_release_id }}"
+
+- name: Symlink shared directories
+  ansible.builtin.file:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    state: link
+  loop:
+    - { src: "{{ agregator_root }}/shared/data", dest: "{{ agregator_root }}/releases/{{ agregator_release_id }}/library" }
+    - { src: "{{ agregator_root }}/shared/logs", dest: "{{ agregator_root }}/releases/{{ agregator_release_id }}/logs" }
+
+- name: Update current symlink
+  ansible.builtin.file:
+    src: "{{ agregator_root }}/releases/{{ agregator_release_id }}"
+    dest: "{{ agregator_root }}/current"
+    state: link
+    force: true
+
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: "templates/agregator.service.j2"
+    dest: "/etc/systemd/system/{{ agregator_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Reload systemd
+  ansible.builtin.command: systemctl daemon-reload
+
+- name: Enable and restart service
+  ansible.builtin.systemd:
+    name: "{{ agregator_service_name }}"
+    enabled: true
+    state: restarted

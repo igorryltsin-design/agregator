@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Network, DataSet } from 'vis-network/standalone'
 import { materialTypeRu, tagKeyRu } from '../utils/locale'
 
-type Node = { id: string; label: string; type: string }
+type Node = { id: string; label: string; type: string; authority?: number }
 type Edge = { from: string; to: string; label?: string }
 
 export default function GraphPage() {
@@ -19,7 +19,7 @@ export default function GraphPage() {
   const [minDegree, setMinDegree] = useState(1)
   const [limit, setLimit] = useState(600)
   const [hideSingletons, setHideSingletons] = useState(true)
-  const [selection, setSelection] = useState<{id:string,label:string,type:string,degree:number}|null>(null)
+  const [selection, setSelection] = useState<{id:string,label:string,type:string,degree:number,authority?:number}|null>(null)
   const [hasGraphData, setHasGraphData] = useState(false)
   const [search, setSearch] = useState('')
   const [smartSearch, setSmartSearch] = useState(true)
@@ -50,7 +50,10 @@ export default function GraphPage() {
           qs.set('smart', '1')
         }
         const res = await fetch(`/api/graph?${qs.toString()}`)
-        const data: { nodes: Node[]; edges: Edge[] } = await res.json()
+        const data: { nodes: Node[]; edges: Edge[]; max_authority?: number } = await res.json()
+        const authorityCeil = typeof data.max_authority === 'number' && Number.isFinite(data.max_authority)
+          ? Math.max(0, data.max_authority)
+          : 0
         // Клиентская фильтрация по степени узлов
         const deg: Record<string, number> = {}
         data.edges.forEach(e => { deg[e.from]=(deg[e.from]||0)+1; deg[e.to]=(deg[e.to]||0)+1 })
@@ -59,7 +62,19 @@ export default function GraphPage() {
           const s = search.trim().toLowerCase()
           nodesFiltered = nodesFiltered.filter(n => (n.label||'').toLowerCase().includes(s))
         }
-        const nodes = new DataSet(nodesFiltered.map(n => ({ ...n, color: (n as any).type?.startsWith('tag:') ? '#1f6feb' : '#2ea043' })))
+        const computedAuthorityMax = authorityCeil > 0
+          ? authorityCeil
+          : nodesFiltered.reduce((acc, node) => Math.max(acc, Number(node.authority || 0)), 0)
+        const sizeFor = (authority: number) => {
+          if (!(authority > 0) || !(computedAuthorityMax > 0)) return 10
+          const ratio = Math.min(1, authority / computedAuthorityMax)
+          return 10 + Math.round(ratio * 22)
+        }
+        const nodes = new DataSet(nodesFiltered.map(n => {
+          const authority = Number(n.authority || 0)
+          const color = n.type?.startsWith('tag:') ? '#1f6feb' : '#2ea043'
+          return { ...n, color, size: sizeFor(authority) }
+        }))
         setHasGraphData(nodesFiltered.length > 0)
         const nodeSet = new Set(nodes.getIds() as string[])
         const edges = new DataSet(data.edges.filter(e => nodeSet.has(e.from) && nodeSet.has(e.to)).map(e => ({ ...e, arrows: 'to', color: '#8b949e' })))
@@ -135,7 +150,8 @@ export default function GraphPage() {
     const neigh = new Set<string>([id, ...net.getConnectedNodes(id) as string[]])
     const degree = (net.getConnectedEdges(id) as string[]).length
     const node = nodes.get(id)
-    setSelection({ id, label: node?.label || '', type: node?.type || '', degree })
+    const authority = typeof node?.authority === 'number' ? node.authority : 0
+    setSelection({ id, label: node?.label || '', type: node?.type || '', degree, authority })
     const all = nodes.get()
     nodes.update(all.map((n:any) => ({ id: n.id, hidden: !neigh.has(n.id) })))
   }
@@ -199,7 +215,7 @@ export default function GraphPage() {
           </div>
           <hr/>
           <div className="fw-semibold mb-2">Легенда</div>
-          <div className="text-secondary small">Зелёные — работы, Синие — теги. Размер узлов пропорционален степени (можно увеличить/уменьшить масштаб колесом мыши).</div>
+          <div className="text-secondary small">Зелёные — работы, Синие — теги. Размер узлов пропорционален авторитетности (PageRank/TopicRank). Масштаб меняется колесом мыши.</div>
           {cloud && (
             <div className="mt-2 text-secondary small">Размер шрифта ~ частотность [{cloud.min}…{cloud.max}]</div>
           )}
@@ -214,7 +230,7 @@ export default function GraphPage() {
       </div>
       <div className="col-12 col-lg-9">
         {view === 'graph' && (
-          <div className="card p-3 position-relative">
+          <div className="card p-3 position-relative" aria-busy={loading}>
             <div className="fw-semibold mb-2">Граф (файл → теги: {selectedKeyLabels.join(', ') || '—'})</div>
             {error && <div className="text-danger mb-2">{error}</div>}
             {!loading && !error && !hasGraphData && (
@@ -230,6 +246,7 @@ export default function GraphPage() {
                 className="skeleton"
                 style={{ position: 'absolute', inset: 16, borderRadius: 12 }}
                 aria-label="Загружаем граф"
+                role="status"
               />
             )}
           </div>
@@ -240,6 +257,7 @@ export default function GraphPage() {
             <div><strong>Метка:</strong> {selection.label}</div>
             <div><strong>Тип:</strong> {selectionTypeLabel || selection.type}</div>
             <div><strong>Степень:</strong> {selection.degree}</div>
+            <div><strong>Авторитет:</strong> {selection.authority !== undefined ? selection.authority.toFixed(3) : '—'}</div>
             <div className="mt-2"><button className="btn btn-sm btn-outline-secondary" onClick={clearHighlight}>Сбросить</button></div>
           </div>
         )}

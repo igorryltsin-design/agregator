@@ -15,6 +15,12 @@
   - Requires authentication.
   - Payload fields: `query_hash`, `action` (`click`, `relevant`, `irrelevant`, `ignored`), optional `file_id`, `keyword`, `score`.
 - Collected feedback is stored in `ai_search_keyword_feedback` and used to suppress noisy keywords in subsequent searches.
+- Aggregated weights:
+  - `POST /api/admin/ai-search/feedback/train` — пересчитывает веса и сохраняет их в `ai_search_feedback_model`; поддерживает `{"async": true, "cutoff_days": 90}`.
+  - `GET /api/admin/ai-search/feedback/model?limit=50` — возвращает топ документов с положительным/отрицательным весом и статистику по логам.
+  - `GET /api/admin/ai-search/feedback/status` — мониторинг планировщика (включён ли, активная задача, время последнего обновления).
+  - Вес документа = `log((positive + click_weight * clicks + prior_pos) / (negative + prior_neg))`, ограничен по `AI_FEEDBACK_MAX_WEIGHT`.
+  - Пересчитанные веса автоматически используются в: поисковой выдаче (`feedback_boost`), RAG-контексте и панели статистики.
 
 ## Metrics & Monitoring
 - Endpoint: `GET /api/admin/ai-search/metrics?limit=100`
@@ -28,6 +34,14 @@
 ## Environment Variables
 - `AI_SNIPPET_CACHE_TTL_HOURS` — snippet cache retention window (default: 24).
 - `AI_SNIPPET_CACHE_SWEEP_INTERVAL_HOURS` — интервал фоновой очистки (default: 24).
+- `AI_FEEDBACK_TTL` — TTL in seconds для кеша весов (default: 600).
+- `AI_FEEDBACK_POS_PRIOR`, `AI_FEEDBACK_NEG_PRIOR` — априорные значения для подсчёта веса (default: 1.0 / 1.0).
+- `AI_FEEDBACK_CLICK_WEIGHT` — вес одного клика при расчёте (default: 0.5).
+- `AI_FEEDBACK_MAX_WEIGHT` — ограничение по абсолютному значению веса (default: 2.5).
+- `AI_FEEDBACK_WEIGHT_SCALE` — коэффициент усиления в поисковой выдаче (default: 0.8).
+- `RAG_FEEDBACK_WEIGHT_SCALE` — коэффициент влияния на ранжирование контекста (default: 0.5).
+- `AI_FEEDBACK_TRAIN_INTERVAL_HOURS` — интервал фонового обучения (0 отключает планировщик).
+- `AI_FEEDBACK_TRAIN_CUTOFF_DAYS` — период, за который учитывается фидбэк при обучении (default: 90).
 
 ## Maintenance Tasks
 - Schedule a daily cleanup job (cron) to remove expired rows:
@@ -35,6 +49,7 @@
   DELETE FROM ai_search_snippet_cache WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP;
   ```
 - Periodically review `ai_search_keyword_feedback` for abusive submissions; consider anonymising user IDs in exported analytics.
+- Enable automated feedback training by setting `AI_FEEDBACK_TRAIN_INTERVAL_HOURS` (>0). По умолчанию тренинг выключен; при включении планировщик будет запускать `POST /api/admin/ai-search/feedback/train` (с параметром `AI_FEEDBACK_TRAIN_CUTOFF_DAYS`, default 90) и логировать результаты.
 
 ## RAG Utilities
 - `scripts/rag_index.py`
@@ -43,8 +58,8 @@
   - `embed` — пересчитывает эмбеддинги для всех чанков.
   - `inspect --chunk <id>` — печатает содержимое и метаданные конкретного чанка.
 - `scripts/rag_smoke.py`
-  - Прогоняет набор запросов (по умолчанию 5 типовых) через `_ai_search_core` и выводит суммарное время, число найденных документов, наличие предупреждений RAG/фолбэка.
-  - Пример: `python scripts/rag_smoke.py --deep --top-k 4 --json smoke.json` — сохраняет результат в JSON для последующего анализа.
+  - Прогоняет набор запросов (по умолчанию 5 типовых) через `_ai_search_core`, выводит сводку (среднее время, долю fallback/warnings, среднее число чанков) и детальные результаты.
+  - Пример: `python scripts/rag_smoke.py --deep --top-k 4 --json smoke.json` — сохранит JSON вида `{summary: {...}, results: [...]}`.
 
 ## Monitoring Checklist
 - Проверяйте `/api/admin/ai-search/metrics` — новые поля `rag_context_count`, `rag_fallback`, `rag_hallucination_warning` сигнализируют о качестве RAG-ответов.

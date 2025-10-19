@@ -70,6 +70,19 @@ class LlmCache:
                 self._data.popitem(last=False)
             self._purge_expired()
 
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": self.enabled,
+                "items": len(self._data),
+                "max_items": self.max_items,
+                "ttl_seconds": self.ttl_seconds,
+            }
+
 
 _default_cache = LlmCache()
 
@@ -84,3 +97,11 @@ def llm_cache_get(key: str) -> Optional[CachedLLMResponse]:
 
 def llm_cache_set(key: str, response: CachedLLMResponse) -> None:
     _default_cache.set(key, response)
+
+
+def llm_cache_clear() -> None:
+    _default_cache.clear()
+
+
+def llm_cache_stats() -> dict[str, Any]:
+    return _default_cache.stats()

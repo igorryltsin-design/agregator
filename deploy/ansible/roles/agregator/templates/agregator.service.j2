@@ -1,0 +1,17 @@
+[Unit]
+Description=Agregator knowledge base service
+After=network.target
+
+[Service]
+Type=simple
+User={{ agregator_service_user }}
+Group={{ agregator_service_group }}
+WorkingDirectory={{ agregator_root }}/current
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-{{ agregator_root }}/shared/env/.env
+ExecStart={{ agregator_root }}/current/.venv/bin/gunicorn --workers {{ agregator_gunicorn_workers | default(4) }} --bind {{ agregator_bind | default('0.0.0.0:5050') }} app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

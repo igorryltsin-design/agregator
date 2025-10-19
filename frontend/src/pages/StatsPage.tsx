@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { materialTypeRu, tagKeyRu } from '../utils/locale'
+import LoadingState from '../ui/LoadingState'
 import { Chart, BarController, BarElement, CategoryScale, LinearScale, LogarithmicScale, LineController, LineElement, PointElement, ArcElement, Tooltip, Legend, DoughnutController } from 'chart.js'
 Chart.register(BarController, BarElement, CategoryScale, LinearScale, LogarithmicScale, LineController, LineElement, PointElement, ArcElement, DoughnutController, Tooltip, Legend)
 
@@ -33,6 +34,13 @@ type StatsResponse = {
     without_tags?: number
     total_tags?: number
   }
+  authority_docs?: { id: number; score: number; title: string; author?: string | null; year?: string | null; collection_id?: number | null; collection_name?: string | null }[]
+  authority_authors?: { name: string; score: number; count?: number }[]
+  authority_topics?: { key: string; label: string; score: number; count?: number }[]
+  authority_collections?: { collection_id?: number | null; name: string; score: number; count?: number }[]
+  feedback_positive?: { file_id: number; title: string; author?: string | null; year?: string | null; collection_id?: number | null; collection_name?: string | null; weight: number; positive: number; negative: number; clicks: number; updated_at?: string | null }[]
+  feedback_negative?: { file_id: number; title: string; author?: string | null; year?: string | null; collection_id?: number | null; collection_name?: string | null; weight: number; positive: number; negative: number; clicks: number; updated_at?: string | null }[]
+  feedback_summary?: { total_files?: number; positive?: number; negative?: number }
 }
 
 export default function StatsPage(){
@@ -355,8 +363,20 @@ export default function StatsPage(){
       .filter(([, count]) => Number(count || 0) > 0)
       .sort((a, b) => Number(b?.[1] || 0) - Number(a?.[1] || 0))
   }, [data])
+  if (error && !data) {
+    return <div className="card p-3 text-danger">Не удалось загрузить статистику: {error}</div>
+  }
+
+  if (loading && !data) {
+    return (
+      <div className="card p-3">
+        <LoadingState title="Загружаем статистику" description="Готовим диаграммы и агрегаты по библиотеке" lines={6} />
+      </div>
+    )
+  }
+
   return (
-    <div className="card p-3">
+    <div className="card p-3" aria-busy={loading}>
       <div className="d-flex align-items-center justify-content-between mb-2">
         <div className="fw-semibold">Статистика</div>
         <div className="d-flex align-items-center gap-3">
@@ -378,13 +398,15 @@ export default function StatsPage(){
         </div>
       </div>
       {loading && (
-        <div className="row g-3">
-          {Array.from({length: 6}).map((_,i)=>(
-            <div key={i} className="col-12 col-xl-4"><div className="skeleton" style={{height:200}} /></div>
+        <div className="row g-3" role="status" aria-live="polite">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="col-12 col-xl-4">
+              <LoadingState variant="card" lines={4} />
+            </div>
           ))}
         </div>
       )}
-      {error && <div className="text-danger">{error}</div>}
+      {error && <div className="text-danger">Не удалось обновить данные: {error}</div>}
       {!loading && data && data.total_files > 0 && (
         <>
           <div className="row g-3">
@@ -416,6 +438,11 @@ export default function StatsPage(){
               </div>
             </div>
           </div>
+          {!loading && data?.feedback_summary && (Number(data.feedback_summary.negative || 0) > 0) && (
+            <div className="alert alert-warning mt-3" role="alert">
+              Несколько документов получили отрицательный вес по пользовательскому фидбэку. Проверьте список «Низкие оценки пользователей» или страницу «AI метрики» для корректирующих действий.
+            </div>
+          )}
           <div className="row g-3 mt-1">
             <div className="col-12 col-xl-6">
               <div className="card p-2 chart-card">
@@ -604,6 +631,67 @@ export default function StatsPage(){
               </div>
             </div>
           </div>
+          {(Boolean(data.feedback_positive?.length) || Boolean(data.feedback_negative?.length) || data.feedback_summary) && (
+            <div className="row g-3 mt-1">
+              {Boolean(data.feedback_positive?.length) && (
+                <div className="col-12 col-xl-6 col-xxl-4">
+                  <div className="card p-3 h-100">
+                    <div className="fw-semibold mb-2">Документы с лучшим откликом</div>
+                    <ol className="mb-0 ps-3">
+                      {(data.feedback_positive || []).slice(0, 10).map(entry => (
+                        <li key={entry.file_id} className="mb-2">
+                          <button className="btn btn-link p-0 text-start" style={{ fontSize: 14 }} onClick={()=> nav(`/?q=${encodeURIComponent(entry.title || '')}`)}>
+                            {entry.title}
+                          </button>
+                          <div className="text-secondary" style={{ fontSize: 12 }}>
+                            {(entry.author || '').trim() ? `${entry.author} · ` : ''}{entry.year || '—'} · вес {formatScore(entry.weight)}
+                          </div>
+                          <div className="text-secondary" style={{ fontSize: 12 }}>
+                            👍 {entry.positive} · 👎 {entry.negative} · кликов {entry.clicks}
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                </div>
+              )}
+              {Boolean(data.feedback_negative?.length) && (
+                <div className="col-12 col-xl-6 col-xxl-4">
+                  <div className="card p-3 h-100">
+                    <div className="fw-semibold mb-2">Низкие оценки пользователей</div>
+                    <ol className="mb-0 ps-3">
+                      {(data.feedback_negative || []).slice(0, 10).map(entry => (
+                        <li key={entry.file_id} className="mb-2">
+                          <button className="btn btn-link p-0 text-start" style={{ fontSize: 14 }} onClick={()=> nav(`/?q=${encodeURIComponent(entry.title || '')}`)}>
+                            {entry.title}
+                          </button>
+                          <div className="text-secondary" style={{ fontSize: 12 }}>
+                            {(entry.author || '').trim() ? `${entry.author} · ` : ''}{entry.year || '—'} · вес {formatScore(entry.weight)}
+                          </div>
+                          <div className="text-secondary" style={{ fontSize: 12 }}>
+                            👍 {entry.positive} · 👎 {entry.negative} · кликов {entry.clicks}
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                </div>
+              )}
+              {data.feedback_summary && (
+                <div className="col-12 col-xl-6 col-xxl-4">
+                  <div className="card p-3 h-100">
+                    <div className="fw-semibold mb-2">Сводка фидбэка</div>
+                    <div className="d-flex flex-column gap-1" style={{ fontSize: 13 }}>
+                      <div className="d-flex justify-content-between"><span>Всего файлов с весами</span><span className="text-secondary">{numberFormatter.format(data.feedback_summary.total_files || 0)}</span></div>
+                      <div className="d-flex justify-content-between"><span>Положительный вес</span><span className="text-success">{numberFormatter.format(data.feedback_summary.positive || 0)}</span></div>
+                      <div className="d-flex justify-content-between"><span>Отрицательный вес</span><span className="text-danger">{numberFormatter.format(data.feedback_summary.negative || 0)}</span></div>
+                      <div className="text-secondary" style={{ fontSize: 12 }}>Вес рассчитывается из оценок релевантности и кликов (`POST /api/ai-search/feedback`).</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </>
       )}
       {!loading && data && data.total_files === 0 && (

@@ -1,0 +1,2 @@
+[agregator]
+# production.example.com ansible_user=deploy ansible_port=22

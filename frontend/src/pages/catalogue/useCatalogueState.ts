@@ -947,6 +947,40 @@ export function useCatalogueState() {
             tag_facets: data.tag_facets && typeof data.tag_facets === 'object' ? data.tag_facets : {},
             include_types: data.include_types !== undefined ? Boolean(data.include_types) : true,
             allowed_keys: Array.isArray(data.allowed_keys) ? data.allowed_keys : null,
+            authors: Array.isArray(data.authors)
+              ? data.authors
+                  .map((entry: any) => {
+                    const name = Array.isArray(entry) ? entry[0] : entry?.name ?? entry?.value ?? ''
+                    const count = Array.isArray(entry) ? entry[1] : entry?.count ?? entry?.total ?? 0
+                    const label = typeof name === 'string' ? name.trim() : ''
+                    const num = Number(count) || 0
+                    return label ? [label, num] as [string, number] : null
+                  })
+                  .filter((entry: [string, number] | null): entry is [string, number] => Boolean(entry))
+              : [],
+            years: Array.isArray(data.years)
+              ? data.years
+                  .map((entry: any) => {
+                    const yearValue = Array.isArray(entry) ? entry[0] : entry?.year ?? entry?.value ?? ''
+                    const count = Array.isArray(entry) ? entry[1] : entry?.count ?? entry?.total ?? 0
+                    const label = typeof yearValue === 'string' ? yearValue.trim() : ''
+                    const num = Number(count) || 0
+                    return label ? [label, num] as [string, number] : null
+                  })
+                  .filter((entry: [string, number] | null): entry is [string, number] => Boolean(entry))
+              : [],
+            suggestions: Array.isArray(data.suggestions)
+              ? data.suggestions
+                  .map((entry: any) => {
+                    const kind = typeof entry?.kind === 'string' ? entry.kind : ''
+                    const value = typeof entry?.value === 'string' ? entry.value : ''
+                    const label = typeof entry?.label === 'string' ? entry.label : ''
+                    const key = typeof entry?.key === 'string' ? entry.key : undefined
+                    if (!kind || !value || !label) return null
+                    return { kind, value, label, key }
+                  })
+                  .filter((item: any): item is FacetData['suggestions'][number] => Boolean(item))
+              : [],
           }
           setFacets(payload)
         } else {

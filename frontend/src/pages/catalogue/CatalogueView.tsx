@@ -5,13 +5,14 @@ import AiPanel from './AiPanel'
 import FileCard from './FileCard'
 import PreviewModal from './PreviewModal'
 import FilterSidebar from './FilterSidebar'
+import type { FacetSuggestion } from './types'
 
 export default function CatalogueView() {
   const catalogue = useCatalogueState()
   const { searchParams, selectors, list, ai, pagination, modals, helpers, facets, facetsLoading, collections } = catalogue
   const materialTypeOptions = useMaterialTypeOptions()
 
-  const { sp, setSp, dq, type, collectionId } = searchParams
+  const { sp, setSp, dq, type, collectionId, year_from, year_to } = searchParams
   const { selectedTags, setSelectedTags, removeTag } = selectors
   const { items, total, loading, sentinelRef } = list
   const { aiMode, resetAiState } = ai
@@ -30,13 +31,15 @@ export default function CatalogueView() {
     setSp(next)
   }
 
-  const hasFacetFilters = Boolean(type) || selectedTags.length > 0
+  const hasFacetFilters = Boolean(type) || selectedTags.length > 0 || Boolean(year_from || year_to)
 
   const handleResetFacets = () => {
     if (!hasFacetFilters) return
     const next = new URLSearchParams(sp)
     next.delete('type')
     next.delete('tag')
+    next.delete('year_from')
+    next.delete('year_to')
     next.set('page', '1')
     setSelectedTags([])
     setSp(next)
@@ -47,6 +50,19 @@ export default function CatalogueView() {
     next.set('page', '1')
     setSelectedTags([])
     resetAiState()
+    setSp(next)
+  }
+
+  const handleYearSelect = (value: string | null) => {
+    const next = new URLSearchParams(sp)
+    if (value) {
+      next.set('year_from', value)
+      next.set('year_to', value)
+    } else {
+      next.delete('year_from')
+      next.delete('year_to')
+    }
+    next.set('page', '1')
     setSp(next)
   }
 
@@ -73,6 +89,29 @@ export default function CatalogueView() {
     setSp(nextParams)
   }
 
+  const handleSuggestion = (suggestion: FacetSuggestion) => {
+    if (suggestion.kind === 'author') {
+      handleTagToggle(`author=${suggestion.value}`)
+      return
+    }
+    if (suggestion.kind === 'year') {
+      const isActive = year_from === suggestion.value && year_to === suggestion.value
+      handleYearSelect(isActive ? null : suggestion.value)
+      return
+    }
+    if (suggestion.kind === 'tag' && suggestion.key) {
+      handleTagToggle(`${suggestion.key}=${suggestion.value}`)
+    }
+  }
+
+  const yearFilterLabel = React.useMemo(() => {
+    if (year_from && year_to && year_from === year_to) return `Год: ${year_from}`
+    if (year_from && year_to) return `Годы: ${year_from}–${year_to}`
+    if (year_from) return `Год от: ${year_from}`
+    if (year_to) return `Год до: ${year_to}`
+    return ''
+  }, [year_from, year_to])
+
   return (
     <>
       <div className="row g-3">
@@ -86,9 +125,13 @@ export default function CatalogueView() {
             onReset={handleResetFacets}
             canReset={hasFacetFilters}
             isLoading={facetsLoading}
+            yearFrom={year_from}
+            yearTo={year_to}
+            onYearSelect={handleYearSelect}
+            onSuggestion={handleSuggestion}
           />
         </div>
-        <div className="col-12 col-lg-9">
+        <div className="col-12 col-lg-9" aria-busy={loading}>
           <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
             <div className="form-floating" style={{ minWidth: 220 }}>
               <select className="form-select" id="collectionSelect" value={collectionId} onChange={event => handleCollectionChange(event.target.value)}>
@@ -117,6 +160,12 @@ export default function CatalogueView() {
                   </span>
                 )
               })}
+              {yearFilterLabel && (
+                <span className="tag" aria-label={`Фильтр ${yearFilterLabel}`}>
+                  {yearFilterLabel}{' '}
+                  <button className="btn btn-sm btn-outline-secondary ms-1" onClick={() => handleYearSelect(null)} aria-label="Снять фильтр по году">×</button>
+                </span>
+              )}
               <span className="muted ms-2">Найдено: {total}</span>
             </div>
             {pages > 1 && (

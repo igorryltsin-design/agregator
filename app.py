@@ -7,12 +7,15 @@ import hmac
 import logging
 from logging.handlers import RotatingFileHandler
 import time
+import math
 from collections import OrderedDict, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import itertools
+import heapq
 import copy
 import queue
+import platform
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
 
 import click
@@ -56,6 +59,7 @@ from models import (
     AiWordAccess,
     AiSearchSnippetCache,
     AiSearchKeywordFeedback,
+    AiSearchFeedbackModel,
     AiSearchMetric,
     RagDocument,
     RagDocumentVersion,
@@ -64,6 +68,9 @@ from models import (
     RagIngestFailure,
     RagSession,
 )
+
+APP_START_TIME = time.time()
+APP_STARTED_AT = datetime.utcnow()
 
 
 @event.listens_for(Engine, "connect")
@@ -126,12 +133,16 @@ from agregator.services import (
     get_task_queue,
     llm_cache_get,
     llm_cache_set,
+    llm_cache_clear,
+    llm_cache_stats,
     CachedLLMResponse,
     FacetQueryParams,
     FacetService,
     SearchService,
     search_cache_get,
     search_cache_set,
+    search_cache_clear,
+    search_cache_stats,
     http_request,
     list_system_log_files as svc_list_system_log_files,
     resolve_log_name as svc_resolve_log_name,
@@ -301,6 +312,16 @@ def _refresh_runtime_globals() -> None:
                 value = 0
             if value <= 0:
                 value = 4000 if key == 'LM_MAX_INPUT_CHARS' else 256
+        if key == 'FEEDBACK_TRAIN_INTERVAL_HOURS':
+            try:
+                value = max(0.0, float(value or 0.0))
+            except Exception:
+                value = 0.0
+        if key == 'FEEDBACK_TRAIN_CUTOFF_DAYS':
+            try:
+                value = max(1, int(value or 1))
+            except Exception:
+                value = 90
         if key in {
             'TRANSCRIBE_ENABLED',
             'SUMMARIZE_AUDIO',
@@ -358,6 +379,8 @@ _RUNTIME_ATTR_MAP = {
     'AI_RERANK_LLM': 'ai_rerank_llm',
     'AI_RAG_RETRY_ENABLED': 'ai_rag_retry_enabled',
     'AI_RAG_RETRY_THRESHOLD': 'ai_rag_retry_threshold',
+    'FEEDBACK_TRAIN_INTERVAL_HOURS': 'feedback_train_interval_hours',
+    'FEEDBACK_TRAIN_CUTOFF_DAYS': 'feedback_train_cutoff_days',
     'LLM_CACHE_ENABLED': 'llm_cache_enabled',
     'LLM_CACHE_TTL_SECONDS': 'llm_cache_ttl_seconds',
     'LLM_CACHE_MAX_ITEMS': 'llm_cache_max_items',
@@ -628,7 +651,7 @@ def _facet_default_contexts() -> list[FacetQueryParams]:
             year_to='',
             size_min='',
             size_max='',
-            sources={'tags': True},
+            sources={'tags': True, 'authors': True, 'years': True},
             request_args=(),
         ),
         FacetQueryParams(
@@ -644,7 +667,7 @@ def _facet_default_contexts() -> list[FacetQueryParams]:
             year_to='',
             size_min='',
             size_max='',
-            sources={'tags': True},
+            sources={'tags': True, 'authors': True, 'years': True},
             request_args=(('context', ('graph',)),),
         ),
     ]
@@ -912,7 +935,9 @@ def _row_text_for_search(f: File) -> str:
 AI_EXPAND_CACHE: dict[str, tuple[float, list[str], list[tuple[str, int]]]] = {}
 AI_KEYWORD_PLAN_CACHE: dict[str, tuple[float, Dict[str, List[str]]]] = {}
 QUERY_VARIANT_CACHE: dict[str, tuple[float, List[str]]] = {}
-AUTHORITY_GRAPH_CACHE: dict[str, tuple[float, Dict[int, float]]] = {}
+AuthorityCacheEntry = Dict[str, Any]
+AUTHORITY_GRAPH_CACHE: dict[str, AuthorityCacheEntry] = {}
+AI_FEEDBACK_MODEL_CACHE: tuple[float, Dict[int, Dict[str, Any]]] = (0.0, {})
 
 try:
     QUERY_VARIANT_TTL = float(os.getenv("AI_QUERY_VARIANT_TTL", "600") or 600.0)
@@ -944,6 +969,27 @@ AI_BOOST_SNIPPET_COOCCUR = _getf('AI_BOOST_SNIPPET_COOCCUR', 0.8)
 SNIPPET_CACHE_TTL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_TTL_HOURS', '24'))
 KEYWORD_IDF_MIN = float(os.getenv('KEYWORD_IDF_MIN', '1.25'))
 CACHE_CLEANUP_INTERVAL_HOURS = int(os.getenv('AI_SNIPPET_CACHE_SWEEP_INTERVAL_HOURS', '24'))
+try:
+    FEEDBACK_MODEL_TTL = float(os.getenv("AI_FEEDBACK_TTL", "600") or 600.0)
+except Exception:
+    FEEDBACK_MODEL_TTL = 600.0
+FEEDBACK_POS_PRIOR = _getf('AI_FEEDBACK_POS_PRIOR', 1.0)
+FEEDBACK_NEG_PRIOR = _getf('AI_FEEDBACK_NEG_PRIOR', 1.0)
+FEEDBACK_CLICK_WEIGHT = _getf('AI_FEEDBACK_CLICK_WEIGHT', 0.5)
+FEEDBACK_MAX_WEIGHT = _getf('AI_FEEDBACK_MAX_WEIGHT', 2.5)
+AI_FEEDBACK_WEIGHT_SCALE = _getf('AI_FEEDBACK_WEIGHT_SCALE', 0.8)
+RAG_FEEDBACK_WEIGHT_SCALE = _getf('RAG_FEEDBACK_WEIGHT_SCALE', 0.5)
+try:
+    FEEDBACK_TRAIN_INTERVAL_HOURS = float(os.getenv("AI_FEEDBACK_TRAIN_INTERVAL_HOURS", "0") or 0.0)
+except Exception:
+    FEEDBACK_TRAIN_INTERVAL_HOURS = 0.0
+try:
+    FEEDBACK_TRAIN_CUTOFF_DAYS = int(os.getenv("AI_FEEDBACK_TRAIN_CUTOFF_DAYS", "90") or 90)
+except Exception:
+    FEEDBACK_TRAIN_CUTOFF_DAYS = 90
+
+FEEDBACK_SCHEDULER_EVENT = threading.Event()
+FEEDBACK_LAST_TRIGGER_AT = 0.0
 
 def _now() -> float:
     return time.time()
@@ -1044,6 +1090,7 @@ def _prune_expired_snippet_cache() -> int:
 
 
 _CLEANUP_THREAD_STARTED = False
+_FEEDBACK_THREAD_STARTED = False
 
 
 def _start_cache_cleanup_scheduler() -> None:
@@ -1064,6 +1111,43 @@ def _start_cache_cleanup_scheduler() -> None:
 
     threading.Thread(target=loop, name='ai-snippet-cache-cleaner', daemon=True).start()
     _CLEANUP_THREAD_STARTED = True
+
+
+def _start_feedback_training_scheduler() -> None:
+    global _FEEDBACK_THREAD_STARTED
+    if _FEEDBACK_THREAD_STARTED:
+        return
+    if FEEDBACK_TRAIN_INTERVAL_HOURS <= 0:
+        _FEEDBACK_THREAD_STARTED = True
+        return
+
+    interval = max(1.0, FEEDBACK_TRAIN_INTERVAL_HOURS) * 3600
+
+    def _queue_training(trigger: str) -> None:
+        try:
+            with app.app_context():
+                task_id, queued = _enqueue_feedback_training(
+                    cutoff_days=FEEDBACK_TRAIN_CUTOFF_DAYS,
+                    trigger=trigger,
+                    submitted_by=None,
+                    allow_duplicate=False,
+                )
+                if queued:
+                    app.logger.info("[ai-feedback] queued training task #%s (%s)", task_id, trigger)
+                else:
+                    app.logger.info("[ai-feedback] training already running (task #%s)", task_id)
+        except Exception:
+            app.logger.exception("[ai-feedback] failed to queue training (%s)", trigger)
+
+    _queue_training('initial')
+
+    def loop():
+        while True:
+            time.sleep(interval)
+            _queue_training('schedule')
+
+    threading.Thread(target=loop, name='ai-feedback-trainer', daemon=True).start()
+    _FEEDBACK_THREAD_STARTED = True
 
 def _record_search_metric(query_hash: str, durations: dict[str, float], user: User | None, meta_extra: dict | None = None):
     try:
@@ -5931,7 +6015,7 @@ def api_facets():
         year_to=year_to,
         size_min=size_min,
         size_max=size_max,
-        sources={'tags': True},
+        sources={'tags': True, 'authors': True, 'years': True},
         request_args=request_args_tuple,
     )
 
@@ -6868,6 +6952,431 @@ def diag_transcribe():
         res["warnings"].append(f"unexpected:{e}")
     return jsonify(res), 500
 
+
+def _format_bytes_short(num: float | int | None) -> str | None:
+    if num is None:
+        return None
+    try:
+        value = float(num)
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        value = 0.0
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    idx = 0
+    while value >= 1024 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(value)} {units[idx]}"
+    return f"{value:.1f} {units[idx]}"
+
+
+def _format_duration_brief(seconds: float | int | None) -> str | None:
+    if seconds is None:
+        return None
+    try:
+        total = int(max(0, float(seconds)))
+    except (TypeError, ValueError):
+        return None
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _isoformat_dt(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        trimmed = value.replace(microsecond=0)
+        if trimmed.tzinfo is None:
+            return trimmed.isoformat() + "Z"
+        return trimmed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+
+
+def _isoformat_ts(value: float | int | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+@admin_bp.route('/status/overview', methods=['GET'])
+@require_admin
+def api_admin_status_overview():
+    now = datetime.utcnow().replace(microsecond=0)
+    queue_stats = get_task_queue().stats()
+    warnings: list[str] = []
+    errors: dict[str, str] = {}
+
+    uptime_seconds = max(0.0, time.time() - APP_START_TIME)
+    app_info = {
+        'created_at': _isoformat_dt(now),
+        'started_at': _isoformat_dt(APP_STARTED_AT),
+        'uptime_seconds': uptime_seconds,
+        'uptime_human': _format_duration_brief(uptime_seconds),
+        'environment': current_app.config.get('ENV'),
+        'debug': bool(current_app.debug),
+        'version': current_app.config.get('APP_VERSION'),
+    }
+
+    system_info = {
+        'host': platform.node(),
+        'platform': platform.platform(),
+        'python_version': platform.python_version(),
+        'pid': os.getpid(),
+        'timezone': time.tzname,
+    }
+    try:
+        load_avg = os.getloadavg()
+        system_info['load_average'] = [round(load_avg[0], 2), round(load_avg[1], 2), round(load_avg[2], 2)]
+    except (AttributeError, OSError):
+        system_info['load_average'] = None
+
+    queue_info = {
+        'name': queue_stats.get('name'),
+        'workers': queue_stats.get('workers'),
+        'max_workers': queue_stats.get('max_workers'),
+        'queued': queue_stats.get('queued'),
+        'started': bool(queue_stats.get('started')),
+        'shutdown': bool(queue_stats.get('shutdown')),
+    }
+    queue_status = 'ok'
+    if not queue_info['started']:
+        queue_status = 'warning'
+        warnings.append('Очередь фоновых задач не запущена')
+    elif queue_info['shutdown']:
+        queue_status = 'warning'
+        warnings.append('Очередь фоновых задач помечена как остановленная')
+    queue_info['status'] = queue_status
+
+    # Database health
+    db_status = 'ok'
+    try:
+        db.session.execute(text('SELECT 1'))
+        db.session.commit()
+    except Exception as exc:
+        db_status = 'error'
+        errors['database'] = str(exc)
+        warnings.append('Ошибка проверки соединения с базой данных')
+        db.session.rollback()
+
+    counts: dict[str, Optional[int]] = {
+        'files': None,
+        'collections': None,
+        'users': None,
+        'tags': None,
+        'rag_documents': None,
+    }
+    user_roles: dict[str, int] = {}
+    rag_status_counts: dict[str, int] = {}
+    rag_last_indexed = None
+
+    if db_status == 'ok':
+        try:
+            counts['files'] = int(db.session.query(func.count(File.id)).scalar() or 0)
+        except Exception as exc:
+            errors['files_count'] = str(exc)
+            warnings.append('Не удалось получить количество файлов')
+            db.session.rollback()
+        try:
+            counts['collections'] = int(db.session.query(func.count(Collection.id)).scalar() or 0)
+        except Exception as exc:
+            errors['collections_count'] = str(exc)
+            warnings.append('Не удалось получить количество коллекций')
+            db.session.rollback()
+        try:
+            counts['tags'] = int(db.session.query(func.count(Tag.id)).scalar() or 0)
+        except Exception as exc:
+            errors['tags_count'] = str(exc)
+            warnings.append('Не удалось получить количество тегов')
+            db.session.rollback()
+        try:
+            counts['users'] = int(db.session.query(func.count(User.id)).scalar() or 0)
+        except Exception as exc:
+            errors['users_count'] = str(exc)
+            warnings.append('Не удалось получить количество пользователей')
+            db.session.rollback()
+        try:
+            counts['rag_documents'] = int(db.session.query(func.count(RagDocument.id)).scalar() or 0)
+        except Exception as exc:
+            errors['rag_documents_count'] = str(exc)
+            warnings.append('Не удалось получить количество RAG-документов')
+            db.session.rollback()
+
+        try:
+            role_rows = db.session.query(User.role, func.count(User.id)).group_by(User.role).all()
+            user_roles = {str(role or 'unknown'): int(count or 0) for role, count in role_rows}
+        except Exception as exc:
+            errors['user_roles'] = str(exc)
+            warnings.append('Не удалось получить распределение ролей пользователей')
+            db.session.rollback()
+
+        try:
+            rag_rows = (
+                db.session.query(RagDocument.import_status, func.count(RagDocument.id))
+                .group_by(RagDocument.import_status)
+                .all()
+            )
+            rag_status_counts = {str(status or 'unknown'): int(count or 0) for status, count in rag_rows}
+            rag_last_indexed = db.session.query(func.max(RagDocument.last_indexed_at)).scalar()
+        except Exception as exc:
+            errors['rag_status'] = str(exc)
+            warnings.append('Не удалось получить статус RAG-индексации')
+            db.session.rollback()
+
+    db_path = getattr(CONFIG, 'catalogue_db_path', None)
+    db_size_bytes: Optional[int] = None
+    if isinstance(db_path, Path):
+        try:
+            if db_path.exists():
+                db_size_bytes = db_path.stat().st_size
+        except Exception as exc:
+            errors['database_size'] = str(exc)
+            warnings.append('Не удалось определить размер базы данных')
+
+    database_info = {
+        'status': db_status,
+        'path': str(db_path) if db_path else None,
+        'size_bytes': db_size_bytes,
+        'size_pretty': _format_bytes_short(db_size_bytes),
+        'counts': counts,
+        'user_roles': user_roles,
+        'rag_status': {
+            'counts': rag_status_counts,
+            'last_indexed_at': _isoformat_dt(rag_last_indexed),
+        },
+    }
+
+    # Tasks summary
+    task_counts: dict[str, int] = {}
+    active_oldest: dict[str, Any] | None = None
+    recent_tasks: list[dict[str, Any]] = []
+    if db_status == 'ok':
+        try:
+            rows = db.session.query(TaskRecord.status, func.count(TaskRecord.id)).group_by(TaskRecord.status).all()
+            task_counts = {str(status or 'unknown'): int(count or 0) for status, count in rows}
+        except Exception as exc:
+            errors['task_counts'] = str(exc)
+            warnings.append('Не удалось получить распределение задач')
+            db.session.rollback()
+        try:
+            active = (
+                TaskRecord.query.filter(TaskRecord.status.notin_(TASK_FINAL_STATUSES))
+                .order_by(TaskRecord.created_at.asc())
+                .first()
+            )
+            if active:
+                active_oldest = _task_to_dict(active)
+        except Exception as exc:
+            errors['task_active'] = str(exc)
+            warnings.append('Не удалось получить активные задачи')
+            db.session.rollback()
+        try:
+            rows = TaskRecord.query.order_by(TaskRecord.created_at.desc()).limit(5).all()
+            recent_tasks = [_task_to_dict(task) for task in rows]
+        except Exception as exc:
+            errors['task_recent'] = str(exc)
+            warnings.append('Не удалось получить последние задачи')
+            db.session.rollback()
+
+    tasks_info = {
+        'counts': task_counts,
+        'oldest_active': active_oldest,
+        'recent': recent_tasks,
+    }
+
+    # AI metrics snapshot
+    ai_metrics_info: dict[str, Any] = {
+        'window_size': 0,
+        'latency_avg_ms': None,
+        'last_measurement': None,
+    }
+    if db_status == 'ok':
+        try:
+            metric_rows = AiSearchMetric.query.order_by(AiSearchMetric.created_at.desc()).limit(25).all()
+            ai_metrics_info['window_size'] = len(metric_rows)
+            if metric_rows:
+                totals = [row.total_ms for row in metric_rows if row.total_ms is not None]
+                if totals:
+                    ai_metrics_info['latency_avg_ms'] = round(sum(totals) / len(totals), 1)
+                last_row = metric_rows[0]
+                meta_payload: Any = last_row.meta
+                if isinstance(meta_payload, str):
+                    try:
+                        meta_payload = json.loads(meta_payload)
+                    except Exception:
+                        meta_payload = {'raw': meta_payload}
+                ai_metrics_info['last_measurement'] = {
+                    'id': last_row.id,
+                    'created_at': _isoformat_dt(last_row.created_at),
+                    'total_ms': last_row.total_ms,
+                    'keywords_ms': last_row.keywords_ms,
+                    'candidate_ms': last_row.candidate_ms,
+                    'deep_ms': last_row.deep_ms,
+                    'llm_answer_ms': last_row.llm_answer_ms,
+                    'llm_snippet_ms': last_row.llm_snippet_ms,
+                    'meta': meta_payload,
+                }
+        except Exception as exc:
+            errors['ai_metrics'] = str(exc)
+            warnings.append('Не удалось получить окна AI-метрик')
+            db.session.rollback()
+
+    # Scan snapshot
+    scan_scope = None
+    scope_payload = SCAN_PROGRESS.get('scope')
+    if isinstance(scope_payload, dict):
+        scan_scope = {
+            'type': scope_payload.get('type'),
+            'label': scope_payload.get('label'),
+            'count': scope_payload.get('count'),
+        }
+    processed = SCAN_PROGRESS.get('processed') or 0
+    total = SCAN_PROGRESS.get('total') or 0
+    percent = None
+    try:
+        total_val = float(total)
+        processed_val = float(processed)
+        if total_val > 0:
+            percent = round(min(100.0, max(0.0, (processed_val / total_val) * 100)), 1)
+    except Exception:
+        percent = None
+    scan_info = {
+        'running': bool(SCAN_PROGRESS.get('running')),
+        'stage': SCAN_PROGRESS.get('stage'),
+        'updated_at': _isoformat_ts(SCAN_PROGRESS.get('updated_at')),
+        'processed': processed,
+        'total': total,
+        'added': SCAN_PROGRESS.get('added'),
+        'updated': SCAN_PROGRESS.get('updated'),
+        'removed': SCAN_PROGRESS.get('removed'),
+        'current': SCAN_PROGRESS.get('current'),
+        'eta_seconds': SCAN_PROGRESS.get('eta_seconds'),
+        'eta_human': _format_duration_brief(SCAN_PROGRESS.get('eta_seconds')),
+        'percent': percent,
+        'scope': scan_scope,
+        'task_id': SCAN_PROGRESS.get('task_id'),
+        'last_log': None,
+        'error': SCAN_PROGRESS.get('error'),
+    }
+    history = SCAN_PROGRESS.get('history') or []
+    if isinstance(history, list) and history:
+        last_entry = history[-1]
+        if isinstance(last_entry, dict):
+            scan_info['last_log'] = {
+                'at': _isoformat_ts(last_entry.get('t')),
+                'level': last_entry.get('level'),
+                'message': last_entry.get('msg'),
+            }
+    if scan_info['error']:
+        warnings.append('Обнаружена ошибка в последнем сканировании')
+
+    # Runtime snapshot
+    rt = runtime_settings_store.current
+    runtime_info = {
+        'scan_root': str(rt.scan_root),
+        'import_subdir': rt.import_subdir,
+        'default_use_llm': bool(rt.default_use_llm),
+        'default_prune': bool(rt.default_prune),
+        'keywords_to_tags_enabled': bool(rt.keywords_to_tags_enabled),
+        'transcribe_enabled': bool(rt.transcribe_enabled),
+        'images_vision_enabled': bool(rt.images_vision_enabled),
+        'ai_query_variants_max': int(rt.ai_query_variants_max),
+        'lm_default_provider': rt.lm_default_provider,
+    }
+    try:
+        usage = shutil.disk_usage(rt.scan_root)
+        runtime_info['disk_usage'] = {
+            'total_bytes': usage.total,
+            'used_bytes': usage.used,
+            'free_bytes': usage.free,
+            'total_pretty': _format_bytes_short(usage.total),
+            'used_pretty': _format_bytes_short(usage.used),
+            'free_pretty': _format_bytes_short(usage.free),
+        }
+    except Exception as exc:
+        errors['disk_usage'] = str(exc)
+
+    service_flags = {
+        'cache_cleanup': {
+            'enabled': CACHE_CLEANUP_INTERVAL_HOURS > 0,
+            'running': _CLEANUP_THREAD_STARTED,
+            'interval_hours': CACHE_CLEANUP_INTERVAL_HOURS,
+        },
+        'feedback_trainer': {
+            'enabled': FEEDBACK_TRAIN_INTERVAL_HOURS > 0,
+            'running': _FEEDBACK_THREAD_STARTED,
+            'interval_hours': FEEDBACK_TRAIN_INTERVAL_HOURS,
+        },
+    }
+    if service_flags['cache_cleanup']['enabled'] and not service_flags['cache_cleanup']['running']:
+        warnings.append('Поток очистки кэша не запущен')
+    if service_flags['feedback_trainer']['enabled'] and not service_flags['feedback_trainer']['running']:
+        warnings.append('Планировщик обучения AI-фидбэка не запущен')
+
+    rag_ready = None
+    rag_pending = None
+    if db_status == 'ok':
+        try:
+            rag_ready = int(
+                db.session.query(func.count(RagDocument.id))
+                .filter(RagDocument.is_ready_for_rag.is_(True))
+                .scalar() or 0
+            )
+            rag_pending = int(
+                db.session.query(func.count(RagDocument.id))
+                .filter(RagDocument.import_status != 'ready')
+                .scalar() or 0
+            )
+        except Exception as exc:
+            errors['rag_overview'] = str(exc)
+            db.session.rollback()
+    rag_overview = {
+        'ready': rag_ready,
+        'pending': rag_pending,
+    }
+
+    status = 'ok'
+    if db_status == 'error':
+        status = 'error'
+    elif warnings:
+        status = 'degraded'
+
+    payload = {
+        'ok': status != 'error',
+        'status': status,
+        'generated_at': _isoformat_dt(now),
+        'warnings': warnings,
+        'errors': errors,
+        'app': app_info,
+        'system': system_info,
+        'queue': queue_info,
+        'database': database_info,
+        'tasks': tasks_info,
+        'ai_search': ai_metrics_info,
+        'scan': scan_info,
+        'runtime': runtime_info,
+        'services': service_flags,
+        'rag': rag_overview,
+    }
+    return jsonify(payload)
+
+
 @admin_bp.route('/ai-search/metrics', methods=['GET', 'DELETE'])
 @require_admin
 def api_admin_ai_metrics():
@@ -6914,12 +7423,142 @@ def api_admin_ai_metrics():
                 summary[field] = sum(vals) / len(vals)
     return jsonify({'ok': True, 'items': payload, 'summary': summary})
 
+
+@admin_bp.route('/ai-search/feedback/train', methods=['POST'])
+@require_admin
+def api_admin_feedback_train():
+    user = _load_current_user()
+    payload = request.get_json(silent=True) or {}
+    cutoff_days_raw = payload.get('cutoff_days')
+    cutoff_days: Optional[int]
+    if cutoff_days_raw is None:
+        cutoff_days = FEEDBACK_TRAIN_CUTOFF_DAYS
+    else:
+        try:
+            cutoff_days = int(cutoff_days_raw)
+        except Exception:
+            return jsonify({'ok': False, 'error': 'invalid_cutoff'}), 400
+    allow_duplicate = bool(payload.get('allow_duplicate'))
+    task_id, queued = _enqueue_feedback_training(
+        cutoff_days=cutoff_days,
+        trigger='manual',
+        submitted_by=getattr(user, 'id', None),
+        allow_duplicate=allow_duplicate,
+    )
+    return jsonify({'ok': True, 'async': True, 'task_id': task_id, 'queued': queued})
+
+
+@admin_bp.route('/ai-search/feedback/model', methods=['GET'])
+@require_admin
+def api_admin_feedback_model():
+    try:
+        limit = int(request.args.get('limit', '50'))
+    except Exception:
+        limit = 50
+    limit = max(1, min(limit, 200))
+    try:
+        feedback_lookup = _get_feedback_weights()
+    except Exception as exc:
+        app.logger.debug("feedback model inspect failed: %s", exc)
+        feedback_lookup = {}
+    if not feedback_lookup:
+        return jsonify({'ok': True, 'total': 0, 'positive': [], 'negative': []})
+
+    positive_items = [(fid, info) for fid, info in feedback_lookup.items() if float(info.get('weight', 0.0) or 0.0) > 0]
+    negative_items = [(fid, info) for fid, info in feedback_lookup.items() if float(info.get('weight', 0.0) or 0.0) < 0]
+    pos_sorted = sorted(positive_items, key=lambda item: float(item[1].get('weight', 0.0) or 0.0), reverse=True)[:limit]
+    neg_sorted = sorted(negative_items, key=lambda item: float(item[1].get('weight', 0.0) or 0.0))[:limit]
+    needed_ids = {fid for fid, _ in pos_sorted + neg_sorted}
+    file_meta_map: Dict[int, File] = {}
+    if needed_ids:
+        try:
+            rows = (
+                File.query.outerjoin(Collection, File.collection_id == Collection.id)
+                .filter(File.id.in_(needed_ids))
+                .all()
+            )
+            file_meta_map = {int(row.id): row for row in rows if getattr(row, 'id', None)}
+        except Exception as exc:
+            app.logger.debug("feedback model meta failed: %s", exc)
+            file_meta_map = {}
+
+    def _serialize(fid: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        row = file_meta_map.get(fid)
+        title = None
+        author_name = None
+        collection_id = None
+        collection_name = None
+        year_val = None
+        if row is not None:
+            title = row.title or row.filename or row.rel_path or f"Документ {fid}"
+            author_name = row.author
+            collection_id = row.collection_id
+            year_val = row.year
+            try:
+                if getattr(row, "collection", None):
+                    collection_name = row.collection.name
+            except Exception:
+                collection_name = None
+        else:
+            title = f"Документ {fid}"
+        return {
+            'file_id': fid,
+            'title': title,
+            'author': author_name,
+            'year': year_val,
+            'collection_id': collection_id,
+            'collection_name': collection_name,
+            'weight': round(float(payload.get('weight', 0.0) or 0.0), 6),
+            'positive': int(payload.get('positive', 0) or 0),
+            'negative': int(payload.get('negative', 0) or 0),
+            'clicks': int(payload.get('clicks', 0) or 0),
+            'updated_at': payload.get('updated_at'),
+        }
+
+    return jsonify({
+        'ok': True,
+        'total': len(feedback_lookup),
+        'positive': [_serialize(fid, payload) for fid, payload in pos_sorted],
+        'negative': [_serialize(fid, payload) for fid, payload in neg_sorted],
+    })
+
+
+@admin_bp.route('/ai-search/feedback/status', methods=['GET'])
+@require_admin
+def api_admin_feedback_status():
+    scheduler_enabled = FEEDBACK_TRAIN_INTERVAL_HOURS > 0
+    try:
+        total_weighted = db.session.query(func.count(AiSearchFeedbackModel.file_id)).scalar() or 0
+    except Exception:
+        total_weighted = 0
+    try:
+        last_updated = db.session.query(func.max(AiSearchFeedbackModel.updated_at)).scalar()
+    except Exception:
+        last_updated = None
+    active_task = TaskRecord.query.filter(
+        TaskRecord.name == 'feedback_train',
+        TaskRecord.status.notin_(TASK_FINAL_STATUSES),
+    ).order_by(TaskRecord.created_at.desc()).first()
+    last_task = TaskRecord.query.filter(TaskRecord.name == 'feedback_train').order_by(TaskRecord.created_at.desc()).first()
+    return jsonify({
+        'ok': True,
+        'scheduler_enabled': scheduler_enabled,
+        'interval_hours': FEEDBACK_TRAIN_INTERVAL_HOURS,
+        'cutoff_days': FEEDBACK_TRAIN_CUTOFF_DAYS,
+        'thread_started': _FEEDBACK_THREAD_STARTED,
+        'total_weighted': int(total_weighted),
+        'last_updated_at': last_updated.isoformat() if last_updated else None,
+        'active_task': _task_to_dict(active_task) if active_task else None,
+        'last_task': _task_to_dict(last_task) if last_task else None,
+    })
+
 # ------------------- Statistics & Visualization -------------------
 from collections import Counter, defaultdict
 
 @app.route("/api/stats")
 def api_stats():
     # Агрегация по авторам, годам, типам материалов
+    allowed_scope = _current_allowed_collections()
     try:
         files = File.query.join(Collection, File.collection_id == Collection.id).filter(Collection.searchable == True).all()
     except Exception:
@@ -7090,6 +7729,116 @@ def api_stats():
         'total_tags': tags_total,
     }
 
+    authority_docs: List[Dict[str, Any]] = []
+    authority_authors: List[Dict[str, Any]] = []
+    authority_topics: List[Dict[str, Any]] = []
+    authority_collections: List[Dict[str, Any]] = []
+    try:
+        snapshot = _compute_authority_snapshot(allowed_scope)
+    except Exception as exc:
+        app.logger.debug("authority stats computation failed: %s", exc)
+        snapshot = None
+    if snapshot:
+        doc_scores = snapshot.get("doc_scores", {}) or {}
+        if doc_scores:
+            top_docs = heapq.nlargest(10, doc_scores.items(), key=lambda item: item[1])
+            doc_ids = [int(fid) for fid, _ in top_docs]
+            if doc_ids:
+                doc_query = File.query.outerjoin(Collection, File.collection_id == Collection.id)
+                doc_query = _apply_file_access_filter(doc_query)
+                doc_rows = doc_query.filter(File.id.in_(doc_ids)).all()
+                doc_map = {int(row.id): row for row in doc_rows if getattr(row, "id", None)}
+                for fid, score in top_docs:
+                    row = doc_map.get(int(fid))
+                    if not row:
+                        continue
+                    try:
+                        collection_name = row.collection.name if getattr(row, "collection", None) else None
+                    except Exception:
+                        collection_name = None
+                    authority_docs.append({
+                        "id": int(fid),
+                        "score": round(float(score), 6),
+                        "title": row.title or row.filename or row.rel_path or f"Документ {fid}",
+                        "author": row.author,
+                        "year": row.year,
+                        "collection_id": row.collection_id,
+                        "collection_name": collection_name,
+                    })
+        authority_authors = list(snapshot.get("author_entries", [])[:10])
+        authority_topics = list(snapshot.get("topic_entries", [])[:12])
+        authority_collections = list(snapshot.get("collection_entries", [])[:10])
+
+    feedback_positive: List[Dict[str, Any]] = []
+    feedback_negative: List[Dict[str, Any]] = []
+    feedback_summary: Optional[Dict[str, Any]] = None
+    try:
+        feedback_lookup = _get_feedback_weights()
+    except Exception as exc:
+        app.logger.debug("feedback stats lookup failed: %s", exc)
+        feedback_lookup = {}
+    if feedback_lookup:
+        positive_items = [(fid, info) for fid, info in feedback_lookup.items() if float(info.get('weight', 0.0) or 0.0) > 0]
+        negative_items = [(fid, info) for fid, info in feedback_lookup.items() if float(info.get('weight', 0.0) or 0.0) < 0]
+        pos_sorted = sorted(positive_items, key=lambda item: float(item[1].get('weight', 0.0) or 0.0), reverse=True)[:10]
+        neg_sorted = sorted(negative_items, key=lambda item: float(item[1].get('weight', 0.0) or 0.0))[:10]
+        needed_ids = {fid for fid, _ in pos_sorted + neg_sorted}
+        file_meta_map: Dict[int, File] = {}
+        if needed_ids:
+            try:
+                rows = (
+                    File.query.outerjoin(Collection, File.collection_id == Collection.id)
+                    .filter(File.id.in_(needed_ids))
+                    .all()
+                )
+                file_meta_map = {int(row.id): row for row in rows if getattr(row, 'id', None)}
+            except Exception as exc:
+                app.logger.debug("feedback stats meta failed: %s", exc)
+                file_meta_map = {}
+
+        def _feedback_entry(fid: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+            row = file_meta_map.get(fid)
+            title = None
+            author_name = None
+            collection_name = None
+            collection_id = None
+            year_val = None
+            if row is not None:
+                title = row.title or row.filename or row.rel_path or f"Документ {fid}"
+                author_name = row.author
+                year_val = row.year
+                collection_id = row.collection_id
+                try:
+                    if getattr(row, "collection", None):
+                        collection_name = row.collection.name
+                except Exception:
+                    collection_name = None
+            else:
+                title = f"Документ {fid}"
+            return {
+                "file_id": fid,
+                "title": title,
+                "author": author_name,
+                "year": year_val,
+                "collection_id": collection_id,
+                "collection_name": collection_name,
+                "weight": round(float(payload.get('weight', 0.0) or 0.0), 6),
+                "positive": int(payload.get('positive', 0) or 0),
+                "negative": int(payload.get('negative', 0) or 0),
+                "clicks": int(payload.get('clicks', 0) or 0),
+                "updated_at": payload.get('updated_at'),
+            }
+
+        feedback_positive = [_feedback_entry(fid, payload) for fid, payload in pos_sorted]
+        feedback_negative = [_feedback_entry(fid, payload) for fid, payload in neg_sorted]
+        pos_count = len([1 for _, info in feedback_lookup.items() if float(info.get('weight', 0.0) or 0.0) > 0])
+        neg_count = len([1 for _, info in feedback_lookup.items() if float(info.get('weight', 0.0) or 0.0) < 0])
+        feedback_summary = {
+            "total_files": len(feedback_lookup),
+            "positive": pos_count,
+            "negative": neg_count,
+        }
+
     return jsonify({
         "authors": authors.most_common(20),
         "authors_cloud": authors.most_common(100),
@@ -7116,6 +7865,71 @@ def api_stats():
             "30d": int(recent_counts['30d']),
         },
         "tags_summary": tags_summary,
+        "authority_docs": authority_docs,
+        "authority_authors": authority_authors,
+        "authority_topics": authority_topics,
+        "authority_collections": authority_collections,
+        "feedback_positive": feedback_positive,
+        "feedback_negative": feedback_negative,
+        "feedback_summary": feedback_summary,
+    })
+
+@app.route('/api/authority')
+def api_authority_summary():
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    allowed_scope = _current_allowed_collections()
+    try:
+        snapshot = _compute_authority_snapshot(allowed_scope)
+    except Exception as exc:
+        app.logger.debug("authority summary failed: %s", exc)
+        snapshot = None
+    if not snapshot:
+        return jsonify({
+            "generated_at": None,
+            "documents": [],
+            "authors": [],
+            "topics": [],
+            "collections": [],
+        })
+    doc_scores = snapshot.get("doc_scores", {}) or {}
+    top_docs = heapq.nlargest(20, doc_scores.items(), key=lambda item: item[1])
+    doc_ids = [int(fid) for fid, _ in top_docs]
+    doc_entries: List[Dict[str, Any]] = []
+    if doc_ids:
+        doc_query = File.query.outerjoin(Collection, File.collection_id == Collection.id)
+        doc_query = _apply_file_access_filter(doc_query)
+        rows = doc_query.filter(File.id.in_(doc_ids)).all()
+        row_map = {int(row.id): row for row in rows if getattr(row, "id", None)}
+        for fid, score in top_docs:
+            row = row_map.get(int(fid))
+            if not row:
+                continue
+            try:
+                collection_name = row.collection.name if getattr(row, "collection", None) else None
+            except Exception:
+                collection_name = None
+            doc_entries.append({
+                "id": int(fid),
+                "score": round(float(score), 6),
+                "title": row.title or row.filename or row.rel_path or f"Документ {fid}",
+                "author": row.author,
+                "year": row.year,
+                "collection_id": row.collection_id,
+                "collection_name": collection_name,
+            })
+    generated_at = snapshot.get("generated_at")
+    try:
+        generated_iso = datetime.utcfromtimestamp(float(generated_at)).isoformat() if generated_at else None
+    except Exception:
+        generated_iso = None
+    return jsonify({
+        "generated_at": generated_iso,
+        "documents": doc_entries,
+        "authors": snapshot.get("author_entries", [])[:20],
+        "topics": snapshot.get("topic_entries", [])[:40],
+        "collections": snapshot.get("collection_entries", [])[:20],
     })
 
 @app.route('/api/stats/tag-values')
@@ -8068,6 +8882,12 @@ def _prepare_rag_context(
             fid = getattr(doc, 'file_id', None)
             if fid and fid in global_authority_scores:
                 file_authority_scores[int(fid)] = float(global_authority_scores.get(fid, 0.0))
+    file_feedback_scores: Dict[int, float] = {}
+    if feedback_weights_lookup:
+        for doc in documents:
+            fid = getattr(doc, 'file_id', None)
+            if fid and fid in feedback_weights_lookup:
+                file_feedback_scores[int(fid)] = float(feedback_weights_lookup[fid].get('weight', 0.0) or 0.0)
     variant = _select_rag_embedding_variant(doc_ids)
     if not variant:
         if progress:
@@ -8179,6 +8999,7 @@ def _prepare_rag_context(
         sparse_limit=int(300 * dense_multiplier),
         max_total_tokens=_lm_safe_context_tokens(),
         rerank_fn=rag_reranker,
+        feedback_scale=RAG_FEEDBACK_WEIGHT_SCALE,
     )
     dense_hits_override: Optional[List[RetrievedChunk]] = None
     if len(query_variants) > 1:
@@ -8205,6 +9026,7 @@ def _prepare_rag_context(
         precomputed_dense_hits=dense_hits_override,
         query_terms=query_terms,
         authority_scores=file_authority_scores if file_authority_scores else None,
+        feedback_scores=file_feedback_scores if file_feedback_scores else None,
     )
     if rag_reranker:
         cfg = getattr(rag_reranker, "_config", None)
@@ -8255,6 +9077,8 @@ def _prepare_rag_context(
             extra_fields["Совпадения метаданных"] = ", ".join(cand.metadata_hits[:5])
         if cand.authority_bonus:
             extra_fields["Вес авторитета"] = f"{cand.authority_bonus:.3f}"
+        if getattr(cand, "feedback_bonus", 0.0):
+            extra_fields["Вес фидбэка"] = f"{cand.feedback_bonus:.3f}"
         if file_obj is not None:
             if getattr(file_obj, "author", None):
                 extra_fields["Автор"] = file_obj.author
@@ -8918,6 +9742,13 @@ def rag_context_cli(
         authority_scores_cli = _compute_authority_scores(None)
     except Exception:
         authority_scores_cli = {}
+    try:
+        feedback_scores_cli = {
+            int(fid): float(entry.get("weight", 0.0) or 0.0)
+            for fid, entry in _get_feedback_weights().items()
+        }
+    except Exception:
+        feedback_scores_cli = {}
     query_terms_cli = _tokenize_query(query)
     mode = (rerank_mode or "none").lower()
 
@@ -8970,6 +9801,7 @@ def rag_context_cli(
         min_combined_score=min_combined_score,
         max_total_tokens=max_tokens if max_tokens > 0 else None,
         rerank_fn=rerank_fn,
+        feedback_scale=RAG_FEEDBACK_WEIGHT_SCALE,
     )
     contexts = selector.select(
         query=query,
@@ -8979,6 +9811,7 @@ def rag_context_cli(
         max_total_tokens=max_tokens if max_tokens > 0 else None,
         query_terms=query_terms_cli,
         authority_scores=authority_scores_cli if authority_scores_cli else None,
+        feedback_scores=feedback_scores_cli if feedback_scores_cli else None,
     )
     if rerank_instance:
         try:
@@ -11121,23 +11954,32 @@ def _normalize_tag_value(value: str) -> str:
     return cleaned.lower()
 
 
-def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = None) -> Dict[int, float]:
+def _compute_authority_snapshot(allowed_collections: Optional[Iterable[int]] = None) -> AuthorityCacheEntry:
     scope_key = "*"
     allowed_set: Optional[frozenset[int]] = None
     if allowed_collections is not None:
         allowed_set = frozenset(int(cid) for cid in allowed_collections)
         scope_key = ",".join(str(cid) for cid in sorted(allowed_set)) or "none"
-    now = time.monotonic()
+    now_monotonic = time.monotonic()
     cached = AUTHORITY_GRAPH_CACHE.get(scope_key)
-    if cached and (now - cached[0]) < AUTHORITY_GRAPH_TTL:
-        return dict(cached[1])
+    if cached and (now_monotonic - float(cached.get("timestamp", 0.0))) < AUTHORITY_GRAPH_TTL:
+        return cached
 
     try:
         file_query = File.query.outerjoin(Collection, File.collection_id == Collection.id)
         if allowed_set is not None:
             if not allowed_set:
-                AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
-                return {}
+                snapshot_empty = {
+                    "timestamp": now_monotonic,
+                    "generated_at": time.time(),
+                    "doc_scores": {},
+                    "author_entries": [],
+                    "collection_entries": [],
+                    "topic_entries": [],
+                    "topic_index": {},
+                }
+                AUTHORITY_GRAPH_CACHE[scope_key] = snapshot_empty
+                return snapshot_empty
             file_query = file_query.filter(File.collection_id.in_(allowed_set))
         else:
             file_query = file_query.filter(or_(Collection.searchable == True, Collection.id.is_(None)))
@@ -11147,14 +11989,29 @@ def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = Non
         files = []
 
     if not files:
-        AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
-        return {}
+        snapshot_empty = {
+            "timestamp": now_monotonic,
+            "generated_at": time.time(),
+            "doc_scores": {},
+            "author_entries": [],
+            "collection_entries": [],
+            "topic_entries": [],
+            "topic_index": {},
+        }
+        AUTHORITY_GRAPH_CACHE[scope_key] = snapshot_empty
+        return snapshot_empty
 
     graph: Dict[int, Dict[int, float]] = defaultdict(dict)
     nodes: set[int] = set()
     collection_groups: Dict[int, List[int]] = defaultdict(list)
     author_groups: Dict[str, List[int]] = defaultdict(list)
     keyword_groups: Dict[str, List[int]] = defaultdict(list)
+    tag_groups: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+
+    collection_ids_seen: set[int] = set()
+    author_labels: Dict[str, str] = {}
+    keyword_labels: Dict[str, str] = {}
+    tag_labels: Dict[Tuple[str, str], str] = {}
 
     for f in files:
         if not getattr(f, "id", None):
@@ -11162,32 +12019,42 @@ def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = Non
         fid = int(f.id)
         nodes.add(fid)
         if f.collection_id:
-            collection_groups[int(f.collection_id)].append(fid)
-        author_clean = _normalize_author_name(f.author or "")
+            cid = int(f.collection_id)
+            collection_groups[cid].append(fid)
+            collection_ids_seen.add(cid)
+        author_raw = (f.author or "").strip()
+        author_clean = _normalize_author_name(author_raw)
         if author_clean:
             author_groups[author_clean].append(fid)
+            author_labels.setdefault(author_clean, author_raw or author_clean)
         keywords_field = (f.keywords or "").strip()
         if keywords_field:
             for token in re.split(r"[,;\n]+", keywords_field):
-                kw = _normalize_tag_value(token)
+                original = (token or "").strip()
+                if not original:
+                    continue
+                kw = _normalize_tag_value(original)
                 if kw:
                     keyword_groups[kw].append(fid)
+                    keyword_labels.setdefault(kw, original)
 
     try:
-        tag_query = db.session.query(Tag.file_id, Tag.value).join(File, Tag.file_id == File.id)
+        tag_query = db.session.query(Tag.file_id, Tag.key, Tag.value).join(File, Tag.file_id == File.id)
         if allowed_set is not None:
             tag_query = tag_query.filter(Tag.file_id.in_(nodes))
         rows = tag_query.all()
     except Exception:
         rows = []
-    tag_groups: Dict[str, List[int]] = defaultdict(list)
-    for fid, value in rows:
+    for fid, key, value in rows:
         fid = int(fid)
         if fid not in nodes:
             continue
+        key_str = str(key or "").strip()
         normalized = _normalize_tag_value(value or "")
-        if normalized:
-            tag_groups[normalized].append(fid)
+        if not key_str or not normalized:
+            continue
+        tag_groups[(key_str, normalized)].append(fid)
+        tag_labels.setdefault((key_str, normalized), (value or "").strip() or normalized)
 
     def _add_group(group: List[int], weight: float) -> None:
         if len(group) < 2:
@@ -11210,8 +12077,17 @@ def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = Non
         _add_group(members, 0.6)
 
     if not graph:
-        AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
-        return {}
+        snapshot_empty = {
+            "timestamp": now_monotonic,
+            "generated_at": time.time(),
+            "doc_scores": {},
+            "author_entries": [],
+            "collection_entries": [],
+            "topic_entries": [],
+            "topic_index": {},
+        }
+        AUTHORITY_GRAPH_CACHE[scope_key] = snapshot_empty
+        return snapshot_empty
 
     damping = 0.85
     max_iter = 20
@@ -11221,8 +12097,17 @@ def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = Non
         all_nodes.update(neighbors.keys())
     N = len(all_nodes)
     if N == 0:
-        AUTHORITY_GRAPH_CACHE[scope_key] = (now, {})
-        return {}
+        snapshot_empty = {
+            "timestamp": now_monotonic,
+            "generated_at": time.time(),
+            "doc_scores": {},
+            "author_entries": [],
+            "collection_entries": [],
+            "topic_entries": [],
+            "topic_index": {},
+        }
+        AUTHORITY_GRAPH_CACHE[scope_key] = snapshot_empty
+        return snapshot_empty
     base = (1.0 - damping) / N
     scores = {node: 1.0 / N for node in all_nodes}
     for _ in range(max_iter):
@@ -11243,8 +12128,313 @@ def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = Non
             break
     max_score = max(scores.values()) if scores else 1.0
     normalized_scores = {node: float(score) / max_score for node, score in scores.items() if score > 0}
-    AUTHORITY_GRAPH_CACHE[scope_key] = (now, normalized_scores)
-    return normalized_scores
+
+    def _aggregate_group(members: List[int]) -> Tuple[float, int]:
+        unique_members = list({int(m) for m in members})
+        if not unique_members:
+            return 0.0, 0
+        values = [normalized_scores.get(mid, 0.0) for mid in unique_members]
+        non_zero = [val for val in values if val > 0]
+        if not non_zero:
+            return 0.0, len(unique_members)
+        return sum(non_zero) / len(non_zero), len(unique_members)
+
+    collection_labels: Dict[int, str] = {}
+    if collection_ids_seen:
+        try:
+            col_rows = db.session.query(Collection.id, Collection.name).filter(Collection.id.in_(collection_ids_seen)).all()
+            collection_labels = {int(cid): (name or f"Коллекция {cid}") for cid, name in col_rows}
+        except Exception:
+            collection_labels = {cid: f"Коллекция {cid}" for cid in collection_ids_seen}
+
+    author_entries: List[Dict[str, Any]] = []
+    for normalized_name, members in author_groups.items():
+        score, count = _aggregate_group(members)
+        if count and score > 0:
+            author_entries.append({
+                "name": author_labels.get(normalized_name, normalized_name),
+                "score": round(score, 6),
+                "count": count,
+            })
+
+    collection_entries: List[Dict[str, Any]] = []
+    for cid, members in collection_groups.items():
+        score, count = _aggregate_group(members)
+        if count and score > 0:
+            collection_entries.append({
+                "collection_id": cid,
+                "name": collection_labels.get(cid, f"Коллекция {cid}"),
+                "score": round(score, 6),
+                "count": count,
+            })
+
+    topic_entries: List[Dict[str, Any]] = []
+    topic_index: Dict[str, float] = {}
+
+    for norm, members in keyword_groups.items():
+        score, count = _aggregate_group(members)
+        if count and score > 0:
+            label = keyword_labels.get(norm, norm)
+            topic_entries.append({
+                "key": "keyword",
+                "label": label,
+                "score": round(score, 6),
+                "count": count,
+            })
+            topic_index[f"keyword|||{norm}"] = score
+
+    for (key_str, norm_val), members in tag_groups.items():
+        score, count = _aggregate_group(members)
+        if count and score > 0:
+            label = tag_labels.get((key_str, norm_val), norm_val)
+            topic_entries.append({
+                "key": key_str,
+                "label": label,
+                "score": round(score, 6),
+                "count": count,
+            })
+            topic_index[f"{key_str}|||{norm_val}"] = score
+
+    author_entries.sort(key=lambda item: item["score"], reverse=True)
+    collection_entries.sort(key=lambda item: item["score"], reverse=True)
+    topic_entries.sort(key=lambda item: item["score"], reverse=True)
+
+    snapshot = {
+        "timestamp": now_monotonic,
+        "generated_at": time.time(),
+        "doc_scores": dict(normalized_scores),
+        "author_entries": author_entries,
+        "collection_entries": collection_entries,
+        "topic_entries": topic_entries,
+        "topic_index": topic_index,
+    }
+    AUTHORITY_GRAPH_CACHE[scope_key] = snapshot
+    return snapshot
+
+
+def _compute_authority_scores(allowed_collections: Optional[Iterable[int]] = None) -> Dict[int, float]:
+    snapshot = _compute_authority_snapshot(allowed_collections)
+    return dict(snapshot.get("doc_scores", {}))
+
+def _invalidate_feedback_model_cache() -> None:
+    global AI_FEEDBACK_MODEL_CACHE
+    AI_FEEDBACK_MODEL_CACHE = (0.0, {})
+
+
+def _get_feedback_weights() -> Dict[int, Dict[str, Any]]:
+    global AI_FEEDBACK_MODEL_CACHE
+    now = time.monotonic()
+    cache_ts, cache_payload = AI_FEEDBACK_MODEL_CACHE
+    if cache_payload and (now - cache_ts) < FEEDBACK_MODEL_TTL:
+        return cache_payload
+    try:
+        rows = AiSearchFeedbackModel.query.all()
+    except Exception as exc:
+        app.logger.debug("Feedback model fetch failed: %s", exc)
+        rows = []
+    payload: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        fid = int(getattr(row, "file_id", 0) or 0)
+        if not fid:
+            continue
+        payload[fid] = {
+            "weight": float(getattr(row, "weight", 0.0) or 0.0),
+            "positive": int(getattr(row, "positive", 0) or 0),
+            "negative": int(getattr(row, "negative", 0) or 0),
+            "clicks": int(getattr(row, "clicks", 0) or 0),
+            "updated_at": row.updated_at.isoformat() if getattr(row, "updated_at", None) else None,
+        }
+    AI_FEEDBACK_MODEL_CACHE = (now, payload)
+    return payload
+
+
+def _rebuild_feedback_model(*, cutoff_days: Optional[int] = None) -> dict:
+    with app.app_context():
+        cutoff_ts: Optional[datetime] = None
+        if cutoff_days is not None:
+            try:
+                cutoff_days = int(cutoff_days)
+                if cutoff_days > 0:
+                    cutoff_ts = datetime.utcnow() - timedelta(days=cutoff_days)
+            except Exception:
+                cutoff_ts = None
+        query = (
+            db.session.query(
+                AiSearchKeywordFeedback.file_id,
+                AiSearchKeywordFeedback.action,
+                func.count(AiSearchKeywordFeedback.id),
+                func.max(AiSearchKeywordFeedback.created_at),
+            )
+            .filter(AiSearchKeywordFeedback.file_id.isnot(None))
+        )
+        if cutoff_ts is not None:
+            query = query.filter(AiSearchKeywordFeedback.created_at >= cutoff_ts)
+        rows = query.group_by(AiSearchKeywordFeedback.file_id, AiSearchKeywordFeedback.action).all()
+        aggregates: Dict[int, Dict[str, Any]] = {}
+        for fid, action, count, last_at in rows:
+            if fid is None:
+                continue
+            fid = int(fid)
+            entry = aggregates.setdefault(
+                fid,
+                {
+                    "positive": 0,
+                    "negative": 0,
+                    "clicks": 0,
+                    "last_positive": None,
+                    "last_negative": None,
+                    "last_click": None,
+                },
+            )
+            cnt = int(count or 0)
+            if action == 'relevant':
+                entry["positive"] += cnt
+                if last_at and (entry["last_positive"] is None or last_at > entry["last_positive"]):
+                    entry["last_positive"] = last_at
+            elif action == 'click':
+                entry["clicks"] += cnt
+                if last_at and (entry["last_click"] is None or last_at > entry["last_click"]):
+                    entry["last_click"] = last_at
+            elif action == 'irrelevant':
+                entry["negative"] += cnt
+                if last_at and (entry["last_negative"] is None or last_at > entry["last_negative"]):
+                    entry["last_negative"] = last_at
+        existing_rows = {
+            row.file_id: row
+            for row in db.session.query(AiSearchFeedbackModel).all()
+        }
+        updated = 0
+        created = 0
+        processed_ids: set[int] = set()
+        now_dt = datetime.utcnow()
+        for fid, entry in aggregates.items():
+            processed_ids.add(fid)
+            row = existing_rows.get(fid)
+            if row is None:
+                row = AiSearchFeedbackModel(file_id=fid)
+                db.session.add(row)
+                created += 1
+            else:
+                updated += 1
+            positive = int(entry["positive"])
+            negative = int(entry["negative"])
+            clicks = int(entry["clicks"])
+            row.positive = positive
+            row.negative = negative
+            row.clicks = clicks
+            row.last_positive_at = entry.get("last_positive")
+            row.last_negative_at = entry.get("last_negative")
+            row.last_click_at = entry.get("last_click")
+            pos_score = positive + (FEEDBACK_CLICK_WEIGHT * clicks)
+            neg_score = negative
+            if pos_score <= 0 and neg_score <= 0:
+                weight = 0.0
+            else:
+                weight = math.log((FEEDBACK_POS_PRIOR + pos_score) / (FEEDBACK_NEG_PRIOR + max(0.0, neg_score)))
+                weight = max(-FEEDBACK_MAX_WEIGHT, min(FEEDBACK_MAX_WEIGHT, weight))
+            row.weight = weight
+            row.updated_at = now_dt
+        deleted = 0
+        for fid, row in existing_rows.items():
+            if fid not in processed_ids:
+                db.session.delete(row)
+                deleted += 1
+        db.session.commit()
+        _invalidate_feedback_model_cache()
+        return {
+            "files": len(aggregates),
+            "created": created,
+            "updated": updated,
+            "deleted": deleted,
+            "cutoff_days": cutoff_days,
+            "timestamp": now_dt.isoformat(),
+        }
+
+
+def _enqueue_feedback_training(
+    *,
+    cutoff_days: Optional[int],
+    trigger: str,
+    submitted_by: Optional[int] = None,
+    allow_duplicate: bool = False,
+) -> tuple[int, bool]:
+    active_task = TaskRecord.query.filter(
+        TaskRecord.name == 'feedback_train',
+        TaskRecord.status.notin_(TASK_FINAL_STATUSES),
+    ).order_by(TaskRecord.created_at.desc()).first()
+    if active_task and not allow_duplicate:
+        return int(active_task.id), False
+    payload = {
+        'trigger': trigger,
+        'cutoff_days': cutoff_days,
+    }
+    if submitted_by:
+        payload['submitted_by'] = int(submitted_by)
+    task = TaskRecord(
+        name='feedback_train',
+        status='queued',
+        progress=0.0,
+        payload=json.dumps(payload, ensure_ascii=False),
+    )
+    db.session.add(task)
+    db.session.commit()
+    task_id = int(task.id)
+    get_task_queue().submit(
+        _feedback_training_job,
+        task_id,
+        cutoff_days,
+        description='feedback_model_train',
+    )
+    return task_id, True
+
+
+def _feedback_training_job(task_id: int, cutoff_days: Optional[int]) -> None:
+    with app.app_context():
+        task = TaskRecord.query.get(task_id)
+        if not task:
+            return
+        try:
+            task.status = 'running'
+            task.started_at = datetime.utcnow()
+            task.progress = 0.0
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        try:
+            stats = _rebuild_feedback_model(cutoff_days=cutoff_days)
+            task = TaskRecord.query.get(task_id)
+            if task:
+                original_payload: dict = {}
+                if task.payload:
+                    try:
+                        original_payload = json.loads(task.payload)
+                    except Exception:
+                        original_payload = {}
+                payload = {
+                    'trigger': original_payload.get('trigger'),
+                    'cutoff_days': cutoff_days,
+                    'stats': stats,
+                }
+                task.status = 'completed'
+                task.finished_at = datetime.utcnow()
+                task.progress = 1.0
+                task.payload = json.dumps(payload, ensure_ascii=False)
+                db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            task = TaskRecord.query.get(task_id)
+            if task:
+                task.status = 'error'
+                task.error = str(exc)
+                task.finished_at = datetime.utcnow()
+                try:
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+            app.logger.exception("[ai-feedback] training task #%s failed", task_id)
+
+app.config['authority_snapshot_fn'] = _compute_authority_snapshot
+
 def _rrf_combine_dense_hits(
     vector_retriever: VectorRetriever,
     variant_vectors: Sequence[Tuple[str, Sequence[float]]],
@@ -11896,6 +13086,9 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
     except Exception:
         feedback_rows = []
 
+    feedback_weights_lookup = _get_feedback_weights()
+    feedback_applied_count = 0
+
     if terms:
         banned_terms = {str(row.keyword).lower() for row in feedback_rows if getattr(row, 'keyword', None) and row.action == 'irrelevant'}
         if banned_terms:
@@ -12192,19 +13385,32 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
                             present += 1
                     if present >= 2:
                         prox_boost += (present - 1) * AI_BOOST_SNIPPET_COOCCUR
+            feedback_weight = 0.0
+            feedback_boost = 0.0
+            feedback_entry = feedback_weights_lookup.get(fid)
+            if feedback_entry:
+                feedback_weight = float(feedback_entry.get('weight', 0.0) or 0.0)
+                if feedback_weight:
+                    feedback_boost = feedback_weight * AI_FEEDBACK_WEIGHT_SCALE
+                    feedback_applied_count += 1
+            final_score = sc + phrase_boost + coverage_boost + prox_boost + feedback_boost
             results.append({
                 "file_id": fid,
                 "rel_path": f.rel_path,
                 "title": f.title or f.filename,
-                "score": round(sc + phrase_boost + coverage_boost + prox_boost, 3),
+                "score": round(final_score, 3),
                 "hits": hits.get(fid, []),
                 "snippets": snips,
                 "snippet_sources": snippet_sources,
+                "feedback_weight": round(feedback_weight, 6),
+                "feedback_boost": round(feedback_boost, 3),
             })
         # сортируем по убыванию балла, затем по дате изменения
         results.sort(key=lambda x: (x.get('score') or 0.0, id2file.get(x['file_id']).mtime or 0.0), reverse=True)
         total_ranked = len(results)
         progress.add(f"Ранжирование: {total_ranked} кандидатов")
+        if feedback_applied_count:
+            progress.add(f"Фидбек: применён вес для {feedback_applied_count} документов")
         if total_ranked > max_candidates:
             progress.add(f"Ограничиваем до {max_candidates} лучших по баллу")
             results = results[:max_candidates]
@@ -13178,6 +14384,7 @@ def api_ai_search_feedback():
 
 def _initialize_background_jobs():
     _start_cache_cleanup_scheduler()
+    _start_feedback_training_scheduler()
 
 
 if hasattr(app, "before_serving"):
@@ -13186,7 +14393,7 @@ if hasattr(app, "before_serving"):
 
 @app.before_request
 def _ensure_background_jobs_started():
-    if not _CLEANUP_THREAD_STARTED:
+    if (not _CLEANUP_THREAD_STARTED) or (FEEDBACK_TRAIN_INTERVAL_HOURS > 0 and not _FEEDBACK_THREAD_STARTED):
         _initialize_background_jobs()
 
 

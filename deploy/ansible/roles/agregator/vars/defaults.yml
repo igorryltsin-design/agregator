@@ -1,0 +1,9 @@
+agregator_root: /opt/agregator
+agregator_service_name: agregator
+agregator_service_user: agregator
+agregator_service_group: agregator
+agregator_manage_user: true
+agregator_release_tarball: "{{ playbook_dir }}/../../../../dist/agregator-release.tar.gz"
+agregator_release_id: "{{ lookup('pipe', 'date +%Y%m%d%H%M%S') }}"
+agregator_gunicorn_workers: 4
+agregator_bind: "0.0.0.0:5050"

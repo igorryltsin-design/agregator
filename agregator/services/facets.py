@@ -177,7 +177,7 @@ class FacetService:
 
         tag_filters = params.tag_filters
         allowed_keys_set = set(params.allowed_keys_list or []) if params.allowed_keys_list is not None else None
-        base_ids_subq = filtered_query.with_entities(File.id).subquery()
+        base_ids_subq = filtered_query.with_entities(File.id).distinct().subquery()
         base_keys = [row[0] for row in db.session.query(Tag.key).filter(Tag.file_id.in_(base_ids_subq)).distinct().all()]
         selected: dict[str, list[str]] = {}
         for tf in tag_filters:
@@ -225,9 +225,67 @@ class FacetService:
         else:
             tag_facets = {}
 
+        authors_facet: list[list] = []
+        if params.sources.get('authors', True):
+            author_rows = (
+                db.session.query(File.author, func.count(File.id))
+                .filter(File.id.in_(base_ids_subq))
+                .filter(File.author.isnot(None))
+                .filter(File.author != '')
+                .group_by(File.author)
+                .order_by(func.count(File.id).desc(), File.author.asc())
+                .limit(60)
+                .all()
+            )
+            authors_facet = [[str(author).strip(), int(count or 0)] for (author, count) in author_rows if str(author or '').strip()]
+            selected_authors = [str(v).strip() for v in selected.get('author', [])]
+            for author in selected_authors:
+                if author and all(author != row[0] for row in authors_facet):
+                    authors_facet.append([author, 0])
+
+        years_facet: list[list] = []
+        if params.sources.get('years', True):
+            year_rows = (
+                db.session.query(File.year, func.count(File.id))
+                .filter(File.id.in_(base_ids_subq))
+                .filter(File.year.isnot(None))
+                .filter(File.year != '')
+                .group_by(File.year)
+                .all()
+            )
+            normalized_years = [(str(year or '').strip(), int(count or 0)) for (year, count) in year_rows if str(year or '').strip()]
+
+            def _year_sort_key(item: tuple[str, int]) -> tuple[int, int | str]:
+                year_str, _count = item
+                try:
+                    return (0, -int(year_str))
+                except Exception:
+                    return (1, year_str)
+
+            years_facet = [[year, count] for (year, count) in sorted(normalized_years, key=_year_sort_key)[:60]]
+            selected_year = None
+            if params.year_from and params.year_to and params.year_from == params.year_to:
+                selected_year = params.year_from
+            elif params.year_from and not params.year_to:
+                selected_year = params.year_from
+            elif params.year_to and not params.year_from:
+                selected_year = params.year_to
+            if selected_year and all(selected_year != row[0] for row in years_facet):
+                years_facet.append([selected_year, 0])
+
+        suggestions: list[dict] = []
+        if params.context == 'search':
+            for author, _count in authors_facet[:3]:
+                suggestions.append({'kind': 'author', 'value': author, 'label': f'Автор: {author}'})
+            for year, _count in years_facet[:3]:
+                suggestions.append({'kind': 'year', 'value': year, 'label': f'Год: {year}'})
+
         return {
             'types': types_facet,
             'tag_facets': tag_facets,
+            'authors': authors_facet,
+            'years': years_facet,
+            'suggestions': suggestions,
             'include_types': include_types,
             'allowed_keys': params.allowed_keys_list,
             'context': params.context,

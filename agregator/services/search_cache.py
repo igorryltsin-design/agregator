@@ -54,6 +54,19 @@ class SearchCache:
             if len(self._data) > self.max_items:
                 self._data.popitem(last=False)
 
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": self.enabled,
+                "items": len(self._data),
+                "max_items": self.max_items,
+                "ttl_seconds": self.ttl_seconds,
+            }
+
 
 _default_cache = SearchCache()
 
@@ -71,3 +84,11 @@ def search_cache_get(key: str) -> Optional[Any]:
 
 def search_cache_set(key: str, payload: Any) -> None:
     _default_cache.set(key, payload)
+
+
+def search_cache_clear() -> None:
+    _default_cache.clear()
+
+
+def search_cache_stats() -> dict[str, Any]:
+    return _default_cache.stats()

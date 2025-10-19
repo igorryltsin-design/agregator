@@ -1,0 +1,4 @@
+- hosts: agregator
+  become: true
+  roles:
+    - agregator

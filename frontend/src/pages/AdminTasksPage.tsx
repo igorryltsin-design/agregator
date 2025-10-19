@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
 import { taskStatusRu } from '../utils/locale'
+import LoadingState from '../ui/LoadingState'
 
 type Task = {
   id: number
@@ -182,7 +183,7 @@ export default function AdminTasksPage() {
 
   return (
     <div className="d-grid gap-3">
-      <div className="card p-3">
+      <div className="card p-3" aria-busy={loading}>
         <div className="d-flex justify-content-between align-items-center mb-3">
           <div className="fw-semibold fs-5">Очередь задач</div>
           <div className="d-flex gap-2">
@@ -210,7 +211,14 @@ export default function AdminTasksPage() {
                 <th>Действия</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody aria-busy={loading}>
+              {loading && tasks.length === 0 && (
+                <tr>
+                  <td colSpan={8}>
+                    <LoadingState variant="inline" lines={4} />
+                  </td>
+                </tr>
+              )}
               {tasks.map(task => {
                 const expanded = expandedTaskId === task.id
                 const pct = Number.isFinite(task.progress) ? Math.min(100, Math.max(0, Math.round(task.progress * 100))) : 0

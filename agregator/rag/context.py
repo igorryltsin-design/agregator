@@ -29,6 +29,7 @@ class ContextCandidate:
     metadata_bonus: float = 0.0
     metadata_hits: List[str] = field(default_factory=list)
     authority_bonus: float = 0.0
+    feedback_bonus: float = 0.0
 
 
 class ContextSelector:
@@ -53,6 +54,7 @@ class ContextSelector:
         rerank_fn: Optional[Callable[[str, List["ContextCandidate"]], List["ContextCandidate"]]] = None,
         token_multiplier: float = 1.6,
         section_overhead: int = 80,
+        feedback_scale: float = 0.5,
     ) -> None:
         self.vector_retriever = vector_retriever
         self.keyword_retriever = keyword_retriever
@@ -70,6 +72,7 @@ class ContextSelector:
         self.rerank_fn = rerank_fn
         self.token_multiplier = max(1.0, float(token_multiplier))
         self.section_overhead = max(0, int(section_overhead))
+        self.feedback_scale = float(feedback_scale)
 
     def select(
         self,
@@ -83,6 +86,7 @@ class ContextSelector:
         precomputed_dense_hits: Optional[Sequence[RetrievedChunk]] = None,
         query_terms: Optional[Sequence[str]] = None,
         authority_scores: Optional[Dict[int, float]] = None,
+        feedback_scores: Optional[Dict[int, float]] = None,
     ) -> List[ContextCandidate]:
         if precomputed_dense_hits is not None:
             dense_hits = list(precomputed_dense_hits)
@@ -114,6 +118,7 @@ class ContextSelector:
             top_k=top_k,
             query=query,
             authority_scores=authority_scores,
+            feedback_scores=feedback_scores,
         )
         for cand in candidates:
             self._estimate_tokens(cand)
@@ -130,6 +135,7 @@ class ContextSelector:
         top_k: int,
         query: str,
         authority_scores: Optional[Dict[int, float]] = None,
+        feedback_scores: Optional[Dict[int, float]] = None,
     ) -> List[ContextCandidate]:
         candidates: Dict[int, ContextCandidate] = {}
 
@@ -150,6 +156,10 @@ class ContextSelector:
                 cand.section_path = (chunk.section_path or "").strip()
             if doc and doc.file_id and authority_scores:
                 cand.authority_bonus = max(cand.authority_bonus, float(authority_scores.get(doc.file_id, 0.0)))
+            if doc and doc.file_id and feedback_scores:
+                fb = float(feedback_scores.get(doc.file_id, 0.0) or 0.0)
+                if fb:
+                    cand.feedback_bonus = max(cand.feedback_bonus, fb * self.feedback_scale)
 
         for match in sparse_hits:
             chunk = match.chunk
@@ -172,6 +182,10 @@ class ContextSelector:
                 cand.matched_terms = match.matched_terms
             if doc and doc.file_id and authority_scores:
                 cand.authority_bonus = max(cand.authority_bonus, float(authority_scores.get(doc.file_id, 0.0)))
+            if doc and doc.file_id and feedback_scores:
+                fb = float(feedback_scores.get(doc.file_id, 0.0) or 0.0)
+                if fb:
+                    cand.feedback_bonus = max(cand.feedback_bonus, fb * self.feedback_scale)
 
         filtered: List[ContextCandidate] = []
         query_terms = self._query_terms(query)
@@ -183,6 +197,7 @@ class ContextSelector:
                 + cand.structure_bonus
                 + cand.metadata_bonus
                 + cand.authority_bonus
+                + cand.feedback_bonus
             )
             cand.reasoning_hint = self._build_reasoning_hint(cand)
             if not self._passes_thresholds(cand):

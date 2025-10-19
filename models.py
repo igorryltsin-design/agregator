@@ -192,6 +192,21 @@ class AiSearchKeywordFeedback(db.Model):
     file = db.relationship("File", backref="ai_keyword_feedback", lazy=True)
 
 
+class AiSearchFeedbackModel(db.Model):
+    __tablename__ = "ai_search_feedback_model"
+    file_id = db.Column(db.Integer, db.ForeignKey("files.id", ondelete="CASCADE"), primary_key=True)
+    positive = db.Column(db.Integer, nullable=False, default=0)
+    negative = db.Column(db.Integer, nullable=False, default=0)
+    clicks = db.Column(db.Integer, nullable=False, default=0)
+    weight = db.Column(db.Float, nullable=False, default=0.0)
+    last_positive_at = db.Column(db.DateTime, nullable=True)
+    last_negative_at = db.Column(db.DateTime, nullable=True)
+    last_click_at = db.Column(db.DateTime, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    file = db.relationship("File", backref="ai_feedback_model", lazy=True)
+
+
 class AiSearchMetric(db.Model):
     __tablename__ = "ai_search_metrics"
     id = db.Column(db.Integer, primary_key=True)

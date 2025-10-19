@@ -69,6 +69,31 @@ npm --prefix AiWord run build
 ## Альтернативный запуск без Docker
 Инструкции в разделе «Установка и запуск» README остаются актуальны: используйте virtualenv, `pip install -r requirements.txt`, `python app.py`. Для Watch-mode можно установить `pip install watchdog` и запускать `flask --app app --debug run`.
 
+## Пакетирование релиза
+Для выкладки без Docker предусмотрен сборочный скрипт:
+
+```bash
+./scripts/package_release.sh            # создаст dist/agregator-<version>.tar.gz
+./scripts/package_release.sh v3.0.0     # зафиксировать версию вручную
+```
+
+Скрипт собирает фронтенд (`frontend/dist`, `AiWord/dist`) и упаковывает исходники в `dist/agregator-<version>.tar.gz`. Артефакт можно копировать на целевой сервер или использовать в Ansible.
+
+## Развёртывание через Ansible
+В каталоге `deploy/ansible` находится базовый шаблон:
+
+1. Отредактируйте `inventory.sample`, указав адрес сервера и пользователя, затем сохраните как `inventory`.
+2. Запустите playbook, передав путь к релизу:
+   ```bash
+   ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml \
+     -e agregator_release_tarball=/tmp/agregator-<version>.tar.gz \
+     -e agregator_release_id=<version>
+   ```
+
+Роль создаёт пользователя `agregator`, разворачивает релиз в `/opt/agregator/releases/<version>`, настраивает виртуальное окружение и systemd unit `agregator.service` (см. шаблон `deploy/ansible/roles/agregator/templates/agregator.service.j2`). Настройки можно переопределять через `-e` или vars-файл.
+
+> Секреты и переменные среды следует хранить в `{{ agregator_root }}/shared/env/.env`. Playbook не создаёт файл автоматически.
+
 ## Типовые проблемы
 - **Контейнер падает сразу после старта.** Проверьте логи `docker compose logs agregator` и корректность `FLASK_SECRET_KEY`.
 - **LM Studio недоступен из контейнера.** На macOS/Windows используйте `http://host.docker.internal:1234/v1`.

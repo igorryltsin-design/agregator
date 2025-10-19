@@ -185,6 +185,8 @@
 
 ## Обратная связь и метрики
 - POST `/api/ai-search/feedback` — сохраняет клики и оценки релевантности (таблица `ai_search_keyword_feedback`). Используется для фильтрации шумных терминов.
+- POST `/api/admin/ai-search/feedback/train` — агрегирует фидбек в таблицу `ai_search_feedback_model` и синхронизирует веса для ранжирования (поддерживает `{"async": true}`).
+- GET `/api/admin/ai-search/feedback/model` — быстрая проверка текущих весов (топ положительных/отрицательных документов).
 - GET `/api/admin/ai-search/metrics` — последние измерения длительностей (`ai_search_metrics`). Параметр `limit` (1..500).
 - Инструменты эксплуатации: см. `docs/ai_search_operations.md`.
 

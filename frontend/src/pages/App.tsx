@@ -69,6 +69,8 @@ export default function App() {
   const canImport = !!user?.can_import || isAdmin
   const adminMenuRef = useRef<HTMLDivElement | null>(null)
   const helpDialogRef = useRef<HTMLDivElement | null>(null)
+  const hotkeySequenceRef = useRef<string | null>(null)
+  const hotkeyTimerRef = useRef<number | null>(null)
   const helpTitleId = 'agregator-help-title'
   const helpDescId = 'agregator-help-desc'
   const iconButtonClass = 'btn btn-outline-secondary icon-only'
@@ -116,21 +118,97 @@ export default function App() {
   }, [location.pathname, location.search])
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); searchRef.current?.focus() }
-      if (e.key === 'Escape') {
-        if (searchRef.current === document.activeElement) searchRef.current?.blur()
+    const resetSequence = () => {
+      if (hotkeyTimerRef.current) {
+        window.clearTimeout(hotkeyTimerRef.current)
+        hotkeyTimerRef.current = null
+      }
+      hotkeySequenceRef.current = null
+    }
+
+    const isEditableTarget = (node: EventTarget | null) => {
+      if (!(node instanceof HTMLElement)) return false
+      const tag = node.tagName
+      return node.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.getAttribute('role') === 'textbox'
+    }
+
+    const navigateByHotkey = (key: string) => {
+      const mapping: Array<{ key: string; path: string; requireAdmin?: boolean; requireImport?: boolean }> = [
+        { key: 'g', path: '/' },
+        { key: 's', path: '/stats' },
+        { key: 'i', path: '/ingest', requireImport: true },
+        { key: 'a', path: '/admin/status', requireAdmin: true },
+        { key: 't', path: '/admin/tasks', requireAdmin: true },
+        { key: 'l', path: '/admin/logs', requireAdmin: true },
+        { key: 'm', path: '/admin/ai-metrics', requireAdmin: true },
+        { key: 'c', path: '/admin/collections', requireAdmin: true },
+        { key: 'u', path: '/users', requireAdmin: true },
+      ]
+      const entry = mapping.find(item => item.key === key.toLowerCase())
+      if (!entry) return false
+      if (entry.requireAdmin && !isAdmin) return false
+      if (entry.requireImport && !canImport) return false
+      nav(entry.path)
+      setAdminMenuOpen(false)
+      return true
+    }
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return
+      const target = event.target as HTMLElement | null
+      const isEditable = isEditableTarget(target)
+      const plain = !event.metaKey && !event.ctrlKey && !event.altKey
+
+      if (plain && event.key === 'Escape') {
+        if (searchRef.current === document.activeElement) {
+          searchRef.current?.blur()
+        }
         setAdminMenuOpen(false)
+        resetSequence()
+        return
+      }
+
+      if (!isEditable) {
+        if (plain && event.key === '/') {
+          event.preventDefault()
+          searchRef.current?.focus()
+          resetSequence()
+          return
+        }
+        if (event.shiftKey && !event.ctrlKey && !event.metaKey && event.key === '?') {
+          event.preventDefault()
+          setShowHelp(true)
+          resetSequence()
+          return
+        }
+        if (plain && event.key.toLowerCase() === 'g') {
+          hotkeySequenceRef.current = 'g'
+          if (hotkeyTimerRef.current) window.clearTimeout(hotkeyTimerRef.current)
+          hotkeyTimerRef.current = window.setTimeout(resetSequence, 1500)
+          return
+        }
+        if (hotkeySequenceRef.current === 'g' && !event.metaKey && !event.ctrlKey) {
+          const handled = navigateByHotkey(event.key)
+          resetSequence()
+          if (handled) {
+            event.preventDefault()
+          }
+          return
+        }
+      } else if (hotkeySequenceRef.current) {
+        resetSequence()
       }
     }
+
     const onScanOpen = () => setScanOpen(true)
     window.addEventListener('keydown', onKey)
     window.addEventListener('scan-open', onScanOpen as any)
     return () => {
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('scan-open', onScanOpen as any)
+      resetSequence()
     }
-  }, [])
+  }, [canImport, isAdmin, nav, setAdminMenuOpen, setShowHelp])
 
   useEffect(() => {
     if (!scanOpen) return
@@ -229,6 +307,7 @@ export default function App() {
   }
 
   const adminMenuItems = useMemo(() => ([
+    { to: 'admin/status', label: 'Состояние' },
     { to: 'settings', label: 'Настройки' },
     { to: 'users', label: 'Пользователи' },
     { to: 'admin/tasks', label: 'Задачи' },
@@ -261,14 +340,17 @@ export default function App() {
             </span>
           </Link>
           <div className="d-flex align-items-center gap-2" style={{ width: 600, maxWidth: '60%', flex: '0 1 auto' }}>
-            <input
-              className="form-control"
-              placeholder="Поиск…"
-              value={searchDraft}
-              ref={searchRef}
-              onChange={e => setSearchDraft(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitSearch(searchDraft, true) } }}
-            />
+            <div className="position-relative flex-grow-1">
+              <input
+                className="form-control pe-5"
+                placeholder="Поиск…"
+                value={searchDraft}
+                ref={searchRef}
+                onChange={e => setSearchDraft(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitSearch(searchDraft, true) } }}
+              />
+              <span className="hotkey-hint d-none d-md-inline" aria-hidden="true" style={{ position: 'absolute', top: '50%', right: 12, transform: 'translateY(-50%)' }}>/</span>
+            </div>
             <button
               className={iconButtonClass}
               type="button"
@@ -443,8 +525,17 @@ export default function App() {
               <section>
                 <h3 className="h6 mb-2" style={{ color: 'var(--text)' }}>Горячие клавиши</h3>
                 <ul className="mb-0" style={{ paddingLeft: 18 }}>
-                  <li><strong>/</strong> — перейти в поле поиска.</li>
-                  <li><strong>Esc</strong> — закрыть выпадающие окна и справку.</li>
+                  <li><code>/</code> — фокус на поле поиска.</li>
+                  <li><code>Shift + ?</code> — открыть эту справку.</li>
+                  <li><code>Esc</code> — закрыть выпадающие окна и диалоги.</li>
+                  <li><code>g</code> затем <code>g</code> — перейти в каталог материалов.</li>
+                  <li><code>g</code> затем <code>s</code> — открыть статистику.</li>
+                  {canImport && <li><code>g</code> затем <code>i</code> — перейти в раздел импорта.</li>}
+                  {isAdmin && <li><code>g</code> затем <code>a</code> — открыть «Состояние сервиса».</li>}
+                  {isAdmin && <li><code>g</code> затем <code>t</code> — перейти к задачам.</li>}
+                  {isAdmin && <li><code>g</code> затем <code>m</code> — открыть AI-метрики.</li>}
+                  {isAdmin && <li><code>g</code> затем <code>c</code> — управление коллекциями.</li>}
+                  {isAdmin && <li><code>g</code> затем <code>u</code> — список пользователей.</li>}
                 </ul>
               </section>
             </div>

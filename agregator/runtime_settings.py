@@ -154,6 +154,8 @@ class RuntimeSettings:
     ai_query_variants_max: int = 0
     ai_rag_retry_enabled: bool = True
     ai_rag_retry_threshold: float = 0.6
+    feedback_train_interval_hours: float = 0.0
+    feedback_train_cutoff_days: int = 90
     rag_rerank_backend: str = "none"
     rag_rerank_model: str = ""
     rag_rerank_device: Optional[str] = None
@@ -202,6 +204,8 @@ class RuntimeSettings:
             ai_query_variants_max=config.ai_query_variants_max,
             ai_rag_retry_enabled=config.ai_rag_retry_enabled,
             ai_rag_retry_threshold=config.ai_rag_retry_threshold,
+            feedback_train_interval_hours=float(os.getenv("AI_FEEDBACK_TRAIN_INTERVAL_HOURS", "0") or 0.0),
+            feedback_train_cutoff_days=int(os.getenv("AI_FEEDBACK_TRAIN_CUTOFF_DAYS", "90") or 90),
             transcribe_enabled=config.transcribe_enabled,
             transcribe_backend=config.transcribe_backend,
             transcribe_model_path=config.transcribe_model_path,
@@ -287,6 +291,8 @@ class RuntimeSettings:
             "AI_RERANK_LLM": bool(self.ai_rerank_llm),
             "AI_RAG_RETRY_ENABLED": bool(self.ai_rag_retry_enabled),
             "AI_RAG_RETRY_THRESHOLD": float(self.ai_rag_retry_threshold),
+            "AI_FEEDBACK_TRAIN_INTERVAL_HOURS": float(self.feedback_train_interval_hours),
+            "AI_FEEDBACK_TRAIN_CUTOFF_DAYS": int(self.feedback_train_cutoff_days),
             "LLM_CACHE_ENABLED": bool(self.llm_cache_enabled),
             "LLM_CACHE_TTL_SECONDS": int(self.llm_cache_ttl_seconds),
             "LLM_CACHE_MAX_ITEMS": int(self.llm_cache_max_items),
@@ -315,6 +321,8 @@ class RuntimeSettings:
         os.environ["LM_MAX_INPUT_CHARS"] = str(self.lm_max_input_chars)
         os.environ["LM_MAX_OUTPUT_TOKENS"] = str(self.lm_max_output_tokens)
         os.environ["AZURE_OPENAI_API_VERSION"] = self.azure_openai_api_version
+        os.environ["AI_FEEDBACK_TRAIN_INTERVAL_HOURS"] = str(self.feedback_train_interval_hours)
+        os.environ["AI_FEEDBACK_TRAIN_CUTOFF_DAYS"] = str(self.feedback_train_cutoff_days)
 
     def apply_to_flask_config(self, app: "Flask") -> None:
         app.config["UPLOAD_FOLDER"] = str(self.scan_root)
@@ -341,6 +349,8 @@ class RuntimeSettings:
         app.config["LM_MAX_OUTPUT_TOKENS"] = self.lm_max_output_tokens
         app.config["AZURE_OPENAI_API_VERSION"] = self.azure_openai_api_version
         app.config["MATERIAL_TYPES"] = copy.deepcopy(self.material_types)
+        app.config["AI_FEEDBACK_TRAIN_INTERVAL_HOURS"] = self.feedback_train_interval_hours
+        app.config["AI_FEEDBACK_TRAIN_CUTOFF_DAYS"] = self.feedback_train_cutoff_days
 
     # -- обновление -------------------------------------------------------
     def update_from_mapping(self, payload: Mapping[str, Any]) -> None:
@@ -411,6 +421,16 @@ class RuntimeSettings:
             elif key == "AI_RAG_RETRY_THRESHOLD":
                 try:
                     self.ai_rag_retry_threshold = max(0.0, min(1.0, float(raw)))
+                except Exception:
+                    pass
+            elif key == "AI_FEEDBACK_TRAIN_INTERVAL_HOURS":
+                try:
+                    self.feedback_train_interval_hours = max(0.0, float(raw))
+                except Exception:
+                    pass
+            elif key == "AI_FEEDBACK_TRAIN_CUTOFF_DAYS":
+                try:
+                    self.feedback_train_cutoff_days = max(1, int(raw))
                 except Exception:
                     pass
             elif key == "TRANSCRIBE_ENABLED":

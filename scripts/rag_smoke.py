@@ -45,20 +45,44 @@ def run_smoke(queries: list[str], *, top_k: int, deep_search: bool) -> list[dict
             start = time.perf_counter()
             response = _ai_search_core(payload)
             elapsed = (time.perf_counter() - start) * 1000.0
+            rag_context = response.get("rag_context") or []
+            rag_validation = response.get("rag_validation") or {}
             results.append(
                 {
                     "query": query,
                     "elapsed_ms": round(elapsed, 2),
                     "items": len(response.get("items") or []),
-                    "rag_context": len(response.get("rag_context") or []),
+                    "rag_context": len(rag_context),
                     "rag_fallback": bool(response.get("rag_fallback")),
-                    "warnings": bool(
-                        (response.get("rag_validation") or {}).get("hallucination_warning")
-                    ),
+                    "warnings": bool(rag_validation.get("hallucination_warning")),
+                    "context_ids": [
+                        (section.get("doc_id"), section.get("chunk_id"))
+                        for section in rag_context
+                        if isinstance(section, dict)
+                    ],
                     "notes": response.get("rag_notes") or [],
                 }
             )
     return results
+
+
+def summarize(results: list[dict]) -> dict:
+    if not results:
+        return {"queries": 0}
+    total = len(results)
+    elapsed = sum(item.get("elapsed_ms", 0.0) for item in results)
+    fallbacks = sum(1 for item in results if item.get("rag_fallback"))
+    warned = sum(1 for item in results if item.get("warnings"))
+    total_context = sum(item.get("rag_context", 0) for item in results)
+    avg_elapsed = elapsed / total if total else 0.0
+    avg_context = total_context / total if total else 0.0
+    return {
+        "queries": total,
+        "avg_elapsed_ms": round(avg_elapsed, 2),
+        "avg_context": round(avg_context, 2),
+        "fallback_ratio": round(fallbacks / total, 3),
+        "warnings_ratio": round(warned / total, 3),
+    }
 
 
 def main() -> None:
@@ -99,6 +123,13 @@ def main() -> None:
         ensure_default_admin()
 
     results = run_smoke(queries, top_k=args.top_k, deep_search=args.deep)
+    summary = summarize(results)
+
+    print("=== Summary ===")
+    for key, value in summary.items():
+        print(f"{key}: {value}")
+
+    print("\n=== Details ===")
     for item in results:
         print(
             f"- {item['query']!r}: {item['elapsed_ms']} ms, "
@@ -110,7 +141,8 @@ def main() -> None:
                 print(f"    note: {note}")
 
     if args.json:
-        args.json.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = {"summary": summary, "results": results}
+        args.json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Results written to {args.json}")
 
 

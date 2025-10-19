@@ -91,6 +91,14 @@ def _expand_synonyms(lemmas: list[str]) -> set[str]:
             out.add(_lemma(s))
     return out
 
+
+def _normalize_tag_value(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    return re.sub(r"\s+", " ", raw).lower()
+
+
 routes = Blueprint('routes', __name__)
 
 def _current_user():
@@ -299,37 +307,86 @@ def api_graph():
     if year_to:
         q = q.filter(File.year <= year_to)
     files = q.order_by(File.mtime.desc().nullslast()).limit(limit).all()
+
+    snapshot_fn = current_app.config.get('authority_snapshot_fn')
+    authority_snapshot: dict = {}
+    if callable(snapshot_fn):
+        try:
+            authority_snapshot = snapshot_fn(_allowed_collection_ids())
+        except Exception as exc:
+            current_app.logger.debug('authority snapshot failed: %s', exc)
+            authority_snapshot = {}
+    doc_scores = authority_snapshot.get('doc_scores', {}) if authority_snapshot else {}
+    topic_index = authority_snapshot.get('topic_index', {}) if authority_snapshot else {}
+    author_entries = authority_snapshot.get('author_entries', []) if authority_snapshot else []
+    author_index = {
+        _normalize_tag_value(entry.get('name')): float(entry.get('score') or 0.0)
+        for entry in author_entries
+        if isinstance(entry, dict) and entry.get('name')
+    }
+
     nodes: list[dict] = []
     edges: list[dict] = []
     file_ids = set()
     tag_node_ids: dict[tuple[str, str], str] = {}
     next_tag_id = 100000
+    max_authority = 0.0
     for f in files:
         fid = f.id
         if fid not in file_ids:
-            nodes.append({"id": f"file-{fid}", "label": f.title or f.filename or str(fid), "type": "work"})
+            authority_score = float(doc_scores.get(fid, 0.0))
+            nodes.append({
+                "id": f"file-{fid}",
+                "label": f.title or f.filename or str(fid),
+                "type": "work",
+                "authority": authority_score,
+            })
             file_ids.add(fid)
+            if authority_score > max_authority:
+                max_authority = authority_score
         # Собираем подходящие теги
         for t in (f.tags or []):
             if t.key in tag_keys and (t.value or '').strip():
                 key = t.key
                 val = t.value.strip()
-                nid = tag_node_ids.get((key, val))
+                norm_val = _normalize_tag_value(val)
+                tag_key = (key, norm_val or val)
+                nid = tag_node_ids.get(tag_key)
                 if not nid:
                     nid = f"tag-{key}-{next_tag_id}"
-                    tag_node_ids[(key, val)] = nid
-                    nodes.append({"id": nid, "label": val, "type": f"tag:{key}"})
+                    tag_node_ids[tag_key] = nid
+                    authority_score = float(topic_index.get(f"{key}|||{norm_val}", 0.0))
+                    nodes.append({
+                        "id": nid,
+                        "label": val,
+                        "type": f"tag:{key}",
+                        "authority": authority_score,
+                    })
                     next_tag_id += 1
+                    if authority_score > max_authority:
+                        max_authority = authority_score
                 edges.append({"from": f"file-{fid}", "to": nid, "label": key})
         # Резервный вариант по полям File (например author)
         if 'author' in tag_keys and (f.author or '').strip():
             val = f.author.strip()
-            nid = tag_node_ids.get(('author', val))
+            norm_val = _normalize_tag_value(val)
+            tag_key = ('author', norm_val or val)
+            nid = tag_node_ids.get(tag_key)
             if not nid:
                 nid = f"tag-author-{next_tag_id}"
-                tag_node_ids[('author', val)] = nid
-                nodes.append({"id": nid, "label": val, "type": "tag:author"})
+                tag_node_ids[tag_key] = nid
+                authority_score = float(topic_index.get(f"author|||{norm_val}", 0.0))
+                if not authority_score and norm_val:
+                    authority_score = float(author_index.get(norm_val, 0.0))
+                nodes.append({
+                    "id": nid,
+                    "label": val,
+                    "type": "tag:author",
+                    "authority": authority_score,
+                })
                 next_tag_id += 1
+                if authority_score > max_authority:
+                    max_authority = authority_score
             edges.append({"from": f"file-{fid}", "to": nid, "label": 'author'})
     # Необязательный умный поиск на сервере с русскими леммами и синонимами
     q_str = (request.args.get('q') or '').strip()
@@ -351,7 +408,10 @@ def api_graph():
         nodes = [n for n in nodes if n['id'] in neigh_keep]
         kept = set(n['id'] for n in nodes)
         edges = [e for e in edges if e['from'] in kept and e['to'] in kept]
-    return jsonify({"nodes": nodes, "edges": edges, "keys": tag_keys})
+        max_authority = max((float(n.get('authority', 0.0)) for n in nodes), default=0.0)
+    else:
+        max_authority = max((float(n.get('authority', 0.0)) for n in nodes), default=max_authority)
+    return jsonify({"nodes": nodes, "edges": edges, "keys": tag_keys, "max_authority": max_authority})
 
 
 @routes.route('/api/graph/build', methods=['POST'])
