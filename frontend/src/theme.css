@@ -138,6 +138,91 @@ a:hover, a:focus { color: var(--primary); }
   line-height: 1;
 }
 
+.doc-chat-launch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 0.35rem 0.95rem;
+  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.22);
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+}
+
+.doc-chat-launch .icon-glyph {
+  font-size: 1.05rem;
+}
+
+.doc-chat-launch .doc-chat-label {
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+}
+
+.doc-chat-launch:hover,
+.doc-chat-launch:focus {
+  transform: translateY(-1px);
+  box-shadow: 0 18px 34px rgba(15, 23, 42, 0.28);
+}
+
+@media (max-width: 1080px) {
+  .doc-chat-launch {
+    padding-inline: 0.75rem;
+  }
+}
+
+@media (max-width: 768px) {
+  .doc-chat-launch .doc-chat-label {
+    display: none;
+  }
+  .doc-chat-launch {
+    gap: 0;
+    border-radius: 999px;
+    padding-inline: 0.6rem;
+  }
+}
+
+.doc-chat-intro {
+  background: linear-gradient(135deg, color-mix(in srgb, var(--surface) 90%, var(--accent) 10%), color-mix(in srgb, var(--surface-raised) 92%, var(--accent) 8%));
+  border: 1px solid color-mix(in srgb, var(--border) 55%, var(--accent) 12%);
+}
+
+.doc-chat-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: docchat-step;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.doc-chat-steps li {
+  position: relative;
+  padding-left: 2.4rem;
+  color: color-mix(in srgb, var(--text) 90%, var(--text-muted) 10%);
+}
+
+.doc-chat-steps li::before {
+  counter-increment: docchat-step;
+  content: counter(docchat-step);
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1.7rem;
+  height: 1.7rem;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--primary) 75%, transparent);
+  color: #fff;
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.18);
+}
+
+.doc-chat-steps strong {
+  color: var(--text);
+}
+
 .bg-body-secondary,
 .bg-body-tertiary,
 .offcanvas,

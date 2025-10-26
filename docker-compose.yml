@@ -13,6 +13,7 @@ services:
     volumes:
       - ./library:/data
       - ./backups:/app/backups
+      - ./models:/app/models
     restart: always
     healthcheck:
       test: ["CMD", "healthcheck.sh"]

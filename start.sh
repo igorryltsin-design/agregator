@@ -4,7 +4,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 
 log() {
-  echo "[start] $*"
+  echo "[start] $*" >&2
 }
 
 build_ui() {

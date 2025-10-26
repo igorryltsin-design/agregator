@@ -40,7 +40,16 @@ class TaskQueue:
             if self._started:
                 return
             self._started = True
-            for idx in range(self.max_workers):
+            worker_count = self.max_workers
+            if worker_count <= 0:
+                worker_count = 1
+                self._logger.warning(
+                    "Количество воркеров очереди %s скорректировано до 1 для продолжения работы.",
+                    self.name,
+                )
+            if worker_count != self.max_workers:
+                self.max_workers = worker_count
+            for idx in range(worker_count):
                 worker = threading.Thread(
                     target=self._worker_loop,
                     name=f"{self.name}-worker-{idx+1}",
@@ -67,8 +76,26 @@ class TaskQueue:
             kwargs=kwargs,
             description=description,
         )
-        self._queue.put(job)
-        self._logger.debug("Фоновая задача %s поставлена в очередь (%s)", job.task_id, description or func.__name__)
+        if not self._workers:
+            self._logger.warning(
+                "Очередь '%s' не имеет активных воркеров, задача %s (%s) будет выполнена во временном потоке.",
+                self.name,
+                job.task_id,
+                description or func.__name__,
+            )
+            threading.Thread(
+                target=self._run_ad_hoc,
+                args=(job,),
+                name=f"{self.name}-adhoc-{job.task_id[:8]}",
+                daemon=True,
+            ).start()
+        else:
+            self._queue.put(job)
+            self._logger.debug(
+                "Фоновая задача %s поставлена в очередь (%s)",
+                job.task_id,
+                description or func.__name__,
+            )
         return job.task_id
 
     def shutdown(self) -> None:
@@ -107,6 +134,10 @@ class TaskQueue:
         else:
             self._logger.debug("Задача %s завершена", job.task_id)
 
+    def _run_ad_hoc(self, job: BackgroundJob) -> None:
+        """Execute a job outside the queue when no workers are running."""
+        self._execute(job)
+
 
     def stats(self) -> dict[str, Any]:
         """Return basic queue statistics."""
@@ -123,9 +154,25 @@ class TaskQueue:
 _default_queue: TaskQueue | None = None
 
 
+def _resolve_worker_count() -> int:
+    """Resolve and sanitize background worker count from environment."""
+    raw_value = os.getenv("AGREGATOR_TASK_WORKERS", "2")
+    logger = logging.getLogger("agregator.task_queue")
+    max_workers: int
+    try:
+        max_workers = int(str(raw_value).strip() or "2")
+    except (TypeError, ValueError):
+        logger.warning("Некорректное значение AGREGATOR_TASK_WORKERS=%r, используем 2 потока.", raw_value)
+        max_workers = 2
+    if max_workers <= 0:
+        logger.warning("AGREGATOR_TASK_WORKERS=%s, увеличено до 1 для корректной работы фоновых задач.", max_workers)
+        max_workers = 1
+    return max_workers
+
+
 def get_task_queue() -> TaskQueue:
     global _default_queue
     if _default_queue is None:
-        max_workers = int(os.getenv("AGREGATOR_TASK_WORKERS", "2") or "2")
+        max_workers = _resolve_worker_count()
         _default_queue = TaskQueue(name="agregator", max_workers=max_workers)
     return _default_queue

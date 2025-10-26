@@ -16,6 +16,8 @@ import heapq
 import copy
 import queue
 import platform
+import shutil
+import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
 
 import click
@@ -41,7 +43,7 @@ except ImportError:  # запасной вариант для старых ве�
         return wrapper
 from sqlalchemy import func, and_, or_, exists, text, event
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, joinedload
 from models import (
     db,
     File,
@@ -158,6 +160,7 @@ from agregator.rag import (
     VectorRetriever,
     RetrievedChunk,
     EmbeddingBackend,
+    HashEmbeddingBackend,
     load_embedding_backend,
     vector_to_bytes,
     build_system_prompt,
@@ -881,6 +884,7 @@ LLM_PURPOSES = [
     {'id': 'compose', 'label': 'Генерация ответов'},
     {'id': 'metadata', 'label': 'Извлечение метаданных'},
     {'id': 'vision', 'label': 'Анализ изображений'},
+    {'id': 'doc_chat', 'label': 'Чат по документу'},
     {'id': 'rerank', 'label': 'Реранжирование поиска'},
     {'id': 'default', 'label': 'По умолчанию'},
 ]
@@ -1730,6 +1734,23 @@ def _fw_alias_to_repo(ref: str) -> str | None:
         return ref
     return None
 
+def _fw_model_dir_is_valid(path: Path) -> bool:
+    """Проверить, что каталог модели содержит полноценные бинарники faster-whisper.
+    Записываются модели в формате CTranslate2: требуется как минимум один .bin-файл весом > 1MB.
+    Это помогает отфильтровать git-lfs плейсхолдеры (134 байта) и незавершённые выгрузки.
+    """
+    try:
+        if not path or not path.exists() or not path.is_dir():
+            return False
+        for candidate in path.glob("*.bin*"):
+            # Игнорируем плейсхолдеры git-lfs: у настоящего файла размер десятки мегабайт.
+            if candidate.is_file() and candidate.stat().st_size >= 1_000_000:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _ensure_faster_whisper_model(model_ref: str) -> str:
     """Гарантировать локальный путь к модели faster-whisper.
     Если указан локальный каталог — используем его. Если это алиас или repo id — скачиваем в кэш.
@@ -1740,7 +1761,12 @@ def _ensure_faster_whisper_model(model_ref: str) -> str:
             return ''
         p = Path(model_ref).expanduser()
         if p.exists() and p.is_dir():
-            return str(p)
+            if _fw_model_dir_is_valid(p):
+                return str(p)
+            app.logger.warning(
+                "Каталог модели faster-whisper найден (%s), но выглядит неполным — попробуем скачать заново.",
+                p,
+            )
         repo = _fw_alias_to_repo(model_ref)
         if not repo:
             return ''
@@ -1751,15 +1777,585 @@ def _ensure_faster_whisper_model(model_ref: str) -> str:
         FW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         safe_name = repo.replace('/', '__')
         target_dir = FW_CACHE_DIR / safe_name
-        if not target_dir.exists() or not any(target_dir.iterdir()):
+        if not _fw_model_dir_is_valid(target_dir):
             # загрузить/снять снимок в target_dir
             hf_snapshot_download(repo_id=repo, local_dir=str(target_dir), local_dir_use_symlinks=False, revision=None)
+        if not _fw_model_dir_is_valid(target_dir):
+            app.logger.warning(
+                "Не удалось получить полноценную модель faster-whisper из репозитория %s — проверьте доступ к HuggingFace или загрузите модель вручную.",
+                repo,
+            )
+            return ''
         return str(target_dir)
     except Exception as e:
         app.logger.warning(f"Failed to resolve faster-whisper model '{model_ref}': {e}")
         return ''
 
 app = Flask(__name__)
+
+DOC_CHAT_LOCK = threading.Lock()
+DOC_CHAT_SESSIONS: dict[str, dict[str, Any]] = {}
+DOC_CHAT_TTL_SECONDS = 6 * 3600  # 6 часов
+DOC_CHAT_IMAGE_LIMIT = 12
+DOC_CHAT_HISTORY_LIMIT = 12
+
+
+def _doc_chat_now() -> float:
+    return time.time()
+
+
+def _doc_chat_cache_dir(session_id: str) -> Path:
+    static_root = Path(app.static_folder or '.')
+    target = static_root / 'cache' / 'doc_chat' / session_id
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return target
+
+
+def _doc_chat_prune(now: Optional[float] = None) -> None:
+    now = now or _doc_chat_now()
+    expired: list[tuple[str, Optional[str]]] = []
+    with DOC_CHAT_LOCK:
+        for sid, session in list(DOC_CHAT_SESSIONS.items()):
+            updated = float(session.get('updated_at') or session.get('created_at') or now)
+            if now - updated > DOC_CHAT_TTL_SECONDS:
+                cache_path = session.get('cache_path')
+                DOC_CHAT_SESSIONS.pop(sid, None)
+                expired.append((sid, cache_path if isinstance(cache_path, str) else None))
+    for _sid, cache_path in expired:
+        if cache_path:
+            try:
+                shutil.rmtree(Path(cache_path), ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _doc_chat_get_cache_path(session_id: str) -> Optional[Path]:
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        cache_path = session.get('cache_path') if session else None
+    if cache_path:
+        try:
+            path = Path(cache_path)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            return None
+    return None
+
+
+def _doc_chat_create_session(user: User, file_obj: File) -> dict[str, Any]:
+    try:
+        app.logger.info("[doc-chat] create_session start user=%s file=%s", user.id, file_obj.id)
+    except Exception:
+        pass
+    session_id = uuid.uuid4().hex
+    cache_dir = _doc_chat_cache_dir(session_id)
+    now = _doc_chat_now()
+    collection = getattr(file_obj, 'collection', None)
+    file_meta = {
+        'id': file_obj.id,
+        'title': (file_obj.title or file_obj.filename or file_obj.rel_path or f"Файл {file_obj.id}").strip(),
+        'author': file_obj.author,
+        'year': file_obj.year,
+        'material_type': file_obj.material_type,
+        'collection_id': getattr(collection, 'id', None),
+        'collection_name': getattr(collection, 'name', None),
+        'rel_path': file_obj.rel_path,
+        'filename': file_obj.filename,
+    }
+    session_payload: dict[str, Any] = {
+        'id': session_id,
+        'user_id': user.id,
+        'file_id': file_obj.id,
+        'file_meta': file_meta,
+        'status': 'queued',
+        'progress': [],
+        'percent': 0.0,
+        'error': None,
+        'data': None,
+        'history': [],
+        'created_at': now,
+        'updated_at': now,
+        'cache_path': str(cache_dir),
+        'cache_rel': f"cache/doc_chat/{session_id}",
+    }
+    with DOC_CHAT_LOCK:
+        _doc_chat_prune(now)
+        DOC_CHAT_SESSIONS[session_id] = session_payload
+    try:
+        app.logger.info("[doc-chat:%s] create_session done status=%s", session_id[:8], session_payload['status'])
+    except Exception:
+        pass
+    return session_payload
+
+
+def _doc_chat_progress(session_id: str, line: str, *, percent: float | None = None) -> None:
+    now = _doc_chat_now()
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return
+        progress = session.setdefault('progress', [])
+        progress.append(str(line))
+        if len(progress) > 400:
+            session['progress'] = progress[-400:]
+        if percent is not None:
+            session['percent'] = max(0.0, min(100.0, float(percent)))
+        session['updated_at'] = now
+    try:
+        label = f"[doc-chat:{session_id[:8]}]"
+        if percent is not None:
+            app.logger.info("%s %s (%.1f%%)", label, line, float(percent))
+        else:
+            app.logger.info("%s %s", label, line)
+    except Exception:
+        pass
+
+
+def _doc_chat_set_status(session_id: str, status: str, *, error: Optional[str] = None, percent: float | None = None) -> None:
+    now = _doc_chat_now()
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return
+        session['status'] = status
+        session['error'] = error
+        if percent is not None:
+            session['percent'] = max(0.0, min(100.0, float(percent)))
+        session['updated_at'] = now
+
+
+def _doc_chat_store_data(session_id: str, data: dict[str, Any]) -> None:
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return
+        session['data'] = data
+        session['updated_at'] = _doc_chat_now()
+
+
+def _doc_chat_append_history(session_id: str, entry: dict[str, Any]) -> None:
+    now = _doc_chat_now()
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return
+        history = session.setdefault('history', [])
+        history.append(dict(entry))
+        if len(history) > DOC_CHAT_HISTORY_LIMIT:
+            session['history'] = history[-DOC_CHAT_HISTORY_LIMIT:]
+        session['updated_at'] = now
+
+
+def _doc_chat_snapshot(session_id: str) -> Optional[dict[str, Any]]:
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return None
+        snapshot = copy.deepcopy(session)
+    data = snapshot.get('data')
+    if isinstance(data, dict):
+        images = data.get('images')
+        if isinstance(images, list):
+            for item in images:
+                if isinstance(item, dict):
+                    item.pop('vector', None)
+                    item.pop('path', None)
+    snapshot.pop('user_id', None)
+    snapshot.pop('cache_path', None)
+    return snapshot
+
+
+def _doc_chat_public_session(session_id: str) -> Optional[dict[str, Any]]:
+    return _doc_chat_snapshot(session_id)
+
+
+def _doc_chat_internal_session(session_id: str) -> Optional[dict[str, Any]]:
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return None
+        return copy.deepcopy(session)
+
+
+def _doc_chat_owner_id(session_id: str) -> Optional[int]:
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return None
+        try:
+            return int(session.get('user_id'))
+        except Exception:
+            return None
+
+
+def _doc_chat_extract_pdf_images(path: Path, session_id: str, limit: int) -> list[dict[str, Any]]:
+    images: list[dict[str, Any]] = []
+    try:
+        doc = fitz.open(path)
+    except Exception:
+        return images
+    try:
+        seen: set[int] = set()
+        for page_index, page in enumerate(doc):
+            page_images = page.get_images(full=True) or []
+            for img in page_images:
+                try:
+                    xref = int(img[0])
+                except Exception:
+                    continue
+                if xref in seen:
+                    continue
+                seen.add(xref)
+                base_image = doc.extract_image(xref) or {}
+                image_bytes = base_image.get('image')
+                if not image_bytes:
+                    continue
+                ext = str(base_image.get('ext') or 'png').lower()
+                cache_dir = _doc_chat_get_cache_path(session_id)
+                if cache_dir is None:
+                    continue
+                filename = f"page{page_index + 1:03d}_img{len(images) + 1:02d}.{ext}"
+                file_path = cache_dir / filename
+                try:
+                    file_path.write_bytes(image_bytes)
+                except Exception:
+                    continue
+                rel_path = f"cache/doc_chat/{session_id}/{filename}"
+                images.append({
+                    'page': page_index + 1,
+                    'ext': ext,
+                    'rel_path': rel_path,
+                    'path': str(file_path),
+                    'width': base_image.get('width'),
+                    'height': base_image.get('height'),
+                })
+                if len(images) >= limit:
+                    return images
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return images
+
+
+def _doc_chat_extract_docx_images(path: Path, session_id: str, limit: int) -> list[dict[str, Any]]:
+    images: list[dict[str, Any]] = []
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as zf:
+            for name in zf.namelist():
+                if not name.startswith('word/media/'):
+                    continue
+                data = zf.read(name)
+                if not data:
+                    continue
+                ext = Path(name).suffix.lstrip('.').lower() or 'png'
+                cache_dir = _doc_chat_get_cache_path(session_id)
+                if cache_dir is None:
+                    continue
+                filename = f"docx{len(images) + 1:02d}.{ext}"
+                file_path = cache_dir / filename
+                try:
+                    file_path.write_bytes(data)
+                except Exception:
+                    continue
+                rel_path = f"cache/doc_chat/{session_id}/{filename}"
+                images.append({
+                    'page': None,
+                    'ext': ext,
+                    'rel_path': rel_path,
+                    'path': str(file_path),
+                })
+                if len(images) >= limit:
+                    break
+    except Exception:
+        return images
+    return images
+
+
+def _doc_chat_extract_images(source_path: Optional[Path], session_id: str, limit: int = DOC_CHAT_IMAGE_LIMIT) -> list[dict[str, Any]]:
+    if not source_path or not source_path.exists():
+        return []
+    ext = source_path.suffix.lower()
+    if ext == '.pdf':
+        return _doc_chat_extract_pdf_images(source_path, session_id, limit)
+    if ext == '.docx':
+        return _doc_chat_extract_docx_images(source_path, session_id, limit)
+    return []
+
+
+def _doc_chat_enrich_images(images: list[dict[str, Any]], *, vision_enabled: bool) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for image in images:
+        entry = dict(image)
+        rel_path = entry.get('rel_path')
+        entry['url'] = f"/static/{rel_path}" if rel_path else None
+        entry['vision_enabled'] = bool(vision_enabled)
+        entry.setdefault('keywords', [])
+        entry.setdefault('description', '')
+        if vision_enabled and entry.get('path'):
+            try:
+                vis = call_lmstudio_vision(Path(entry['path']), Path(entry['path']).name)
+                if isinstance(vis, dict):
+                    entry['description'] = (vis.get('description') or '').strip()
+                    kws = vis.get('keywords') or []
+                    if isinstance(kws, list):
+                        entry['keywords'] = [str(k) for k in kws[:16]]
+            except Exception as exc:
+                entry['vision_error'] = str(exc)
+        if not entry.get('description'):
+            entry['description'] = 'Описание не получено.' if vision_enabled else 'Анализ изображений отключён.'
+        enriched.append(entry)
+    return enriched
+
+
+def _doc_chat_collect_chunk_previews(document_id: int, limit: int = 3) -> list[dict[str, Any]]:
+    if not document_id:
+        return []
+    try:
+        rows = (
+            db.session.query(RagDocumentChunk)
+            .filter(RagDocumentChunk.document_id == document_id)
+            .order_by(RagDocumentChunk.ordinal.asc())
+            .limit(limit)
+            .all()
+        )
+    except Exception:
+        return []
+    previews: list[dict[str, Any]] = []
+    for chunk in rows:
+        text = (chunk.preview or chunk.content or '')[:400]
+        previews.append({
+            'ordinal': chunk.ordinal,
+            'section_path': chunk.section_path,
+            'preview': text,
+        })
+    return previews
+
+
+def _doc_chat_resolve_embedding_variant(document_id: int) -> Optional[dict[str, Any]]:
+    if not document_id:
+        return None
+    try:
+        row = (
+            db.session.query(
+                RagChunkEmbedding.model_name,
+                RagChunkEmbedding.model_version,
+                func.max(RagChunkEmbedding.dim).label('dim'),
+                func.count(RagChunkEmbedding.id).label('count'),
+            )
+            .join(RagDocumentChunk, RagChunkEmbedding.chunk_id == RagDocumentChunk.id)
+            .filter(RagDocumentChunk.document_id == document_id)
+            .group_by(RagChunkEmbedding.model_name, RagChunkEmbedding.model_version)
+            .order_by(func.count(RagChunkEmbedding.id).desc())
+            .first()
+        )
+    except Exception:
+        return None
+    if not row:
+        return None
+    model_name, model_version, dim, _count = row
+    return {
+        'model_name': model_name,
+        'model_version': model_version,
+        'dim': int(dim or 0),
+    }
+
+
+def _doc_chat_cosine(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    if dot == 0:
+        return 0.0
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _doc_chat_prepare_worker(session_id: str, file_id: int, user_id: int | None, allowed_ids: Optional[Sequence[int]]) -> None:
+    allowed_set = set(int(x) for x in allowed_ids) if allowed_ids is not None else None
+    with app.app_context():
+        try:
+            db.session.rollback()
+        except Exception:
+            db.session.remove()
+        try:
+            session_snapshot = _doc_chat_internal_session(session_id)
+            if session_snapshot is None:
+                app.logger.warning("[doc-chat:%s] session missing before подготовки", session_id[:8])
+                return
+            app.logger.info("[doc-chat:%s] start preparation for file_id=%s", session_id[:8], file_id)
+            _doc_chat_set_status(session_id, 'processing', percent=5)
+            _doc_chat_progress(session_id, "Подготовка документа начата", percent=5)
+
+            file_obj = File.query.get(file_id)
+            if not file_obj:
+                _doc_chat_progress(session_id, "Ошибка: файл не найден")
+                _doc_chat_set_status(session_id, 'error', error='Файл не найден', percent=100)
+                return
+            if allowed_set is not None and file_obj.collection_id not in allowed_set:
+                _doc_chat_progress(session_id, "Ошибка: нет доступа к выбранному документу")
+                _doc_chat_set_status(session_id, 'error', error='Нет доступа к документу', percent=100)
+                return
+
+            runtime = _rt()
+            text, source_path = _collect_text_for_rag(file_obj, limit_chars=120_000)
+            if not text.strip():
+                raise RuntimeError("Не удалось извлечь текст из документа.")
+            _doc_chat_progress(session_id, f"Извлечение текста завершено ({len(text)} символов)", percent=20)
+
+            chunk_config = ChunkConfig(max_tokens=700, overlap=120, min_tokens=80)
+            indexer = RagIndexer(chunk_config=chunk_config, normalizer_version='v1')
+            ingest_result = indexer.ingest_document(
+                file_obj,
+                text,
+                metadata={'source': 'doc_chat', 'session_id': session_id},
+                skip_if_unchanged=True,
+                commit=True,
+            )
+            if ingest_result.get('skipped'):
+                _doc_chat_progress(session_id, "RAG: документ уже проиндексирован", percent=35)
+            else:
+                chunks_count = int(ingest_result.get('chunks') or 0)
+                _doc_chat_progress(session_id, f"RAG: создано чанков {chunks_count}", percent=35)
+
+            document = file_obj.rag_document
+            if not document or not document.is_ready_for_rag:
+                document = RagDocument.query.filter_by(file_id=file_obj.id, is_ready_for_rag=True).first()
+            if not document:
+                raise RuntimeError("RAG-документ не сформирован.")
+
+            embedding_backend = (runtime.rag_embedding_backend or 'auto').strip().lower() or 'auto'
+            embedding_model = runtime.rag_embedding_model or 'intfloat/multilingual-e5-large'
+            embedding_dim = int(getattr(runtime, 'rag_embedding_dim', 384) or 384)
+            embedding_batch = max(1, int(getattr(runtime, 'rag_embedding_batch_size', 32) or 32))
+            embedding_device = getattr(runtime, 'rag_embedding_device', None)
+            embedding_endpoint = getattr(runtime, 'rag_embedding_endpoint', None) or runtime.lmstudio_api_base
+            embedding_api_key = getattr(runtime, 'rag_embedding_api_key', None) or runtime.lmstudio_api_key
+
+            backend: EmbeddingBackend | None = None
+            embedding_fallback_reason: Optional[str] = None
+            try:
+                backend = load_embedding_backend(
+                    embedding_backend,
+                    model_name=embedding_model,
+                    dim=embedding_dim,
+                    batch_size=embedding_batch,
+                    device=embedding_device,
+                    base_url=embedding_endpoint or None,
+                    api_key=embedding_api_key or None,
+                )
+            except Exception as exc:
+                embedding_fallback_reason = str(exc)
+                _doc_chat_progress(session_id, f"Эмбеддинги недоступны ({embedding_fallback_reason}), используем hash fallback", percent=50)
+                backend = HashEmbeddingBackend(dim=embedding_dim or 384, normalize=True, model_name="doc-chat-hash")
+
+            try:
+                created_embeddings = _embed_missing_chunks_for_document(
+                    document.id,
+                    backend,
+                    batch_size=embedding_batch,
+                    commit=True,
+                )
+                embedding_info = {
+                    'backend': embedding_backend,
+                    'model_name': getattr(backend, 'model_name', embedding_model),
+                    'model_version': getattr(backend, 'model_version', None),
+                    'dim': int(getattr(backend, 'dim', embedding_dim) or embedding_dim),
+                }
+                if embedding_fallback_reason:
+                    embedding_info['fallback'] = embedding_fallback_reason
+            finally:
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+
+            if created_embeddings:
+                _doc_chat_progress(session_id, f"Эмбеддинги обновлены: {created_embeddings}", percent=55)
+            else:
+                _doc_chat_progress(session_id, "Эмбеддинги актуальны", percent=55)
+
+            variant = _doc_chat_resolve_embedding_variant(document.id) or {
+                'model_name': embedding_info['model_name'],
+                'model_version': embedding_info['model_version'],
+                'dim': embedding_info['dim'],
+            }
+            variant['backend'] = embedding_backend
+
+            chunk_count = int(
+                db.session.query(func.count(RagDocumentChunk.id))
+                .filter(RagDocumentChunk.document_id == document.id)
+                .scalar() or 0
+            )
+            _doc_chat_progress(session_id, f"Документ готов: чанков {chunk_count}", percent=65)
+
+            if not source_path:
+                for candidate in _resolve_candidate_paths(file_obj):
+                    if candidate.exists():
+                        source_path = candidate
+                        break
+
+            images_raw = _doc_chat_extract_images(source_path if isinstance(source_path, Path) else None, session_id, DOC_CHAT_IMAGE_LIMIT)
+            vision_enabled = bool(getattr(runtime, 'images_vision_enabled', False))
+            images_enriched = _doc_chat_enrich_images(images_raw, vision_enabled=vision_enabled) if images_raw else []
+            if images_enriched:
+                _doc_chat_progress(session_id, f"Обработано изображений: {len(images_enriched)}", percent=80)
+            else:
+                _doc_chat_progress(session_id, "Изображения не найдены", percent=70)
+
+            previews = _doc_chat_collect_chunk_previews(document.id)
+
+            session_data = {
+                'document_id': document.id,
+                'chunk_count': chunk_count,
+                'language': document.lang_primary,
+                'embedding': variant,
+                'images': images_enriched,
+                'image_count': len(images_enriched),
+                'preview_chunks': previews,
+                'text_size': len(text),
+            }
+            if source_path:
+                session_data['source_name'] = source_path.name
+
+            _doc_chat_store_data(session_id, session_data)
+            _doc_chat_progress(session_id, "Документ подготовлен", percent=95)
+            _doc_chat_set_status(session_id, 'ready', percent=100)
+
+            actor = None
+            if user_id:
+                try:
+                    actor = User.query.get(int(user_id))
+                except Exception:
+                    actor = None
+            try:
+                detail = json.dumps({
+                    'session_id': session_id,
+                    'file_id': file_obj.id,
+                    'chunk_count': chunk_count,
+                    'image_count': len(images_enriched),
+                    'model': variant.get('model_name'),
+                }, ensure_ascii=False)
+                _log_user_action(actor, 'doc_chat_prepare', 'file', file_obj.id, detail=detail[:2000])
+            except Exception:
+                pass
+        except Exception as exc:
+            msg = str(exc)
+            app.logger.exception("doc-chat preparation failed for session %s: %s", session_id, msg)
+            _doc_chat_progress(session_id, f"Ошибка подготовки: {msg}")
+            _doc_chat_set_status(session_id, 'error', error=msg, percent=100)
+            db.session.rollback()
+        finally:
+            db.session.remove()
 
 
 def _initialize_database_structures(app_obj: Flask) -> None:
@@ -4341,6 +4937,45 @@ def call_lmstudio_compose(system: str, user: str, *, temperature: float = 0.2, m
     if last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
         app.logger.warning(f"LLM compose failed: {last_error}")
     return ""
+
+
+def call_doc_chat_llm(messages: list[dict[str, Any]], *, temperature: float = 0.2, max_tokens: int = 600) -> str:
+    last_error: Exception | None = None
+    for choice in _llm_iter_choices('doc_chat'):
+        label = _llm_choice_label(choice)
+        provider = _llm_choice_provider(choice)
+        try:
+            _provider, response = _llm_send_chat(
+                choice,
+                messages,
+                temperature=float(temperature),
+                max_tokens=min(int(max_tokens), _lm_max_output_tokens()),
+                timeout=180,
+                cache_bucket='doc_chat',
+            )
+            if _llm_response_indicates_busy(response):
+                app.logger.info(f"LLM doc_chat endpoint занята ({label}), переключаемся")
+                last_error = RuntimeError('busy')
+                continue
+            response.raise_for_status()
+            data = response.json()
+            content = _llm_extract_content(_provider, data)
+            if content:
+                return content
+        except ValueError as ve:
+            last_error = ve
+            app.logger.warning(f"Doc chat LLM endpoint некорректен ({label}): {ve}")
+            continue
+        except Exception as exc:
+            last_error = exc
+            if isinstance(exc, RuntimeError) and str(exc) == 'llm_cache_only_mode':
+                app.logger.info(f"Doc chat пропущен (режим cache-only, {label})")
+            else:
+                app.logger.warning(f"Doc chat LLM не удался ({label}, {provider}): {exc}")
+            continue
+    if last_error and str(last_error) not in {'busy', 'llm_cache_only_mode'}:
+        app.logger.warning(f"Doc chat LLM окончательно не ответил: {last_error}")
+    raise RuntimeError("LLM не вернул ответ для документа.")
 def call_lmstudio_keywords(text: str, filename: str):
     """Извлечь короткий список ключевых слов из текста или поискового запроса через LM Studio."""
     text = (text or "").strip()
@@ -14513,6 +15148,506 @@ def api_training_problem_pipeline():
     elif dry_run:
         response['dataset_preview_full'] = dataset[: min(len(dataset), 10)]
     return _add_pipeline_cors_headers(jsonify(response))
+
+
+@app.route('/api/doc-chat/documents')
+def api_doc_chat_documents():
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    term = (request.args.get('q') or '').strip()
+    try:
+        query = _apply_file_access_filter(
+            File.query.options(
+                joinedload(File.collection),
+                joinedload(File.rag_document),
+            )
+        )
+        try:
+            query = query.outerjoin(Collection, File.collection_id == Collection.id).filter(
+                or_(Collection.searchable == True, Collection.id.is_(None))
+            )
+        except Exception:
+            pass
+        query = query.filter(or_(File.material_type.is_(None), File.material_type.notin_(['audio', 'image'])))
+        if term:
+            like = f"%{term}%"
+            query = query.filter(or_(
+                File.title.ilike(like),
+                File.filename.ilike(like),
+                File.author.ilike(like),
+                File.keywords.ilike(like),
+                File.rel_path.ilike(like),
+            ))
+        files = query.order_by(File.title.asc(), File.id.asc()).limit(400).all()
+    except Exception as exc:
+        app.logger.warning("doc-chat documents query failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'Не удалось получить список документов'}), 500
+    items: list[dict[str, Any]] = []
+    for file_obj in files:
+        collection = getattr(file_obj, 'collection', None)
+        doc = getattr(file_obj, 'rag_document', None)
+        items.append({
+            'id': file_obj.id,
+            'title': (file_obj.title or file_obj.filename or file_obj.rel_path or f"Файл {file_obj.id}").strip(),
+            'author': file_obj.author,
+            'year': file_obj.year,
+            'collection': getattr(collection, 'name', None),
+            'collection_id': getattr(collection, 'id', None),
+            'material_type': file_obj.material_type,
+            'rel_path': file_obj.rel_path,
+            'has_rag': bool(doc and getattr(doc, 'is_ready_for_rag', False)),
+            'mtime': file_obj.mtime,
+        })
+    return jsonify({'ok': True, 'items': items})
+
+
+@app.route('/api/doc-chat/prepare', methods=['POST'])
+def api_doc_chat_prepare():
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    try:
+        app.logger.info("[doc-chat] prepare endpoint hit by user=%s (v2)", getattr(user, 'id', None))
+    except Exception:
+        pass
+    data = request.get_json(silent=True) or {}
+    try:
+        file_id = int(data.get('file_id'))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Некорректный идентификатор файла'}), 400
+    file_obj = File.query.get(file_id)
+    if not file_obj:
+        return jsonify({'ok': False, 'error': 'Документ не найден'}), 404
+    app.logger.info("[doc-chat] file resolved id=%s title=%s", file_obj.id, (file_obj.title or file_obj.filename))
+    allowed = _current_allowed_collections()
+    if allowed is not None and file_obj.collection_id not in allowed:
+        return jsonify({'ok': False, 'error': 'Нет доступа к документу'}), 403
+    existing_id: Optional[str] = None
+    with DOC_CHAT_LOCK:
+        for sid, sess in DOC_CHAT_SESSIONS.items():
+            if sess.get('user_id') == user.id and sess.get('file_id') == file_obj.id and sess.get('status') in {'processing', 'ready'}:
+                existing_id = sid
+                break
+    now_ts = time.time()
+    if existing_id:
+        try:
+            existing = _doc_chat_internal_session(existing_id)
+        except Exception:
+            existing = None
+        if existing:
+            status = existing.get('status')
+            percent = existing.get('percent')
+            updated_at = float(existing.get('updated_at') or existing.get('created_at') or 0.0)
+            age = now_ts - updated_at if updated_at else None
+            app.logger.info(
+                "[doc-chat:%s] reuse candidate status=%s percent=%s age=%s",
+                existing_id[:8],
+                status,
+                percent,
+                f"{age:.1f}s" if age is not None else None,
+            )
+            is_ready = status == 'ready'
+            is_active = status == 'processing' and age is not None and age < 45
+            if is_ready or is_active:
+                snapshot = _doc_chat_public_session(existing_id)
+                if snapshot:
+                    return jsonify({'ok': True, 'session': snapshot})
+            # признаём сессию устаревшей и очищаем, чтобы перезапустить обработку
+            if age is not None and age > 45:
+                app.logger.warning(
+                    "[doc-chat:%s] stale session detected (status=%s age=%.1fs) — переинициализация",
+                    existing_id[:8],
+                    status,
+                    age,
+                )
+                cache_path = existing.get('cache_path')
+                with DOC_CHAT_LOCK:
+                    DOC_CHAT_SESSIONS.pop(existing_id, None)
+                if cache_path:
+                    try:
+                        shutil.rmtree(Path(cache_path), ignore_errors=True)
+                    except Exception:
+                        pass
+        else:
+            with DOC_CHAT_LOCK:
+                DOC_CHAT_SESSIONS.pop(existing_id, None)
+    try:
+        session_payload = _doc_chat_create_session(user, file_obj)
+    except Exception as exc:
+        app.logger.exception("[doc-chat] failed to create session: %s", exc)
+        return jsonify({'ok': False, 'error': 'Не удалось создать сессию документа'}), 500
+    app.logger.info("[doc-chat:%s] session payload created", session_payload['id'][:8])
+    allowed_ids = list(allowed) if allowed is not None else None
+    app.logger.info(
+        "[doc-chat:%s] session created status=%s percent=%s",
+        session_payload['id'][:8],
+        session_payload.get('status'),
+        session_payload.get('percent'),
+    )
+    fallback_thread = None
+    fallback_reason: Optional[str] = None
+    try:
+        queue = get_task_queue()
+        stats_before = queue.stats()
+        app.logger.info(
+            "[doc-chat:%s] submit task: before workers=%s started=%s queued=%s",
+            session_payload['id'][:8],
+            stats_before.get('workers'),
+            stats_before.get('started'),
+            stats_before.get('queued'),
+        )
+        task_id = queue.submit(
+            _doc_chat_prepare_worker,
+            session_payload['id'],
+            file_obj.id,
+            user.id,
+            allowed_ids,
+            description=f"doc-chat-prepare-{file_obj.id}",
+        )
+        stats_after = queue.stats()
+        app.logger.info(
+            "[doc-chat:%s] очередь подготовки поставлена (task=%s, workers=%s, started=%s, queued=%s)",
+            session_payload['id'][:8],
+            task_id,
+            stats_after.get('workers'),
+            stats_after.get('started'),
+            stats_after.get('queued'),
+        )
+        if not stats_after.get('started') or not stats_after.get('workers'):
+            fallback_reason = f"queue_inactive workers={stats_after.get('workers')} started={stats_after.get('started')}"
+        def _queue_watchdog() -> None:
+            app.logger.info("[doc-chat:%s] watchdog started", session_payload['id'][:8])
+            try:
+                time.sleep(3.0)
+                session_probe = _doc_chat_internal_session(session_payload['id'])
+                if not session_probe:
+                    app.logger.warning("[doc-chat:%s] watchdog: session отсутствует — запускаем резерв", session_payload['id'][:8])
+                    raise RuntimeError("session_missing")
+                status = session_probe.get('status')
+                if status in {'processing', 'ready', 'error'}:
+                    app.logger.info("[doc-chat:%s] watchdog: очередь работает (status=%s)", session_payload['id'][:8], status)
+                    return
+                app.logger.warning("[doc-chat:%s] watchdog: очередь не стартовала (status=%s) — запускаем резерв", session_payload['id'][:8], status)
+                raise RuntimeError(f"queue_idle:{status}")
+            except Exception as watchdog_exc:
+                try:
+                    app.logger.warning(
+                        "[doc-chat:%s] watchdog triggered fallback: %s",
+                        session_payload['id'][:8],
+                        watchdog_exc,
+                    )
+                    _doc_chat_prepare_worker(
+                        session_payload['id'],
+                        file_obj.id,
+                        user.id,
+                        allowed_ids,
+                    )
+                    app.logger.info("[doc-chat:%s] watchdog fallback completed", session_payload['id'][:8])
+                except Exception as exc_inner:
+                    app.logger.exception(
+                        "[doc-chat:%s] watchdog fallback failed: %s",
+                        session_payload['id'][:8],
+                        exc_inner,
+                    )
+
+        threading.Thread(
+            target=_queue_watchdog,
+            name=f"doc-chat-watchdog-{session_payload['id'][:8]}",
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        app.logger.exception(
+            "[doc-chat:%s] не удалось поставить задачу: %s",
+            session_payload['id'][:8],
+            exc,
+        )
+        fallback_reason = f"queue_error:{exc}"
+
+    if fallback_reason:
+        try:
+            app.logger.warning(
+                "[doc-chat:%s] используем резервный поток подготовки (%s)",
+                session_payload['id'][:8],
+                fallback_reason,
+            )
+            fallback_thread = threading.Thread(
+                target=_doc_chat_prepare_worker,
+                args=(session_payload['id'], file_obj.id, user.id, allowed_ids),
+                name=f"doc-chat-fallback-{session_payload['id'][:8]}",
+                daemon=True,
+            )
+            fallback_thread.start()
+            app.logger.info("[doc-chat:%s] fallback thread started", session_payload['id'][:8])
+        except Exception as exc:
+            app.logger.exception(
+                "[doc-chat:%s] резервный запуск подготовки не удался: %s",
+                session_payload['id'][:8],
+                exc,
+            )
+            return jsonify({'ok': False, 'error': 'Не удалось запустить обработку документа'}), 500
+
+    snapshot = _doc_chat_public_session(session_payload['id'])
+    return jsonify({'ok': True, 'session': snapshot})
+
+
+@app.route('/api/doc-chat/status/<session_id>')
+def api_doc_chat_status(session_id: str):
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    owner_id = _doc_chat_owner_id(session_id)
+    if owner_id is None:
+        return jsonify({'ok': False, 'error': 'Сессия не найдена'}), 404
+    if owner_id != user.id and _user_role(user) != ROLE_ADMIN:
+        return jsonify({'ok': False, 'error': 'Нет доступа'}), 403
+    snapshot = _doc_chat_public_session(session_id)
+    if snapshot is None:
+        return jsonify({'ok': False, 'error': 'Сессия не найдена'}), 404
+    return jsonify({'ok': True, 'session': snapshot})
+
+
+@app.route('/api/doc-chat/ask', methods=['POST'])
+def api_doc_chat_ask():
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    payload = request.get_json(silent=True) or {}
+    session_id = str(payload.get('session_id') or '').strip()
+    question = str(payload.get('question') or '').strip()
+    if not session_id:
+        return jsonify({'ok': False, 'error': 'Не указана сессия'}), 400
+    if not question:
+        return jsonify({'ok': False, 'error': 'Вопрос не должен быть пустым'}), 400
+    owner_id = _doc_chat_owner_id(session_id)
+    if owner_id is None:
+        return jsonify({'ok': False, 'error': 'Сессия не найдена'}), 404
+    if owner_id != user.id and _user_role(user) != ROLE_ADMIN:
+        return jsonify({'ok': False, 'error': 'Нет доступа'}), 403
+    session_internal = _doc_chat_internal_session(session_id)
+    if not session_internal:
+        return jsonify({'ok': False, 'error': 'Сессия не найдена'}), 404
+    if session_internal.get('status') != 'ready':
+        return jsonify({'ok': False, 'error': 'Документ ещё обрабатывается'}), 409
+    doc_data = session_internal.get('data') or {}
+    document_id = doc_data.get('document_id')
+    embedding_info = doc_data.get('embedding') or {}
+    if not document_id or not embedding_info:
+        return jsonify({'ok': False, 'error': 'Сессия не готова к ответам'}), 409
+
+    runtime = _rt()
+    embedding_backend = (embedding_info.get('backend') or runtime.rag_embedding_backend or 'auto').strip().lower() or 'auto'
+    model_name = embedding_info.get('model_name') or runtime.rag_embedding_model or 'intfloat/multilingual-e5-large'
+    model_version = embedding_info.get('model_version')
+    dim = int(embedding_info.get('dim') or getattr(runtime, 'rag_embedding_dim', 384) or 384)
+    batch_size = max(1, int(getattr(runtime, 'rag_embedding_batch_size', 32) or 32))
+    device = getattr(runtime, 'rag_embedding_device', None)
+    endpoint = getattr(runtime, 'rag_embedding_endpoint', None) or runtime.lmstudio_api_base
+    api_key = getattr(runtime, 'rag_embedding_api_key', None) or runtime.lmstudio_api_key
+
+    images = doc_data.get('images') or []
+    image_vector_indexes: dict[int, int] = {}
+    try:
+        backend = load_embedding_backend(
+            embedding_backend,
+            model_name=model_name,
+            dim=dim,
+            batch_size=batch_size,
+            device=device,
+            base_url=endpoint or None,
+            api_key=api_key or None,
+        )
+        texts_to_embed = [question]
+        for idx, image in enumerate(images):
+            description = str(image.get('description') or '').strip()
+            keywords = image.get('keywords') or []
+            kw_text = ", ".join(str(k) for k in keywords if k)
+            combined = description
+            if kw_text:
+                combined = f"{description}\nКлючевые слова: {kw_text}" if description else f"Ключевые слова: {kw_text}"
+            combined = combined.strip()
+            if combined:
+                image_vector_indexes[idx] = len(texts_to_embed)
+                texts_to_embed.append(combined)
+        vectors = backend.embed_many(texts_to_embed)
+    except Exception as exc:
+        try:
+            backend.close()
+        except Exception:
+            pass
+        app.logger.warning("doc-chat embedding failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'Не удалось обработать вопрос'}), 500
+    try:
+        backend.close()
+    except Exception:
+        pass
+    if not vectors:
+        return jsonify({'ok': False, 'error': 'Не удалось обработать вопрос'}), 500
+    question_vector = vectors[0]
+
+    retriever = VectorRetriever(
+        model_name=model_name,
+        model_version=model_version,
+        max_candidates=200,
+    )
+    retrieved = retriever.search_by_vector(
+        question_vector,
+        top_k=6,
+        allowed_document_ids=[document_id],
+    )
+
+    context_sections: list[dict[str, Any]] = []
+    text_sources: list[dict[str, Any]] = []
+    for idx, item in enumerate(retrieved, start=1):
+        chunk = item.chunk
+        snippet = (chunk.content or '')[:800]
+        section_path = chunk.section_path
+        page = None
+        if chunk.meta:
+            try:
+                meta = json.loads(chunk.meta)
+                page = meta.get('page') or meta.get('page_number') or meta.get('page_index')
+            except Exception:
+                page = None
+        label = f"Текст {idx}"
+        context_sections.append({
+            'label': label,
+            'content': snippet,
+            'section_path': section_path,
+            'page': page,
+            'score': round(float(item.score), 4),
+        })
+        text_sources.append({
+            'label': label,
+            'section_path': section_path,
+            'page': page,
+            'score': round(float(item.score), 4),
+            'preview': (chunk.preview or snippet[:300]),
+        })
+
+    if not context_sections:
+        previews = doc_data.get('preview_chunks') or []
+        for idx, preview in enumerate(previews, start=1):
+            snippet = (preview.get('preview') or '')[:800]
+            label = f"Текст {idx}"
+            context_sections.append({
+                'label': label,
+                'content': snippet,
+                'section_path': preview.get('section_path'),
+                'page': None,
+                'score': 0.0,
+            })
+            text_sources.append({
+                'label': label,
+                'section_path': preview.get('section_path'),
+                'page': None,
+                'score': 0.0,
+                'preview': snippet[:300],
+            })
+
+    image_sources: list[dict[str, Any]] = []
+    if images:
+        scored_images: list[dict[str, Any]] = []
+        for idx, image in enumerate(images):
+            vec_idx = image_vector_indexes.get(idx)
+            vector = vectors[vec_idx] if vec_idx is not None and vec_idx < len(vectors) else None
+            score = _doc_chat_cosine(question_vector, vector) if vector else 0.0
+            label = f"Изображение {idx + 1}"
+            scored_images.append({
+                'label': label,
+                'page': image.get('page'),
+                'description': image.get('description'),
+                'keywords': image.get('keywords') or [],
+                'url': image.get('url'),
+                'score': round(float(score), 4),
+            })
+        scored_images.sort(key=lambda item: item['score'], reverse=True)
+        image_sources = scored_images[:3] if len(scored_images) > 3 else scored_images
+
+    doc_meta = session_internal.get('file_meta') or {}
+    doc_title = doc_meta.get('title') or f"Документ {doc_meta.get('id')}"
+    doc_author = doc_meta.get('author')
+    doc_year = doc_meta.get('year')
+    info_parts = [f"Документ: «{doc_title}»"]
+    if doc_author:
+        info_parts.append(f"Автор: {doc_author}")
+    if doc_year:
+        info_parts.append(f"Год: {doc_year}")
+    doc_info_line = "; ".join(info_parts)
+
+    context_parts: list[str] = []
+    for section in context_sections:
+        meta_line = []
+        if section.get('page'):
+            meta_line.append(f"стр. {section['page']}")
+        if section.get('section_path'):
+            meta_line.append(section['section_path'])
+        meta_suffix = f" ({', '.join(meta_line)})" if meta_line else ""
+        context_parts.append(f"[{section['label']}{meta_suffix}]\n{section['content']}".strip())
+    if image_sources:
+        context_parts.append("Изображения:")
+        for image in image_sources:
+            meta_line = []
+            if image.get('page'):
+                meta_line.append(f"стр. {image['page']}")
+            meta_suffix = f" ({', '.join(meta_line)})" if meta_line else ""
+            keywords = image.get('keywords') or []
+            kw_text = f" Ключевые слова: {', '.join(keywords)}." if keywords else ""
+            context_parts.append(f"[{image['label']}{meta_suffix}]\n{image.get('description') or ''}{kw_text}".strip())
+    if not context_parts:
+        context_parts.append("Контекст: подходящие фрагменты не найдены, ответ может быть неполным.")
+    context_blob = "\n\n".join(context_parts)
+    max_chars = _lm_max_input_chars()
+    if len(context_blob) > max_chars:
+        context_blob = context_blob[:max_chars]
+
+    system_prompt = (
+        "Ты виртуальный эксперт по документам. Используй приведённые фрагменты текста и описания изображений, "
+        "чтобы ответить на вопрос. Указывай ссылки на использованные части форматом «Текст N» или «Изображение N». "
+        "Если данных недостаточно, прямо сообщи об этом. Отвечай на русском языке."
+    )
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": f"{doc_info_line}\n\nКонтекст:\n{context_blob}"},
+    ]
+    history = session_internal.get('history') or []
+    for turn in history[-6:]:
+        role = turn.get('role')
+        content = turn.get('content')
+        if role in {'user', 'assistant'} and content:
+            messages.append({'role': role, 'content': str(content)})
+    messages.append({'role': 'user', 'content': question})
+
+    try:
+        answer = call_doc_chat_llm(messages, temperature=0.2, max_tokens=700)
+    except Exception as exc:
+        app.logger.warning("doc-chat LLM failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'Не удалось получить ответ'}), 500
+    answer = (answer or '').strip()
+
+    _doc_chat_append_history(session_id, {'role': 'user', 'content': question})
+    _doc_chat_append_history(session_id, {'role': 'assistant', 'content': answer, 'sources': {'texts': text_sources, 'images': image_sources}})
+
+    try:
+        detail = json.dumps({
+            'session_id': session_id,
+            'file_id': session_internal.get('file_id'),
+            'question': question[:200],
+        }, ensure_ascii=False)
+        _log_user_action(user, 'doc_chat_ask', 'file', session_internal.get('file_id'), detail=detail[:2000])
+    except Exception:
+        pass
+
+    snapshot = _doc_chat_public_session(session_id)
+    return jsonify({
+        'ok': True,
+        'answer': answer,
+        'sources': {
+            'texts': text_sources,
+            'images': image_sources,
+        },
+        'session': snapshot,
+    })
 
 
 @app.route('/api/ai-search', methods=['POST'])

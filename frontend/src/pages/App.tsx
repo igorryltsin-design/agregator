@@ -74,6 +74,7 @@ export default function App() {
   const helpTitleId = 'agregator-help-title'
   const helpDescId = 'agregator-help-desc'
   const iconButtonClass = 'btn btn-outline-secondary icon-only'
+  const docChatButtonClass = 'btn btn-primary doc-chat-launch'
 
   useEffect(() => {
     if (!loading && !user) {
@@ -363,6 +364,15 @@ export default function App() {
           </div>
           <VoiceSearchButton onTranscribed={handleVoiceSearch} onError={handleVoiceError} />
           <div className="ms-auto d-flex align-items-center gap-2 flex-wrap justify-content-end" style={{ rowGap: '0.3rem' }}>
+            <Link
+              className={docChatButtonClass}
+              to="doc-chat"
+              aria-label="Режим «Документ-чат»"
+              data-tooltip="Чат на основе выбранного документа"
+            >
+              <span className="icon-glyph" aria-hidden="true">💬</span>
+              <span className="doc-chat-label">Документ-чат</span>
+            </Link>
             <button
               className={iconButtonClass}
               type="button"

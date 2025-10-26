@@ -9,6 +9,7 @@ import GraphPage from './pages/GraphPage'
 import StatsPage from './pages/StatsPage'
 import SettingsPage from './pages/SettingsPage'
 import IngestPage from './pages/IngestPage'
+import DocumentChatPage from './pages/DocumentChatPage'
 import LoginPage from './pages/LoginPage'
 import ProfilePage from './pages/ProfilePage'
 import UsersPage from './pages/UsersPage'
@@ -28,6 +29,7 @@ const router = createBrowserRouter([
     element: <App />,
     children: [
       { index: true, element: <Catalogue /> },
+      { path: 'doc-chat', element: <DocumentChatPage /> },
       { path: 'graph', element: <GraphPage /> },
       { path: 'stats', element: <StatsPage /> },
       { path: 'settings', element: <SettingsPage /> },
