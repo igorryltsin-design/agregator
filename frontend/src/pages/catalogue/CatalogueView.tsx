@@ -1,13 +1,15 @@
 import React from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useMaterialTypeOptions, tagKeyRu } from '../../utils/locale'
 import { useCatalogueState } from './useCatalogueState'
 import AiPanel from './AiPanel'
 import FileCard from './FileCard'
 import PreviewModal from './PreviewModal'
 import FilterSidebar from './FilterSidebar'
-import type { FacetSuggestion } from './types'
+import type { FacetSuggestion, FileItem } from './types'
 
 export default function CatalogueView() {
+  const navigate = useNavigate()
   const catalogue = useCatalogueState()
   const { searchParams, selectors, list, ai, pagination, modals, helpers, facets, facetsLoading, collections } = catalogue
   const materialTypeOptions = useMaterialTypeOptions()
@@ -103,6 +105,12 @@ export default function CatalogueView() {
       handleTagToggle(`${suggestion.key}=${suggestion.value}`)
     }
   }
+
+  const handleStartChat = React.useCallback((file: FileItem) => {
+    const params = new URLSearchParams()
+    params.set('file', String(file.id))
+    navigate(`/doc-chat?${params.toString()}`)
+  }, [navigate])
 
   const yearFilterLabel = React.useMemo(() => {
     if (year_from && year_to && year_from === year_to) return `Год: ${year_from}`
@@ -212,6 +220,7 @@ export default function CatalogueView() {
                 onRename={renameFile}
                 onDelete={deleteFile}
                 onTagSubmit={updateTagsInline}
+                onStartChat={handleStartChat}
               />
             ))}
           </div>

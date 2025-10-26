@@ -90,6 +90,7 @@ class File(db.Model):
     collection = db.relationship("Collection", backref="files", lazy=True)
     tags = db.relationship("Tag", backref="file", cascade="all, delete-orphan")
     rag_document = db.relationship("RagDocument", backref="file", uselist=False, cascade="all, delete-orphan")
+    doc_chat_cache = db.relationship("DocChatCache", backref="file", uselist=False, cascade="all, delete-orphan")
 
 
 class Tag(db.Model):
@@ -132,6 +133,23 @@ class TaskRecord(db.Model):
     started_at = db.Column(db.DateTime, nullable=True)
     finished_at = db.Column(db.DateTime, nullable=True)
     error = db.Column(db.String, nullable=True)
+
+
+class DocChatCache(db.Model):
+    __tablename__ = "doc_chat_cache"
+    file_id = db.Column(db.Integer, db.ForeignKey("files.id", ondelete="CASCADE"), primary_key=True)
+    document_id = db.Column(db.Integer, nullable=False)
+    data = db.Column(db.JSON, nullable=False, default=dict)
+    chunk_count = db.Column(db.Integer, nullable=False, default=0)
+    image_count = db.Column(db.Integer, nullable=False, default=0)
+    text_size = db.Column(db.Integer, nullable=True)
+    embedding_backend = db.Column(db.String, nullable=True)
+    embedding_model = db.Column(db.String, nullable=True)
+    embedding_dim = db.Column(db.Integer, nullable=True)
+    vision_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    file_mtime = db.Column(db.Float, nullable=True)
+    file_sha1 = db.Column(db.String, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class LlmEndpoint(db.Model):

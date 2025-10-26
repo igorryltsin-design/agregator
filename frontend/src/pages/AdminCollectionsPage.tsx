@@ -11,11 +11,14 @@ type Member = {
 type CollectionRow = {
   id: number
   name: string
+  slug?: string | null
   owner_id?: number | null
   owner_username?: string | null
   is_private?: boolean
   count?: number
   members?: Member[]
+  searchable?: boolean
+  graphable?: boolean
 }
 
 type UserSuggestion = {
@@ -40,7 +43,7 @@ export default function AdminCollectionsPage() {
   const [loading, setLoading] = useState(false)
   const [rescanLoading, setRescanLoading] = useState(false)
   const [renameLoading, setRenameLoading] = useState(false)
-  const [deleteLoading, setDeleteLoading] = useState(false)
+  const [deletingCollectionId, setDeletingCollectionId] = useState<number | null>(null)
   const [clearLoading, setClearLoading] = useState(false)
   const [exportLoading, setExportLoading] = useState(false)
   const [ragLoading, setRagLoading] = useState(false)
@@ -48,6 +51,9 @@ export default function AdminCollectionsPage() {
   const [memberForm, setMemberForm] = useState<{ username: string; role: string; userId: number | null }>({ username: '', role: 'viewer', userId: null })
   const [memberOptions, setMemberOptions] = useState<UserSuggestion[]>([])
   const [memberLookupLoading, setMemberLookupLoading] = useState(false)
+  const [docChatCollectionId, setDocChatCollectionId] = useState<number | null>(null)
+  const [collectionsSaving, setCollectionsSaving] = useState(false)
+  const [newCollectionName, setNewCollectionName] = useState('')
 
   const loadCollections = async () => {
     setLoading(true)
@@ -157,6 +163,86 @@ export default function AdminCollectionsPage() {
       window.clearTimeout(handle)
     }
   }, [assignedMemberIds, isAdmin, memberForm.username])
+
+  const updateCollectionFlag = (collectionId: number, field: 'searchable' | 'graphable', value: boolean) => {
+    setCollections(prev => prev.map(col => (col.id === collectionId ? { ...col, [field]: value } : col)))
+  }
+
+  const saveCollectionSettings = async () => {
+    setCollectionsSaving(true)
+    try {
+      const fd = new FormData()
+      collections.forEach(col => {
+        if (col.searchable) fd.set(`search_${col.id}`, 'on')
+        if (col.graphable) fd.set(`graph_${col.id}`, 'on')
+      })
+      const trimmed = newCollectionName.trim()
+      if (trimmed) {
+        fd.set('new_name', trimmed)
+      }
+      const r = await fetch('/settings/collections', { method: 'POST', body: fd })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || data?.status !== 'ok') {
+        throw new Error(data?.error || 'Не удалось сохранить коллекции')
+      }
+      toasts.push('Коллекции обновлены', 'success')
+      setNewCollectionName('')
+      await loadCollections()
+    } catch (error: any) {
+      toasts.push(error?.message || 'Ошибка сохранения коллекций', 'error')
+    } finally {
+      setCollectionsSaving(false)
+    }
+  }
+
+  const prepareCollectionForChat = async (collectionId: number) => {
+    setDocChatCollectionId(collectionId)
+    try {
+      const resp = await fetch(`/api/doc-chat/collections/${collectionId}/prepare`, { method: 'POST' })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok || !data?.ok) {
+        throw new Error(data?.error || 'Не удалось запустить обработку коллекции для чата')
+      }
+      const pending = typeof data.pending === 'number' ? data.pending : null
+      if (pending === 0) {
+        toasts.push('Все документы коллекции уже готовы для чата.', 'info')
+      } else if (pending && pending > 0) {
+        toasts.push(`Запущена подготовка ${pending} документов для чата.`, 'success')
+      } else {
+        toasts.push('Задача подготовки документов для чата создана.', 'success')
+      }
+    } catch (error: any) {
+      toasts.push(error?.message || 'Не удалось подготовить коллекцию для чата', 'error')
+    } finally {
+      setDocChatCollectionId(null)
+    }
+  }
+
+  const deleteCollectionById = async (collectionId: number) => {
+    const target = collections.find(c => c.id === collectionId)
+    if (!target) return
+    if (!confirm(`Удалить коллекцию «${target.name}» и все её файлы?`)) return
+    setDeletingCollectionId(collectionId)
+    try {
+      const r = await fetch(`/api/collections/${collectionId}`, { method: 'DELETE' })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok && data?.ok) {
+        toasts.push('Коллекция удалена', 'success')
+        setCollections(prev => prev.filter(c => c.id !== collectionId))
+        if (selectedId === collectionId) {
+          setSelectedId(null)
+          setMembers([])
+        }
+      } else {
+        throw new Error(data?.error || 'Не удалось удалить коллекцию')
+      }
+    } catch (error: any) {
+      toasts.push(error?.message || 'Ошибка при удалении коллекции', 'error')
+    } finally {
+      setDeletingCollectionId(null)
+      await loadCollections()
+    }
+  }
 
   const selectedCollection = useMemo(() => collections.find(c => c.id === selectedId) || null, [collections, selectedId])
 
@@ -286,25 +372,7 @@ export default function AdminCollectionsPage() {
 
   const deleteCollection = async () => {
     if (!selectedId) return
-    if (!confirm('Удалить коллекцию и все её файлы? Действие необратимо.')) return
-    setDeleteLoading(true)
-    try {
-      const r = await fetch(`/api/collections/${selectedId}`, { method: 'DELETE' })
-      const data = await r.json().catch(() => ({}))
-      if (r.ok && data?.ok) {
-        toasts.push('Коллекция удалена', 'success')
-        setCollections(prev => prev.filter(c => c.id !== selectedId))
-        setSelectedId(null)
-        setMembers([])
-      } else {
-        toasts.push(data?.error || 'Не удалось удалить коллекцию', 'error')
-      }
-    } catch {
-      toasts.push('Ошибка при удалении коллекции', 'error')
-    } finally {
-      setDeleteLoading(false)
-      loadCollections()
-    }
+    await deleteCollectionById(selectedId)
   }
 
   const exportExcel = async () => {
@@ -527,9 +595,9 @@ export default function AdminCollectionsPage() {
                         type="button"
                         className="btn btn-outline-danger"
                         onClick={deleteCollection}
-                        disabled={deleteLoading}
+                        disabled={deletingCollectionId === selectedId}
                       >
-                        {deleteLoading ? '...' : 'Удалить'}
+                        {deletingCollectionId === selectedId ? '...' : 'Удалить'}
                       </button>
                     </div>
                   )}
@@ -616,8 +684,96 @@ export default function AdminCollectionsPage() {
           ) : (
             <div className="text-muted">Выберите коллекцию, чтобы просмотреть участников.</div>
           )}
+      </div>
+    </div>
+    <div className="col-12">
+      <div className="card p-3">
+        <div className="fw-semibold mb-2">Настройки коллекций</div>
+        <div className="table-responsive">
+          <table className="table table-sm align-middle">
+            <thead>
+              <tr>
+                <th>Название</th>
+                <th>Файлов</th>
+                <th>Поиск</th>
+                <th>Граф</th>
+                <th className="text-end">Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {collections.map(col => {
+                const searchChecked = col.searchable !== false
+                const graphChecked = col.graphable !== false
+                return (
+                  <tr key={col.id}>
+                    <td>
+                      <div className="fw-semibold">{col.name}</div>
+                      <div className="text-muted" style={{ fontSize: 12 }}>{col.slug ? `slug: ${col.slug}` : 'slug не задан'}</div>
+                    </td>
+                    <td className="text-secondary">{col.count ?? 0}</td>
+                    <td>
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={searchChecked}
+                        onChange={event => updateCollectionFlag(col.id, 'searchable', event.target.checked)}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={graphChecked}
+                        onChange={event => updateCollectionFlag(col.id, 'graphable', event.target.checked)}
+                      />
+                    </td>
+                    <td>
+                      <div className="d-flex gap-2 justify-content-end">
+                        <button
+                          className="btn btn-sm btn-outline-primary"
+                          onClick={() => prepareCollectionForChat(col.id)}
+                          disabled={docChatCollectionId === col.id}
+                        >
+                          {docChatCollectionId === col.id ? '…' : 'Обработать для чата'}
+                        </button>
+                        <button
+                          className="btn btn-sm btn-outline-danger"
+                          onClick={() => deleteCollectionById(col.id)}
+                          disabled={deletingCollectionId === col.id}
+                        >
+                          {deletingCollectionId === col.id ? '...' : 'Удалить'}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+              {collections.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="text-center text-muted py-3">Коллекции не найдены</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="d-flex flex-wrap align-items-center gap-2 mt-2">
+          <input
+            className="form-control"
+            placeholder="Новая коллекция"
+            value={newCollectionName}
+            onChange={event => setNewCollectionName(event.target.value)}
+            style={{ maxWidth: 320 }}
+          />
+          <button
+            className="btn btn-outline-primary"
+            onClick={saveCollectionSettings}
+            disabled={collectionsSaving}
+          >
+            {collectionsSaving ? 'Сохранение…' : 'Сохранить'}
+          </button>
         </div>
       </div>
     </div>
-  )
+  </div>
+)
 }

@@ -11,9 +11,10 @@ type FileCardProps = {
   onRename: (file: FileItem) => void
   onDelete: (file: FileItem) => void
   onTagSubmit: (file: FileItem, tags: Tag[]) => void | Promise<void>
+  onStartChat: (file: FileItem) => void
 }
 
-const FileCard: React.FC<FileCardProps> = ({ file, query, onPreview, onEdit, onRefresh, onRename, onDelete, onTagSubmit }) => {
+const FileCard: React.FC<FileCardProps> = ({ file, query, onPreview, onEdit, onRefresh, onRename, onDelete, onTagSubmit, onStartChat }) => {
   const [refreshing, setRefreshing] = useState(false)
   const [renaming, setRenaming] = useState(false)
 
@@ -40,6 +41,8 @@ const FileCard: React.FC<FileCardProps> = ({ file, query, onPreview, onEdit, onR
     await onTagSubmit(file, nextTags)
     if (input) input.value = ''
   }
+
+  const hasRelPath = Boolean(file.rel_path)
 
   return (
     <div className="masonry-item">
@@ -84,16 +87,15 @@ const FileCard: React.FC<FileCardProps> = ({ file, query, onPreview, onEdit, onR
             />
           </form>
         </div>
-        {file.rel_path && (
-          <div className="mt-2 d-flex gap-2 mt-auto">
-            <button className="btn btn-sm btn-outline-secondary" onClick={() => onPreview(file.rel_path!)} title="Предпросмотр">👁️</button>
-            <button className="btn btn-sm btn-outline-secondary" disabled={refreshing} onClick={async () => { if (refreshing) return; setRefreshing(true); try { await onRefresh(file) } finally { setRefreshing(false) } }} title="Обновить теги">{refreshing ? '…' : '⟳'}</button>
-            <button className="btn btn-sm btn-outline-secondary" onClick={() => onEdit(file)} title="Редактировать">📝</button>
-            <button className="btn btn-sm btn-outline-secondary" disabled={renaming} onClick={async () => { if (renaming) return; setRenaming(true); try { await onRename(file) } finally { setRenaming(false) } }} title="Автопереименование">{renaming ? '…' : '✎'}</button>
-            <a className="btn btn-sm btn-outline-secondary" href={`/download/${encodeURIComponent(file.rel_path)}`}>Скачать</a>
-            <button className="btn btn-sm btn-outline-danger ms-auto" onClick={() => onDelete(file)} title="Удалить">✖</button>
-          </div>
-        )}
+        <div className="mt-2 d-flex gap-2 mt-auto">
+          {hasRelPath && <button className="btn btn-sm btn-outline-secondary" onClick={() => onPreview(file.rel_path!)} title="Предпросмотр">👁️</button>}
+          <button className="btn btn-sm btn-outline-primary" onClick={() => onStartChat(file)} title="Чат с документом">💬</button>
+          <button className="btn btn-sm btn-outline-secondary" disabled={refreshing} onClick={async () => { if (refreshing) return; setRefreshing(true); try { await onRefresh(file) } finally { setRefreshing(false) } }} title="Обновить теги">{refreshing ? '…' : '⟳'}</button>
+          <button className="btn btn-sm btn-outline-secondary" onClick={() => onEdit(file)} title="Редактировать">📝</button>
+          <button className="btn btn-sm btn-outline-secondary" disabled={renaming} onClick={async () => { if (renaming) return; setRenaming(true); try { await onRename(file) } finally { setRenaming(false) } }} title="Автопереименование">{renaming ? '…' : '✎'}</button>
+          {hasRelPath && <a className="btn btn-sm btn-outline-secondary" href={`/download/${encodeURIComponent(file.rel_path!)}`}>Скачать</a>}
+          <button className="btn btn-sm btn-outline-danger ms-auto" onClick={() => onDelete(file)} title="Удалить">✖</button>
+        </div>
       </div>
     </div>
   )

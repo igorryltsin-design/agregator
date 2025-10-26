@@ -296,7 +296,6 @@ export default function SettingsPage() {
   const [aiwordOptions, setAiwordOptions] = useState<UserSuggestion[]>([])
   const [aiwordLoading, setAiwordLoading] = useState(false)
   const [llmWeights, setLlmWeights] = useState<Record<number, string>>({})
-  const [deleteCollectionId, setDeleteCollectionId] = useState<number | null>(null)
 
   useEffect(() => {
     if (!isAdmin) return
@@ -635,27 +634,6 @@ export default function SettingsPage() {
       try { window.dispatchEvent(new Event('scan-open')) } catch {}
     } catch {
       alert('Не удалось запустить сканирование')
-    }
-  }
-
-  const deleteCollection = async (collectionId: number) => {
-    const target = (s?.collections || []).find(c => c.id === collectionId)
-    if (!target) return
-    if (!confirm(`Удалить коллекцию «${target.name}» и все её файлы?`)) return
-    setDeleteCollectionId(collectionId)
-    try {
-      const r = await fetch(`/api/collections/${collectionId}`, { method: 'DELETE' })
-      const data = await r.json().catch(() => ({}))
-      if (r.ok && data?.ok) {
-        toasts.push('Коллекция удалена', 'success')
-        setS(prev => prev ? { ...prev, collections: (prev.collections || []).filter(c => c.id !== collectionId) } : prev)
-      } else {
-        toasts.push(data?.error || 'Не удалось удалить коллекцию', 'error')
-      }
-    } catch {
-      toasts.push('Ошибка при удалении коллекции', 'error')
-    } finally {
-      setDeleteCollectionId(null)
     }
   }
 
@@ -1156,80 +1134,6 @@ export default function SettingsPage() {
       </div>
 
       <div className="card p-3">
-        <div className="fw-semibold mb-2">Коллекции</div>
-        <div className="table-responsive">
-          <table className="table table-sm align-middle">
-            <thead>
-              <tr>
-                <th>Название</th>
-                <th>Файлов</th>
-                <th>Поиск</th>
-                <th>Граф</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {(s.collections || []).map((c, idx) => (
-                <tr key={c.id}>
-                  <td>
-                    <div className="fw-semibold">{c.name}</div>
-                    <div className="text-muted" style={{ fontSize: 12 }}>
-                      {c.slug ? `slug: ${c.slug}` : ''}
-                    </div>
-                  </td>
-                  <td className="text-secondary">{c.count ?? 0}</td>
-                  <td>
-                    <input
-                      className="form-check-input"
-                      type="checkbox"
-                      checked={c.searchable}
-                      onChange={e => {
-                        const next = [...(s.collections || [])]
-                        next[idx] = { ...c, searchable: e.target.checked }
-                        setS({ ...s, collections: next })
-                      }}
-                    />
-                  </td>
-                  <td>
-                    <input
-                      className="form-check-input"
-                      type="checkbox"
-                      checked={c.graphable}
-                      onChange={e => {
-                        const next = [...(s.collections || [])]
-                        next[idx] = { ...c, graphable: e.target.checked }
-                        setS({ ...s, collections: next })
-                      }}
-                    />
-                  </td>
-                  <td className="text-end">
-                    <button
-                      className="btn btn-sm btn-outline-danger"
-                      onClick={() => deleteCollection(c.id)}
-                      disabled={deleteCollectionId === c.id}
-                    >
-                      {deleteCollectionId === c.id ? '...' : 'Удалить'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <CollectionsEditor
-          collections={s.collections || []}
-          onSaved={async () => {
-            const r = await fetch('/api/settings')
-            const j = await r.json()
-            const normalized = normalizeSettings(j)
-            setS(normalized)
-            setReindexUseLLM(boolVal(normalized.default_use_llm, true))
-            setReindexPrune(boolVal(normalized.default_prune, true))
-          }}
-        />
-      </div>
-
-      <div className="card p-3">
         <div className="fw-semibold mb-2">Управление базой данных</div>
         <div className="d-flex flex-wrap gap-2 align-items-center">
           <button className="btn btn-outline-primary" onClick={backupDb}>Резервная копия</button>
@@ -1275,36 +1179,6 @@ export default function SettingsPage() {
           </div>
         </details>
       </div>
-    </div>
-  )
-}
-
-function CollectionsEditor({ collections, onSaved }: { collections: Collection[]; onSaved: () => void }) {
-  const [newName, setNewName] = useState('')
-  const [saving, setSaving] = useState(false)
-  const save = async () => {
-    setSaving(true)
-    try {
-      const fd = new FormData()
-      for (const c of collections) {
-        if (c.searchable) fd.set(`search_${c.id}`, 'on')
-        if (c.graphable) fd.set(`graph_${c.id}`, 'on')
-      }
-      if (newName.trim()) fd.set('new_name', newName.trim())
-      const r = await fetch('/settings/collections', { method: 'POST', body: fd })
-      if (!r.ok) alert('Ошибка сохранения коллекций')
-      setNewName('')
-      onSaved()
-    } catch {
-      alert('Ошибка сети при сохранении коллекций')
-    } finally {
-      setSaving(false)
-    }
-  }
-  return (
-    <div className="d-flex flex-wrap align-items-center gap-2">
-      <input className="form-control" placeholder="Новая коллекция" value={newName} onChange={e => setNewName(e.target.value)} style={{ maxWidth: 320 }} />
-      <button className="btn btn-outline-primary" onClick={save} disabled={saving}>{saving ? 'Сохранение…' : 'Сохранить'}</button>
     </div>
   )
 }
