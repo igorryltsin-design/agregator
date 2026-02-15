@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
+import { EmptyState } from '../ui/EmptyState'
 
 type LlmEndpoint = {
   id: number
@@ -174,7 +175,7 @@ export default function AdminLlmPage() {
   }
 
   return (
-    <div className="d-grid gap-3">
+    <div className="d-grid gap-3 admin-page-glass">
       <div className="card p-3">
         <div className="fw-semibold mb-2">Добавить новый эндпоинт</div>
         <form className="row g-3" onSubmit={submit}>
@@ -307,7 +308,11 @@ export default function AdminLlmPage() {
                 )
               })}
               {list.length === 0 && (
-                <tr><td colSpan={7} className="text-center text-muted py-3">Список пуст</td></tr>
+                <tr>
+                  <td colSpan={7}>
+                    <EmptyState title="Список эндпоинтов пуст" description="Добавьте первый LLM-эндпоинт для работы AI-сценариев." />
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>

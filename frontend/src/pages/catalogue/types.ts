@@ -9,6 +9,12 @@ export type FileItem = {
   rel_path: string | null
   keywords?: string | null
   text_excerpt?: string | null
+  metadata_quality?: {
+    score: number
+    bucket: 'low' | 'medium' | 'high'
+    filled: number
+    total: number
+  }
   tags: Tag[]
 }
 
@@ -53,6 +59,28 @@ export type RagContextEntry = {
   content?: string
   url?: string | null
   extra?: Record<string, unknown>
+}
+
+export type RagContextChunk = {
+  chunk_id: number
+  section_path?: string | null
+  preview?: string
+  content?: string
+  score_dense?: number
+  score_sparse?: number
+  combined_score?: number
+  reasoning_hint?: string
+  translation_hint?: string
+  extra?: Record<string, unknown>
+}
+
+export type RagContextGroup = {
+  doc_id: number
+  title?: string | null
+  url?: string | null
+  language?: string
+  combined_score?: number
+  chunks: RagContextChunk[]
 }
 
 export type RagSourceEntry = {

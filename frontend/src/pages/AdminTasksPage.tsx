@@ -46,13 +46,20 @@ export default function AdminTasksPage() {
   const [expandedTaskId, setExpandedTaskId] = useState<number | null>(null)
   const [deletingTaskId, setDeletingTaskId] = useState<number | null>(null)
   const [clearingCompleted, setClearingCompleted] = useState(false)
+  const [statusFilter, setStatusFilter] = useState('active')
+  const [nameFilter, setNameFilter] = useState('')
+  const [nameDraft, setNameDraft] = useState('')
   const isAdmin = user?.role === 'admin'
 
   const load = useCallback(async () => {
     if (!isAdmin) return
     setLoading(true)
     try {
-      const r = await fetch('/api/admin/tasks')
+      const params = new URLSearchParams()
+      if (statusFilter) params.set('status', statusFilter)
+      if (nameFilter) params.set('name', nameFilter)
+      const query = params.toString()
+      const r = await fetch(`/api/admin/tasks${query ? `?${query}` : ''}`)
       const data = await r.json().catch(() => ({}))
       if (r.ok && data?.ok) {
         const list: Task[] = Array.isArray(data.tasks)
@@ -71,7 +78,7 @@ export default function AdminTasksPage() {
     } finally {
       setLoading(false)
     }
-  }, [isAdmin, toasts])
+  }, [isAdmin, toasts, statusFilter, nameFilter])
 
   useEffect(() => { load() }, [load])
 
@@ -182,7 +189,7 @@ export default function AdminTasksPage() {
   }
 
   return (
-    <div className="d-grid gap-3">
+    <div className="d-grid gap-3 admin-page-glass">
       <div className="card p-3" aria-busy={loading}>
         <div className="d-flex justify-content-between align-items-center mb-3">
           <div className="fw-semibold fs-5">Очередь задач</div>
@@ -195,6 +202,59 @@ export default function AdminTasksPage() {
               {clearingCompleted ? 'Очистка…' : 'Очистить завершённые'}
             </button>
             <button className="btn btn-outline-secondary btn-sm" onClick={load} disabled={loading}>{loading ? 'Обновление…' : 'Обновить'}</button>
+          </div>
+        </div>
+        <div className="row g-3 mb-3">
+          <div className="col-12 col-md-4">
+            <label className="form-label small mb-1">Статус</label>
+            <select
+              className="form-select form-select-sm"
+              value={statusFilter}
+              onChange={event => setStatusFilter(event.target.value)}
+            >
+              <option value="active">Активные</option>
+              <option value="queued">В очереди</option>
+              <option value="running">Выполняются</option>
+              <option value="completed">Завершённые</option>
+              <option value="error">С ошибкой</option>
+              <option value="all">Все</option>
+            </select>
+          </div>
+          <div className="col-12 col-md-4">
+            <label className="form-label small mb-1">Имя задачи</label>
+            <input
+              type="text"
+              className="form-control form-control-sm"
+              value={nameDraft}
+              onChange={event => setNameDraft(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  setNameFilter(nameDraft.trim())
+                }
+              }}
+              placeholder="import_file, scan, rag…"
+            />
+          </div>
+          <div className="col-12 col-md-4 d-flex align-items-end gap-2">
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              onClick={() => setNameFilter(nameDraft.trim())}
+            >
+              Применить
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              onClick={() => {
+                setStatusFilter('active')
+                setNameDraft('')
+                setNameFilter('')
+              }}
+            >
+              Сбросить
+            </button>
           </div>
         </div>
         <div className="table-responsive">

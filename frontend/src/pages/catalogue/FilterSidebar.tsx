@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react'
 import type { FacetData, FacetSuggestion } from './types'
 import { materialTypeRu, tagKeyRu } from '../../utils/locale'
 import LoadingState from '../../ui/LoadingState'
+import { EmptyState } from '../../ui/EmptyState'
 
 type FilterSidebarProps = {
   facets: FacetData | null
@@ -77,7 +78,7 @@ const FilterSidebar: React.FC<FilterSidebarProps> = ({
   }
 
   return (
-    <div className="card p-3" style={{ position: 'sticky', top: 8, maxHeight: 'calc(100vh - 120px)', overflow: 'auto' }} aria-busy={isLoading}>
+    <div className="card p-3 catalogue-filter-card" style={{ position: 'sticky', top: 8, maxHeight: 'calc(100vh - 120px)', overflow: 'auto' }} aria-busy={isLoading}>
       <div className="d-flex justify-content-between align-items-center mb-2">
         <div className="fw-semibold">Фильтры</div>
         <button className="btn btn-sm btn-outline-secondary" onClick={onReset} disabled={!canReset}>
@@ -86,7 +87,7 @@ const FilterSidebar: React.FC<FilterSidebarProps> = ({
       </div>
       {isLoading && <LoadingState variant="inline" lines={4} />}
       {!isLoading && !facets && (
-        <div className="text-secondary">Нет данных фасетов.</div>
+        <EmptyState title="Нет данных фасетов" description="Попробуйте изменить запрос или обновить страницу." />
       )}
       {facets && (
         <div className="d-flex flex-column gap-3">
@@ -204,7 +205,7 @@ const FilterSidebar: React.FC<FilterSidebarProps> = ({
               onChange={event => setTagSearch(event.target.value)}
             />
             {filteredFacets && Object.keys(filteredFacets).length === 0 && (
-              <div className="text-secondary" style={{ fontSize: '0.9rem' }}>Ничего не найдено.</div>
+              <EmptyState title="Ничего не найдено" description="Измените запрос по тегам или очистите фильтры." />
             )}
             {filteredFacets && Object.entries(filteredFacets).map(([key, values]) => {
               const expanded = expandedKeys[key]

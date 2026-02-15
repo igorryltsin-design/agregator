@@ -1,0 +1,1683 @@
+===== README.md =====
+# Контекстный аналитик СППР
+
+Модуль выполняет позднее объединение и контекстный анализ многомодальных данных. Он строит события, вычисляет связи, ведёт временную шкалу и собирает доказательные кейсы для принятия решений.
+
+## Основные функции
+- регистрация каналов поступления и приём наблюдений через REST/CLI;
+- векторизация аудио/текста/визуальных и радиолокационных данных, кластеризация и расчёт связей;
+- формирование упорядоченного списка событий с метриками когерентности, плотности и значимости;
+- поддержка временной шкалы и статистики;
+- автоматическое построение доказательной базы (evidence cases) с описанием гипотез.
+
+## Запуск
+```bash
+python -m program_modules.context_analytic_sppr.cli runserver --host 0.0.0.0 --port 8151
+```
+
+CLI-команды: `register-source`, `ingest`, `analyse`, `stats`, `runserver`.
+
+
+===== __init__.py =====
+"""Contextual analytics SPPR module."""
+
+from .bootstrap import build_context
+from .app import create_app
+
+__all__ = ["build_context", "create_app"]
+
+
+===== app.py =====
+"""Flask app entry point for Contextual Analytics SPPR."""
+
+from __future__ import annotations
+
+from flask import Flask
+
+from .api.routes import create_blueprint
+from .bootstrap import build_context
+
+
+def create_app() -> Flask:
+    ctx = build_context()
+    app = Flask(__name__)
+    app.config["CONTEXT_CONFIG"] = ctx.config
+    app.register_blueprint(create_blueprint(ctx.engine), url_prefix="/context")
+    return app
+
+
+if __name__ == "__main__":
+    app = create_app()
+    app.run(host="0.0.0.0", port=8151)
+
+
+===== bootstrap.py =====
+"""Bootstrap utilities for Contextual Analytics module."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .config import AppConfig, load_config
+from .database import Database
+from .engine import ContextEngine
+from .logging_setup import setup_logging
+
+
+@dataclass
+class ContextApp:
+    config: AppConfig
+    database: Database
+    engine: ContextEngine
+
+
+def build_context(base_dir=None) -> ContextApp:
+    setup_logging()
+    config = load_config(base_dir)
+    database = Database(config.database_url)
+    database.create_all()
+    engine = ContextEngine(config, database)
+    return ContextApp(config=config, database=database, engine=engine)
+
+
+===== cli.py =====
+"""CLI for Contextual Analytics SPPR."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime
+from pathlib import Path
+
+from .bootstrap import build_context
+
+
+def _print(data):
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def with_context(func):
+    def wrapper(args):
+        ctx = build_context(Path(args.base_dir) if getattr(args, "base_dir", None) else None)
+        try:
+            return func(ctx, args)
+        finally:
+            pass
+
+    return wrapper
+
+
+@with_context
+def cmd_register(ctx, args):
+    payload = {
+        "name": args.name,
+        "modality": args.modality,
+        "description": args.description,
+        "relevance_bias": args.relevance,
+        "latency_expectation": args.latency,
+    }
+    result = ctx.engine.register_source(payload)
+    _print(result.payload if result.ok else {"error": result.error})
+
+
+@with_context
+def cmd_ingest(ctx, args):
+    payload = {
+        "source": args.source,
+        "modality": args.modality,
+        "content_ref": args.content,
+        "annotation": args.annotation,
+        "recorded_at": (datetime.utcnow()).isoformat(),
+        "intensity": args.intensity,
+        "confidence": args.confidence,
+    }
+    result = ctx.engine.ingest_observation(payload)
+    _print(result.payload if result.ok else {"error": result.error})
+
+
+@with_context
+def cmd_analyse(ctx, args):
+    result = ctx.engine.analyse(limit=args.limit)
+    _print(result.payload if result.ok else {"error": result.error})
+
+
+@with_context
+def cmd_stats(ctx, args):
+    result = ctx.engine.stats()
+    _print(result.payload)
+
+
+@with_context
+def cmd_runserver(ctx, args):
+    from .app import create_app
+
+    app = create_app()
+    app.run(host=args.host, port=args.port)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Contextual Analytics CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    register = sub.add_parser("register-source", help="Register new source channel")
+    register.add_argument("--name", required=True)
+    register.add_argument("--modality", required=True)
+    register.add_argument("--description")
+    register.add_argument("--relevance", type=float, default=0.5)
+    register.add_argument("--latency", type=int, default=5)
+    register.add_argument("--base-dir")
+    register.set_defaults(func=cmd_register)
+
+    ingest = sub.add_parser("ingest", help="Push observation")
+    ingest.add_argument("--source", required=True)
+    ingest.add_argument("--modality", required=True)
+    ingest.add_argument("--content", required=True)
+    ingest.add_argument("--annotation")
+    ingest.add_argument("--intensity", type=float, default=0.6)
+    ingest.add_argument("--confidence", type=float, default=0.6)
+    ingest.add_argument("--base-dir")
+    ingest.set_defaults(func=cmd_ingest)
+
+    analyse = sub.add_parser("analyse", help="Run analytical window")
+    analyse.add_argument("--limit", type=int, default=64)
+    analyse.add_argument("--base-dir")
+    analyse.set_defaults(func=cmd_analyse)
+
+    stats = sub.add_parser("stats", help="Show operational stats")
+    stats.add_argument("--base-dir")
+    stats.set_defaults(func=cmd_stats)
+
+    runserver = sub.add_parser("runserver", help="Start HTTP server")
+    runserver.add_argument("--host", default="0.0.0.0")
+    runserver.add_argument("--port", type=int, default=8151)
+    runserver.set_defaults(func=cmd_runserver)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== config.py =====
+"""Configuration primitives for Contextual Analytics SPPR."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from datetime import timedelta
+from pathlib import Path
+from typing import Dict, Any
+
+
+def _env(key: str, default: str) -> str:
+    value = os.getenv(key)
+    return value if value is not None else default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = _env(key, str(default)).lower()
+    if raw in {"1", "true", "yes", "y"}:
+        return True
+    if raw in {"0", "false", "no", "n"}:
+        return False
+    return default
+
+
+@dataclass(slots=True)
+class VectorizerConfig:
+    default_dim: int = 48
+    audio_bias: float = 0.6
+    text_bias: float = 0.7
+    radar_bias: float = 0.8
+    visual_bias: float = 0.65
+
+
+@dataclass(slots=True)
+class ScoringConfig:
+    similarity_threshold: float = 0.45
+    prominence_decay: float = 0.92
+    hot_window_minutes: int = 15
+
+
+@dataclass(slots=True)
+class TimelineConfig:
+    max_events: int = 500
+    aggregation_window: timedelta = timedelta(minutes=10)
+
+
+@dataclass(slots=True)
+class EvidenceConfig:
+    narrative_max_len: int = 2048
+    confidence_floor: float = 0.4
+    refresh_interval: timedelta = timedelta(minutes=5)
+
+
+@dataclass(slots=True)
+class AppConfig:
+    base_dir: Path
+    data_dir: Path
+    database_url: str
+    profile: str
+    vectorizer: VectorizerConfig = field(default_factory=VectorizerConfig)
+    scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    timeline: TimelineConfig = field(default_factory=TimelineConfig)
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
+def load_config(base_dir: Path | None = None) -> AppConfig:
+    root = base_dir or Path(os.getenv("CONTEXT_ANALYTIC_HOME", Path.cwd()))
+    data_dir = root / "context_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "context_analytic.db"
+
+    vectorizer = VectorizerConfig(
+        default_dim=_env_int("CONTEXT_VEC_DIM", 48),
+        audio_bias=_env_float("CONTEXT_VEC_AUDIO", 0.6),
+        text_bias=_env_float("CONTEXT_VEC_TEXT", 0.7),
+        radar_bias=_env_float("CONTEXT_VEC_RADAR", 0.8),
+        visual_bias=_env_float("CONTEXT_VEC_VISUAL", 0.65),
+    )
+    scoring = ScoringConfig(
+        similarity_threshold=_env_float("CONTEXT_SIM_THRESHOLD", 0.45),
+        prominence_decay=_env_float("CONTEXT_PROMINENCE_DECAY", 0.92),
+        hot_window_minutes=_env_int("CONTEXT_HOT_WINDOW_MIN", 15),
+    )
+    timeline = TimelineConfig(
+        max_events=_env_int("CONTEXT_TIMELINE_MAX", 500),
+        aggregation_window=timedelta(
+            minutes=_env_int("CONTEXT_TIMELINE_WINDOW_MIN", 10)
+        ),
+    )
+    evidence = EvidenceConfig(
+        narrative_max_len=_env_int("CONTEXT_EVIDENCE_LEN", 2048),
+        confidence_floor=_env_float("CONTEXT_EVIDENCE_FLOOR", 0.4),
+        refresh_interval=timedelta(
+            minutes=_env_int("CONTEXT_EVIDENCE_REFRESH_MIN", 5)
+        ),
+    )
+    extras = {
+        "instance_id": _env("CONTEXT_INSTANCE_ID", "context-sppr-local"),
+        "environment": _env("CONTEXT_ENV", "development"),
+    }
+    return AppConfig(
+        base_dir=root,
+        data_dir=data_dir,
+        database_url=f"sqlite:///{db_path}",
+        profile=_env("CONTEXT_PROFILE", "default"),
+        vectorizer=vectorizer,
+        scoring=scoring,
+        timeline=timeline,
+        evidence=evidence,
+        extras=extras,
+    )
+
+
+===== database.py =====
+"""SQLAlchemy helpers for Contextual Analytics."""
+
+from __future__ import annotations
+
+import contextlib
+from typing import Iterator
+
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+
+class Base(DeclarativeBase):
+    """Declarative base class."""
+
+
+class Database:
+    def __init__(self, url: str, echo: bool = False) -> None:
+        self._engine: Engine = create_engine(url, echo=echo, future=True)
+        self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False)
+
+    def create_all(self) -> None:
+        from . import models  # noqa: F401
+
+        Base.metadata.create_all(self._engine)
+
+    @contextlib.contextmanager
+    def session(self) -> Iterator[Session]:
+        session = self._session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+
+===== engine.py =====
+"""High-level application service for Contextual Analytics."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List
+
+from .config import AppConfig
+from .database import Database
+from .repositories import EvidenceRepository, LogRepository, ObservationRepository
+from .services.analysis import AnalysisService
+from .services.evidence import EvidenceService
+from .services.ingestion import IngestionService
+from .services.timeline import TimelineService
+from .vectorizers import Vectorizer
+
+
+@dataclass
+class EngineResult:
+    ok: bool
+    payload: Dict[str, Any]
+    error: str | None = None
+
+
+class ContextEngine:
+    def __init__(self, config: AppConfig, database: Database):
+        self.config = config
+        self.database = database
+        self.vectorizer = Vectorizer(config.vectorizer)
+        self.ingestion = IngestionService(config, self.vectorizer)
+        self.analysis = AnalysisService(config, self.vectorizer)
+        self.timeline = TimelineService(config)
+        self.evidence = EvidenceService(config)
+
+    @contextmanager
+    def _session(self):
+        with self.database.session() as session:
+            yield session
+
+    def register_source(self, payload: dict) -> EngineResult:
+        required = {"name", "modality"}
+        missing = required - payload.keys()
+        if missing:
+            return EngineResult(False, {}, f"Отсутствуют поля: {', '.join(sorted(missing))}")
+        with self._session() as session:
+            result = self.ingestion.register_source(
+                session=session,
+                name=payload["name"],
+                modality=payload["modality"],
+                description=payload.get("description"),
+                relevance_bias=float(payload.get("relevance_bias", 0.5)),
+                latency_expectation=int(payload.get("latency_expectation", 5)),
+            )
+            return EngineResult(True, result)
+
+    def ingest_observation(self, payload: dict) -> EngineResult:
+        required = {"source", "modality", "content_ref"}
+        missing = required - payload.keys()
+        if missing:
+            return EngineResult(False, {}, f"Отсутствуют поля: {', '.join(sorted(missing))}")
+        recorded = payload.get("recorded_at")
+        recorded_at = datetime.fromisoformat(recorded) if recorded else datetime.utcnow()
+        with self._session() as session:
+            result = self.ingestion.ingest_observation(
+                session=session,
+                source_name=payload["source"],
+                modality=payload["modality"],
+                content_ref=payload["content_ref"],
+                recorded_at=recorded_at,
+                annotation=payload.get("annotation"),
+                attributes=payload.get("attributes", {}),
+                intensity=float(payload.get("intensity", 0.5)),
+                confidence=float(payload.get("confidence", 0.5)),
+            )
+            return EngineResult(True, result)
+
+    def analyse(self, limit: int = 64) -> EngineResult:
+        with self._session() as session:
+            summaries = self.analysis.run_window(session, limit=limit)
+            markers = self.timeline.refresh(session)
+            cases = self.evidence.refresh_cases(session)
+            return EngineResult(
+                True,
+                {
+                    "events": [summary.__dict__ for summary in summaries],
+                    "timeline": markers,
+                    "evidence": cases,
+                },
+            )
+
+    def stats(self) -> EngineResult:
+        with self._session() as session:
+            log_repo = LogRepository(session)
+            observation_repo = ObservationRepository(session)
+            pending = observation_repo.fetch_unprocessed(limit=10)
+            logs = log_repo.latest(limit=10)
+            evidence_repo = EvidenceRepository(session)
+            cases = evidence_repo.latest_cases(limit=5)
+            return EngineResult(
+                True,
+                {
+                    "pending_observations": [
+                        {
+                            "id": obs.id,
+                            "source": obs.source.name if obs.source else None,
+                            "modality": obs.modality,
+                            "recorded_at": obs.recorded_at.isoformat(),
+                        }
+                        for obs in pending
+                    ],
+                    "logs": [
+                        {
+                            "component": record.component,
+                            "level": record.level,
+                            "message": record.message,
+                            "created_at": record.created_at.isoformat(),
+                        }
+                        for record in logs
+                    ],
+                    "evidence": [
+                        {
+                            "case_id": case.id,
+                            "title": case.title,
+                            "confidence": case.confidence,
+                        }
+                        for case in cases
+                    ],
+                },
+            )
+
+
+===== logging_setup.py =====
+"""Logging utilities for Contextual Analytics SPPR."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Dict
+
+
+@dataclass(slots=True)
+class LoggingConfig:
+    level: int = logging.INFO
+    fmt: str = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+
+def setup_logging(config: LoggingConfig | None = None) -> Dict[str, logging.Logger]:
+    cfg = config or LoggingConfig()
+    logging.basicConfig(level=cfg.level, format=cfg.fmt)
+    return {
+        "context": logging.getLogger("context"),
+        "vectorizer": logging.getLogger("context.vectorizer"),
+        "scoring": logging.getLogger("context.scoring"),
+        "timeline": logging.getLogger("context.timeline"),
+        "evidence": logging.getLogger("context.evidence"),
+        "api": logging.getLogger("context.api"),
+    }
+
+
+===== models.py =====
+"""ORM models for Contextual Analytics SPPR."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .database import Base
+
+Modality = Enum(
+    "audio",
+    "text",
+    "image",
+    "radar",
+    "video",
+    "composite",
+    name="context_modality",
+)
+
+
+class SourceChannel(Base):
+    __tablename__ = "source_channels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
+    modality: Mapped[str] = mapped_column(Modality, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    relevance_bias: Mapped[float] = mapped_column(Float, default=0.5)
+    latency_expectation: Mapped[int] = mapped_column(Integer, default=5)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    observations: Mapped[List["Observation"]] = relationship(
+        "Observation", back_populates="source"
+    )
+
+
+class Observation(Base):
+    __tablename__ = "observations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("source_channels.id"))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    modality: Mapped[str] = mapped_column(Modality, nullable=False)
+    content_ref: Mapped[str] = mapped_column(String(512), nullable=False)
+    annotation: Mapped[Optional[str]] = mapped_column(Text)
+    attributes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    intensity: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    processed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    source: Mapped["SourceChannel"] = relationship("SourceChannel", back_populates="observations")
+    vectors: Mapped[List["FeatureVector"]] = relationship(
+        "FeatureVector", back_populates="observation", cascade="all, delete-orphan"
+    )
+    events: Mapped[List["ContextEvent"]] = relationship(
+        "ContextEventLink", back_populates="observation", cascade="all, delete-orphan"
+    )
+
+
+class FeatureVector(Base):
+    __tablename__ = "feature_vectors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    observation_id: Mapped[int] = mapped_column(ForeignKey("observations.id"))
+    vector_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    values: Mapped[List[float]] = mapped_column(JSON, nullable=False)
+    norm: Mapped[float] = mapped_column(Float, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    observation: Mapped["Observation"] = relationship("Observation", back_populates="vectors")
+
+
+class ContextEvent(Base):
+    __tablename__ = "context_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    synopsis: Mapped[str] = mapped_column(Text, nullable=False)
+    start_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    coherence: Mapped[float] = mapped_column(Float, default=0.0)
+    density: Mapped[float] = mapped_column(Float, default=0.0)
+    prominence: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    links: Mapped[List["ContextEventLink"]] = relationship(
+        "ContextEventLink",
+        back_populates="event",
+        cascade="all, delete-orphan",
+    )
+    relations_from: Mapped[List["ContextRelation"]] = relationship(
+        "ContextRelation",
+        foreign_keys="ContextRelation.from_event_id",
+        back_populates="from_event",
+    )
+    relations_to: Mapped[List["ContextRelation"]] = relationship(
+        "ContextRelation",
+        foreign_keys="ContextRelation.to_event_id",
+        back_populates="to_event",
+    )
+
+
+class ContextEventLink(Base):
+    __tablename__ = "context_event_links"
+    __table_args__ = (
+        UniqueConstraint("event_id", "observation_id", name="uix_event_observation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("context_events.id"))
+    observation_id: Mapped[int] = mapped_column(ForeignKey("observations.id"))
+    weight: Mapped[float] = mapped_column(Float, default=0.0)
+
+    event: Mapped["ContextEvent"] = relationship("ContextEvent", back_populates="links")
+    observation: Mapped["Observation"] = relationship("Observation", back_populates="events")
+
+
+class ContextRelation(Base):
+    __tablename__ = "context_relations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    from_event_id: Mapped[int] = mapped_column(ForeignKey("context_events.id"))
+    to_event_id: Mapped[int] = mapped_column(ForeignKey("context_events.id"))
+    relation_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    similarity: Mapped[float] = mapped_column(Float, default=0.0)
+    causality_score: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    from_event: Mapped["ContextEvent"] = relationship(
+        "ContextEvent", foreign_keys=[from_event_id], back_populates="relations_from"
+    )
+    to_event: Mapped["ContextEvent"] = relationship(
+        "ContextEvent", foreign_keys=[to_event_id], back_populates="relations_to"
+    )
+
+
+class EntityProfile(Base):
+    __tablename__ = "entity_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    canonical_name: Mapped[str] = mapped_column(String(256), nullable=False, unique=True)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    latest_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    prominence: Mapped[float] = mapped_column(Float, default=0.0)
+    stability: Mapped[float] = mapped_column(Float, default=0.0)
+    extra: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class EntityObservation(Base):
+    __tablename__ = "entity_observations"
+    __table_args__ = (
+        UniqueConstraint("entity_id", "observation_id", name="uix_entity_observation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entity_profiles.id"))
+    observation_id: Mapped[int] = mapped_column(ForeignKey("observations.id"))
+    salience: Mapped[float] = mapped_column(Float, default=0.0)
+
+    entity: Mapped["EntityProfile"] = relationship("EntityProfile")
+    observation: Mapped["Observation"] = relationship("Observation")
+
+
+class EvidenceCase(Base):
+    __tablename__ = "evidence_cases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    hypothesis: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    status: Mapped[str] = mapped_column(String(32), default="draft")
+
+    artifacts: Mapped[List["EvidenceArtifact"]] = relationship(
+        "EvidenceArtifact",
+        back_populates="case",
+        cascade="all, delete-orphan",
+    )
+
+
+class EvidenceArtifact(Base):
+    __tablename__ = "evidence_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("evidence_cases.id"))
+    event_id: Mapped[int] = mapped_column(ForeignKey("context_events.id"))
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    strength: Mapped[float] = mapped_column(Float, default=0.0)
+
+    case: Mapped["EvidenceCase"] = relationship("EvidenceCase", back_populates="artifacts")
+    event: Mapped["ContextEvent"] = relationship("ContextEvent")
+
+
+class TimelineMarker(Base):
+    __tablename__ = "timeline_markers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    date: Mapped[Date] = mapped_column(Date, nullable=False, unique=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    event_ids: Mapped[List[int]] = mapped_column(JSON, default=list)
+
+
+class MetricSnapshot(Base):
+    __tablename__ = "metric_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class ProcessingLog(Base):
+    __tablename__ = "processing_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    component: Mapped[str] = mapped_column(String(64), nullable=False)
+    level: Mapped[str] = mapped_column(String(16), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    extra: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+===== repositories.py =====
+"""Repository helpers for Contextual Analytics SPPR."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Dict, Iterable, List, Sequence
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from . import models
+
+
+class BaseRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+
+class SourceRepository(BaseRepository):
+    def get_or_create(
+        self,
+        name: str,
+        modality: str,
+        description: str | None,
+        relevance_bias: float,
+        latency_expectation: int,
+    ) -> models.SourceChannel:
+        entity = self.session.scalar(
+            select(models.SourceChannel).where(models.SourceChannel.name == name)
+        )
+        if entity:
+            return entity
+        entity = models.SourceChannel(
+            name=name,
+            modality=modality,
+            description=description,
+            relevance_bias=relevance_bias,
+            latency_expectation=latency_expectation,
+        )
+        self.session.add(entity)
+        self.session.flush()
+        return entity
+
+
+class ObservationRepository(BaseRepository):
+    def add(
+        self,
+        source_id: int,
+        recorded_at: datetime,
+        modality: str,
+        content_ref: str,
+        annotation: str | None,
+        attributes: Dict,
+        intensity: float,
+        confidence: float,
+    ) -> models.Observation:
+        entity = models.Observation(
+            source_id=source_id,
+            recorded_at=recorded_at,
+            modality=modality,
+            content_ref=content_ref,
+            annotation=annotation,
+            attributes=attributes,
+            intensity=intensity,
+            confidence=confidence,
+        )
+        self.session.add(entity)
+        self.session.flush()
+        return entity
+
+    def fetch_unprocessed(self, limit: int = 64) -> List[models.Observation]:
+        stmt = (
+            select(models.Observation)
+            .where(models.Observation.processed.is_(False))
+            .order_by(models.Observation.recorded_at.asc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+    def mark_processed(self, observation_ids: Sequence[int]) -> None:
+        if not observation_ids:
+            return
+        self.session.query(models.Observation).filter(
+            models.Observation.id.in_(observation_ids)
+        ).update({"processed": True}, synchronize_session=False)
+
+
+class VectorRepository(BaseRepository):
+    def attach(self, observation_id: int, vector_type: str, values: List[float], norm: float) -> None:
+        vector = models.FeatureVector(
+            observation_id=observation_id,
+            vector_type=vector_type,
+            values=values,
+            norm=norm,
+        )
+        self.session.add(vector)
+
+    def collect(self, observation_ids: Sequence[int]) -> List[models.FeatureVector]:
+        if not observation_ids:
+            return []
+        stmt = select(models.FeatureVector).where(
+            models.FeatureVector.observation_id.in_(observation_ids)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class EventRepository(BaseRepository):
+    def create_event(
+        self,
+        title: str,
+        synopsis: str,
+        start_at: datetime,
+        end_at: datetime,
+        coherence: float,
+        density: float,
+        prominence: float,
+    ) -> models.ContextEvent:
+        event = models.ContextEvent(
+            title=title,
+            synopsis=synopsis,
+            start_at=start_at,
+            end_at=end_at,
+            coherence=coherence,
+            density=density,
+            prominence=prominence,
+        )
+        self.session.add(event)
+        self.session.flush()
+        return event
+
+    def attach_observations(
+        self, event_id: int, observation_ids: Sequence[int], weights: Sequence[float]
+    ) -> None:
+        for observation_id, weight in zip(observation_ids, weights, strict=False):
+            link = models.ContextEventLink(
+                event_id=event_id,
+                observation_id=observation_id,
+                weight=weight,
+            )
+            self.session.add(link)
+
+    def latest(self, limit: int = 50) -> List[models.ContextEvent]:
+        stmt = (
+            select(models.ContextEvent)
+            .order_by(models.ContextEvent.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class RelationRepository(BaseRepository):
+    def upsert(
+        self,
+        from_event: int,
+        to_event: int,
+        relation_type: str,
+        similarity: float,
+        causality_score: float,
+    ) -> models.ContextRelation:
+        stmt = select(models.ContextRelation).where(
+            models.ContextRelation.from_event_id == from_event,
+            models.ContextRelation.to_event_id == to_event,
+            models.ContextRelation.relation_type == relation_type,
+        )
+        edge = self.session.scalar(stmt)
+        if edge:
+            edge.similarity = similarity
+            edge.causality_score = causality_score
+        else:
+            edge = models.ContextRelation(
+                from_event_id=from_event,
+                to_event_id=to_event,
+                relation_type=relation_type,
+                similarity=similarity,
+                causality_score=causality_score,
+            )
+            self.session.add(edge)
+        self.session.flush()
+        return edge
+
+    def neighborhood(self, event_id: int, limit: int = 20) -> List[models.ContextRelation]:
+        stmt = (
+            select(models.ContextRelation)
+            .where(
+                (models.ContextRelation.from_event_id == event_id)
+                | (models.ContextRelation.to_event_id == event_id)
+            )
+            .order_by(models.ContextRelation.similarity.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class EntityRepository(BaseRepository):
+    def get_or_create(self, canonical_name: str, category: str) -> models.EntityProfile:
+        stmt = select(models.EntityProfile).where(
+            models.EntityProfile.canonical_name == canonical_name
+        )
+        entity = self.session.scalar(stmt)
+        if entity:
+            entity.latest_seen = datetime.utcnow()
+            return entity
+        entity = models.EntityProfile(
+            canonical_name=canonical_name,
+            category=category,
+            first_seen=datetime.utcnow(),
+            latest_seen=datetime.utcnow(),
+        )
+        self.session.add(entity)
+        self.session.flush()
+        return entity
+
+    def attach(self, entity_id: int, observation_id: int, salience: float) -> None:
+        link = models.EntityObservation(
+            entity_id=entity_id,
+            observation_id=observation_id,
+            salience=salience,
+        )
+        self.session.add(link)
+
+    def top_entities(self, limit: int = 20) -> List[models.EntityProfile]:
+        stmt = (
+            select(models.EntityProfile)
+            .order_by(models.EntityProfile.prominence.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class EvidenceRepository(BaseRepository):
+    def create_case(self, title: str, hypothesis: str, confidence: float) -> models.EvidenceCase:
+        case = models.EvidenceCase(
+            title=title,
+            hypothesis=hypothesis,
+            confidence=confidence,
+            updated_at=datetime.utcnow(),
+        )
+        self.session.add(case)
+        self.session.flush()
+        return case
+
+    def add_artifact(
+        self,
+        case_id: int,
+        event_id: int,
+        description: str,
+        strength: float,
+    ) -> None:
+        artifact = models.EvidenceArtifact(
+            case_id=case_id,
+            event_id=event_id,
+            description=description,
+            strength=strength,
+        )
+        self.session.add(artifact)
+
+    def latest_cases(self, limit: int = 10) -> List[models.EvidenceCase]:
+        stmt = (
+            select(models.EvidenceCase)
+            .order_by(models.EvidenceCase.updated_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class TimelineRepository(BaseRepository):
+    def upsert_marker(self, date: datetime, summary: str, event_ids: List[int]) -> models.TimelineMarker:
+        stmt = select(models.TimelineMarker).where(models.TimelineMarker.date == date.date())
+        marker = self.session.scalar(stmt)
+        if marker:
+            marker.summary = summary
+            marker.event_ids = event_ids
+        else:
+            marker = models.TimelineMarker(
+                date=date.date(),
+                summary=summary,
+                event_ids=event_ids,
+            )
+            self.session.add(marker)
+        self.session.flush()
+        return marker
+
+    def list_markers(self, limit: int = 30) -> List[models.TimelineMarker]:
+        stmt = (
+            select(models.TimelineMarker)
+            .order_by(models.TimelineMarker.date.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class MetricRepository(BaseRepository):
+    def store(self, name: str, window_start: datetime, window_end: datetime, payload: Dict) -> None:
+        snapshot = models.MetricSnapshot(
+            metric_name=name,
+            window_start=window_start,
+            window_end=window_end,
+            payload=payload,
+        )
+        self.session.add(snapshot)
+
+    def recent(self, name: str, limit: int = 5) -> List[models.MetricSnapshot]:
+        stmt = (
+            select(models.MetricSnapshot)
+            .where(models.MetricSnapshot.metric_name == name)
+            .order_by(models.MetricSnapshot.window_end.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class LogRepository(BaseRepository):
+    def add(self, component: str, level: str, message: str, extra: Dict | None = None) -> None:
+        record = models.ProcessingLog(
+            component=component,
+            level=level,
+            message=message,
+            extra=extra,
+        )
+        self.session.add(record)
+
+    def latest(self, limit: int = 50) -> List[models.ProcessingLog]:
+        stmt = (
+            select(models.ProcessingLog)
+            .order_by(models.ProcessingLog.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+===== scoring.py =====
+"""Scoring helpers for contextual prominence and evidence building."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Iterable, List, Sequence
+
+from .config import ScoringConfig
+from .vectorizers import cosine
+
+
+@dataclass(slots=True)
+class SimilarityResult:
+    score: float
+    threshold: float
+    accepted: bool
+
+
+def similarity(a: Sequence[float], b: Sequence[float], config: ScoringConfig) -> SimilarityResult:
+    score = cosine(list(a), list(b))
+    accepted = score >= config.similarity_threshold
+    return SimilarityResult(score=score, threshold=config.similarity_threshold, accepted=accepted)
+
+
+def moving_prominence(values: Iterable[float], decay: float) -> float:
+    accumulator = 0.0
+    for value in values:
+        accumulator = accumulator * decay + value
+    return accumulator
+
+
+def temporal_weight(recorded_at: datetime, config: ScoringConfig) -> float:
+    delta = datetime.utcnow() - recorded_at
+    minutes = max(delta.total_seconds() / 60, 0.1)
+    hot_window = config.hot_window_minutes
+    if minutes <= hot_window:
+        return 1.0
+    return math.exp(-minutes / (hot_window * 4))
+
+
+def blend(*values: float) -> float:
+    filled = [value for value in values if value is not None]
+    return sum(filled) / len(filled) if filled else 0.0
+
+
+===== vectorizers.py =====
+"""Simple deterministic vectorizers for multimodal content."""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import random
+from dataclasses import dataclass
+from typing import Iterable, List
+
+from .config import VectorizerConfig
+
+
+def _seed(text: str) -> int:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+@dataclass
+class Vectorizer:
+    config: VectorizerConfig
+
+    def _rand(self, key: str):
+        seed = _seed(key)
+        rng = random.Random(seed)
+        return rng
+
+    def _create_vector(self, key: str, dim: int | None = None) -> List[float]:
+        size = dim or self.config.default_dim
+        rng = self._rand(key)
+        return [round(rng.uniform(-1.0, 1.0), 6) for _ in range(size)]
+
+    def encode_text(self, text: str) -> List[float]:
+        return self._create_vector(f"text::{text}")
+
+    def encode_audio(self, fingerprint: str) -> List[float]:
+        return [
+            round(math.sin(idx + _seed(fingerprint)) * self.config.audio_bias, 6)
+            for idx in range(self.config.default_dim)
+        ]
+
+    def encode_visual(self, payload: str) -> List[float]:
+        rng = self._rand(f"visual::{payload}")
+        return [round(rng.gauss(0, self.config.visual_bias), 6) for _ in range(self.config.default_dim)]
+
+    def encode_radar(self, payload: str) -> List[float]:
+        base = _seed(payload) % 997
+        return [
+            round(math.cos(base + idx) * self.config.radar_bias, 6)
+            for idx in range(self.config.default_dim)
+        ]
+
+
+def l2(values: Iterable[float]) -> float:
+    return math.sqrt(sum(value * value for value in values))
+
+
+def cosine(a: List[float], b: List[float]) -> float:
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
+    norm_a = l2(a)
+    norm_b = l2(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+===== api/routes.py =====
+"""Flask blueprint for Contextual Analytics module."""
+
+from __future__ import annotations
+
+from flask import Blueprint, jsonify, request
+
+from ..engine import ContextEngine
+from . import schemas
+
+
+def create_blueprint(engine: ContextEngine) -> Blueprint:
+    bp = Blueprint("context_api", __name__)
+
+    @bp.route("/health", methods=["GET"])
+    def health():
+        return jsonify(schemas.success({"status": "ok"}).to_dict())
+
+    @bp.route("/sources", methods=["POST"])
+    def register_source():
+        payload = request.get_json(force=True, silent=True) or {}
+        result = engine.register_source(payload)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 400)
+
+    @bp.route("/observations", methods=["POST"])
+    def ingest_observation():
+        payload = request.get_json(force=True, silent=True) or {}
+        result = engine.ingest_observation(payload)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 400)
+
+    @bp.route("/analyse", methods=["POST"])
+    def analyse():
+        limit = int(request.args.get("limit", 64))
+        result = engine.analyse(limit=limit)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 500)
+
+    @bp.route("/stats", methods=["GET"])
+    def stats():
+        result = engine.stats()
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    return bp
+
+
+===== api/schemas.py =====
+"""Response envelopes for Contextual Analytics API."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict
+
+
+def iso(dt: datetime | None = None) -> str:
+    dt = dt or datetime.utcnow()
+    return dt.replace(microsecond=0).isoformat() + "Z"
+
+
+@dataclass
+class Envelope:
+    ok: bool
+    payload: Dict[str, Any]
+    error: str | None = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "payload": self.payload,
+            "error": self.error,
+            "timestamp": iso(),
+        }
+
+
+def success(payload: Dict[str, Any]) -> Envelope:
+    return Envelope(ok=True, payload=payload)
+
+
+def failure(message: str) -> Envelope:
+    return Envelope(ok=False, payload={}, error=message)
+
+
+===== services/analysis.py =====
+"""Core analytical routines: grouping observations, scoring events, updating relations."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Iterable, List, Sequence
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import (
+    EntityRepository,
+    EventRepository,
+    LogRepository,
+    ObservationRepository,
+    RelationRepository,
+    VectorRepository,
+)
+from ..scoring import blend, moving_prominence, similarity, temporal_weight
+from ..vectorizers import Vectorizer
+
+
+@dataclass
+class EventSummary:
+    event_id: int
+    observation_ids: List[int]
+    prominence: float
+    coherence: float
+    density: float
+
+
+class AnalysisService:
+    def __init__(self, config: AppConfig, vectorizer: Vectorizer):
+        self.config = config
+        self.vectorizer = vectorizer
+
+    def run_window(self, session: Session, limit: int = 64) -> List[EventSummary]:
+        observation_repo = ObservationRepository(session)
+        vector_repo = VectorRepository(session)
+        event_repo = EventRepository(session)
+        relation_repo = RelationRepository(session)
+        entity_repo = EntityRepository(session)
+        log_repo = LogRepository(session)
+
+        observations = observation_repo.fetch_unprocessed(limit=limit)
+        if not observations:
+            return []
+        vectors = vector_repo.collect([item.id for item in observations])
+        vector_map = {vector.observation_id: vector for vector in vectors}
+
+        batches = self._group_by_modality(observations)
+        summaries: List[EventSummary] = []
+        for modality, items in batches.items():
+            if not items:
+                continue
+            clusters = self._cluster(items, vector_map)
+            for cluster in clusters:
+                summary = self._build_event(event_repo, cluster, vector_map)
+                observation_repo.mark_processed([obs.id for obs in cluster])
+                self._update_entities(entity_repo, cluster)
+                self._update_relations(relation_repo, summary.event_id)
+                summaries.append(summary)
+        log_repo.add(
+            component="analysis",
+            level="info",
+            message="Processed observations",
+            extra={"count": len(observations)},
+        )
+        return summaries
+
+    def _group_by_modality(self, observations) -> Dict[str, List]:
+        buckets: Dict[str, List] = {}
+        for item in observations:
+            buckets.setdefault(item.modality, []).append(item)
+        return buckets
+
+    def _cluster(self, observations, vector_map) -> List[List]:
+        clusters: List[List] = []
+        for observation in observations:
+            vector = vector_map.get(observation.id)
+            if not vector:
+                continue
+            assigned = False
+            for cluster in clusters:
+                reference = vector_map[cluster[0].id]
+                sim = similarity(vector.values, reference.values, self.config.scoring)
+                if sim.accepted:
+                    cluster.append(observation)
+                    assigned = True
+                    break
+            if not assigned:
+                clusters.append([observation])
+        return clusters
+
+    def _build_event(
+        self,
+        repo: EventRepository,
+        cluster: Sequence,
+        vector_map,
+    ) -> EventSummary:
+        title = f"Событие ({cluster[0].modality})"
+        synopsis = " ".join((obs.annotation or obs.content_ref)[:120] for obs in cluster[:5])
+        start_at = min(obs.recorded_at for obs in cluster)
+        end_at = max(obs.recorded_at for obs in cluster)
+        coherence, density, prominence = self._metrics(cluster, vector_map)
+        event = repo.create_event(title, synopsis[:512], start_at, end_at, coherence, density, prominence)
+        weights = self._weights(cluster, vector_map)
+        repo.attach_observations(event.id, [obs.id for obs in cluster], weights)
+        return EventSummary(
+            event_id=event.id,
+            observation_ids=[obs.id for obs in cluster],
+            prominence=prominence,
+            coherence=coherence,
+            density=density,
+        )
+
+    def _metrics(self, observations, vector_map):
+        vectors = [vector_map[obs.id].values for obs in observations if obs.id in vector_map]
+        coherence = 0.0
+        if len(vectors) > 1:
+            sims = []
+            base = vectors[0]
+            for vector in vectors[1:]:
+                sims.append(similarity(base, vector, self.config.scoring).score)
+            coherence = sum(sims) / len(sims)
+        density = len(observations) / max(
+            (max(obs.recorded_at for obs in observations) - min(obs.recorded_at for obs in observations)).total_seconds(),
+            1.0,
+        )
+        prominence = moving_prominence(
+            [
+                blend(obs.intensity, obs.confidence, temporal_weight(obs.recorded_at, self.config.scoring))
+                for obs in observations
+            ],
+            self.config.scoring.prominence_decay,
+        )
+        return coherence, density, prominence
+
+    def _weights(self, observations, vector_map):
+        raw = [
+            blend(obs.intensity, vector_map[obs.id].norm if obs.id in vector_map else 1.0)
+            for obs in observations
+        ]
+        total = sum(raw) or 1.0
+        return [value / total for value in raw]
+
+    def _update_entities(self, repo: EntityRepository, cluster: Sequence) -> None:
+        for observation in cluster:
+            entity = repo.get_or_create(canonical_name=f"entity-{observation.id}", category="generic")
+            repo.attach(entity.id, observation.id, salience=0.5)
+
+    def _update_relations(self, repo: RelationRepository, event_id: int) -> None:
+        neighborhood = repo.neighborhood(event_id, limit=3)
+        for relation in neighborhood:
+            repo.upsert(
+                from_event=event_id,
+                to_event=relation.to_event_id,
+                relation_type="follow_up",
+                similarity=min(1.0, relation.similarity + 0.05),
+                causality_score=min(1.0, relation.causality_score + 0.02),
+            )
+
+
+===== services/evidence.py =====
+"""Evidence synthesis for decision support."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import List
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import EvidenceRepository, EventRepository
+
+
+class EvidenceService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def refresh_cases(self, session: Session) -> List[dict]:
+        event_repo = EventRepository(session)
+        evidence_repo = EvidenceRepository(session)
+
+        events = event_repo.latest(limit=10)
+        if not events:
+            return []
+        cases: List[dict] = []
+        for event in events:
+            hypothesis = f"Влияние события «{event.title}» на текущий контур решений."
+            confidence = min(1.0, event.coherence * 0.4 + event.prominence * 0.6)
+            if confidence < self.config.evidence.confidence_floor:
+                continue
+            case = evidence_repo.create_case(event.title, hypothesis, confidence)
+            narrative = self._narrative(event)
+            evidence_repo.add_artifact(
+                case_id=case.id,
+                event_id=event.id,
+                description=narrative,
+                strength=confidence,
+            )
+            cases.append(
+                {
+                    "case_id": case.id,
+                    "event_id": event.id,
+                    "confidence": confidence,
+                    "narrative": narrative,
+                }
+            )
+        return cases
+
+    def _narrative(self, event) -> str:
+        base = [
+            f"Сигналы между {event.start_at:%H:%M} и {event.end_at:%H:%M} сформировали кластер.",
+            f"Плотность наблюдений: {event.density:.2f}.",
+            f"Когерентность: {event.coherence:.2f}, значимость: {event.prominence:.2f}.",
+        ]
+        text = " ".join(base)
+        return text[: self.config.evidence.narrative_max_len]
+
+
+===== services/ingestion.py =====
+"""Ingestion layer for Contextual Analytics."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Dict
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import ObservationRepository, SourceRepository, VectorRepository
+from ..vectorizers import Vectorizer
+
+
+class IngestionService:
+    def __init__(self, config: AppConfig, vectorizer: Vectorizer):
+        self.config = config
+        self.vectorizer = vectorizer
+
+    def register_source(
+        self,
+        session: Session,
+        name: str,
+        modality: str,
+        description: str | None,
+        relevance_bias: float,
+        latency_expectation: int,
+    ) -> dict:
+        repo = SourceRepository(session)
+        source = repo.get_or_create(
+            name=name,
+            modality=modality,
+            description=description,
+            relevance_bias=relevance_bias,
+            latency_expectation=latency_expectation,
+        )
+        return {"id": source.id, "name": source.name, "modality": source.modality}
+
+    def ingest_observation(
+        self,
+        session: Session,
+        source_name: str,
+        modality: str,
+        content_ref: str,
+        recorded_at: datetime,
+        annotation: str | None,
+        attributes: Dict,
+        intensity: float,
+        confidence: float,
+    ) -> dict:
+        source_repo = SourceRepository(session)
+        observation_repo = ObservationRepository(session)
+        vector_repo = VectorRepository(session)
+
+        source = source_repo.get_or_create(
+            name=source_name,
+            modality=modality,
+            description=None,
+            relevance_bias=0.5,
+            latency_expectation=5,
+        )
+
+        observation = observation_repo.add(
+            source_id=source.id,
+            recorded_at=recorded_at,
+            modality=modality,
+            content_ref=content_ref,
+            annotation=annotation,
+            attributes=attributes,
+            intensity=intensity,
+            confidence=confidence,
+        )
+
+        vector = self._vectorize(modality, annotation or content_ref)
+        vector_repo.attach(
+            observation_id=observation.id,
+            vector_type=f"default:{modality}",
+            values=vector,
+            norm=max(1e-6, sum(value * value for value in vector) ** 0.5),
+        )
+
+        return {"id": observation.id, "source": source.name}
+
+    def _vectorize(self, modality: str, payload: str):
+        if modality == "text":
+            return self.vectorizer.encode_text(payload)
+        if modality == "audio":
+            return self.vectorizer.encode_audio(payload)
+        if modality == "radar":
+            return self.vectorizer.encode_radar(payload)
+        if modality in {"image", "video"}:
+            return self.vectorizer.encode_visual(payload)
+        return self.vectorizer.encode_text(payload)
+
+
+===== services/timeline.py =====
+"""Timeline aggregation logic."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import List
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import EventRepository, TimelineRepository
+
+
+class TimelineService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def refresh(self, session: Session) -> List[dict]:
+        event_repo = EventRepository(session)
+        timeline_repo = TimelineRepository(session)
+        events = event_repo.latest(limit=self.config.timeline.max_events)
+        markers: List[dict] = []
+        if not events:
+            return markers
+        window = self.config.timeline.aggregation_window
+        bucket = []
+        bucket_start = events[0].start_at
+        for event in events:
+            if (bucket_start - event.start_at) > window:
+                markers.append(self._flush_bucket(timeline_repo, bucket))
+                bucket = []
+                bucket_start = event.start_at
+            bucket.append(event)
+        if bucket:
+            markers.append(self._flush_bucket(timeline_repo, bucket))
+        return markers
+
+    def _flush_bucket(self, repo: TimelineRepository, bucket):
+        bucket = sorted(bucket, key=lambda event: event.start_at)
+        summary = "; ".join(event.title for event in bucket[:3])
+        marker = repo.upsert_marker(bucket[-1].start_at, summary, [event.id for event in bucket])
+        return {
+            "date": marker.date.isoformat(),
+            "summary": marker.summary,
+            "event_ids": marker.event_ids,
+        }
+

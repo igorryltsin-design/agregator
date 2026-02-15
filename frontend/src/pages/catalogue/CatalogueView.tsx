@@ -7,6 +7,8 @@ import FileCard from './FileCard'
 import PreviewModal from './PreviewModal'
 import FilterSidebar from './FilterSidebar'
 import type { FacetSuggestion, FileItem } from './types'
+import LoadingState from '../../ui/LoadingState'
+import { EmptySearch } from '../../ui/EmptyState'
 
 export default function CatalogueView() {
   const navigate = useNavigate()
@@ -14,13 +16,13 @@ export default function CatalogueView() {
   const { searchParams, selectors, list, ai, pagination, modals, helpers, facets, facetsLoading, collections } = catalogue
   const materialTypeOptions = useMaterialTypeOptions()
 
-  const { sp, setSp, dq, type, collectionId, year_from, year_to } = searchParams
+  const { sp, setSp, q, dq, type, metadataQuality, collectionId, year_from, year_to } = searchParams
   const { selectedTags, setSelectedTags, removeTag } = selectors
   const { items, total, loading, sentinelRef } = list
   const { aiMode, resetAiState } = ai
   const { page, pages, canLoadMore } = pagination
   const { previewRel, setPreviewRel, editItem, setEditItem, editForm, setEditForm, saveEdit, openEdit } = modals
-  const { updateTagsInline, refreshFile, renameFile, deleteFile } = helpers
+  const { updateTagsInline, refreshFile, renameFile, deleteFile, sendSearchFeedback } = helpers
 
   const handleCollectionChange = (value: string) => {
     const next = new URLSearchParams(sp)
@@ -33,7 +35,7 @@ export default function CatalogueView() {
     setSp(next)
   }
 
-  const hasFacetFilters = Boolean(type) || selectedTags.length > 0 || Boolean(year_from || year_to)
+  const hasFacetFilters = Boolean(type) || selectedTags.length > 0 || Boolean(year_from || year_to) || metadataQuality === 'low'
 
   const handleResetFacets = () => {
     if (!hasFacetFilters) return
@@ -42,6 +44,7 @@ export default function CatalogueView() {
     next.delete('tag')
     next.delete('year_from')
     next.delete('year_to')
+    next.delete('metadata_quality')
     next.set('page', '1')
     setSelectedTags([])
     setSp(next)
@@ -107,10 +110,11 @@ export default function CatalogueView() {
   }
 
   const handleStartChat = React.useCallback((file: FileItem) => {
+    sendSearchFeedback?.(file, 'relevant')
     const params = new URLSearchParams()
     params.set('file', String(file.id))
     navigate(`/doc-chat?${params.toString()}`)
-  }, [navigate])
+  }, [navigate, sendSearchFeedback])
 
   const yearFilterLabel = React.useMemo(() => {
     if (year_from && year_to && year_from === year_to) return `Год: ${year_from}`
@@ -122,7 +126,7 @@ export default function CatalogueView() {
 
   return (
     <>
-      <div className="row g-3">
+      <div className="row g-3 catalogue-glass">
         <div className="col-12 col-lg-3">
           <FilterSidebar
             facets={facets}
@@ -140,8 +144,8 @@ export default function CatalogueView() {
           />
         </div>
         <div className="col-12 col-lg-9" aria-busy={loading}>
-          <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
-            <div className="form-floating" style={{ minWidth: 220 }}>
+          <div className="d-flex flex-wrap gap-2 align-items-center mb-2 catalogue-toolbar">
+            <div className="form-floating catalogue-toolbar__collection" style={{ minWidth: 220 }}>
               <select className="form-select" id="collectionSelect" value={collectionId} onChange={event => handleCollectionChange(event.target.value)}>
                 <option value="">Все доступные</option>
                 {collections.map(col => (
@@ -150,11 +154,24 @@ export default function CatalogueView() {
               </select>
               <label htmlFor="collectionSelect">Коллекция</label>
             </div>
+            <button
+              className={`btn btn-sm ${metadataQuality === 'low' ? 'btn-warning' : 'btn-outline-secondary'}`}
+              onClick={() => {
+                const next = new URLSearchParams(sp)
+                if (metadataQuality === 'low') next.delete('metadata_quality')
+                else next.set('metadata_quality', 'low')
+                next.set('page', '1')
+                setSp(next)
+              }}
+              title="Показывать документы с низким качеством метаданных"
+            >
+              {metadataQuality === 'low' ? 'Низкое качество: включено' : 'Фильтр: низкое качество'}
+            </button>
           </div>
 
           <AiPanel ai={ai} />
 
-          <div className="floating-search mb-2 d-flex align-items-center justify-content-between" role="toolbar" aria-label="Выбранные фильтры">
+          <div className="floating-search catalogue-floating-search mb-2 d-flex align-items-center justify-content-between" role="toolbar" aria-label="Выбранные фильтры">
             <div className="d-flex flex-wrap align-items-center" style={{ gap: 8 }}>
               {selectedTags.map((tag, index) => {
                 const [rawKey, ...rest] = tag.split('=')
@@ -198,17 +215,9 @@ export default function CatalogueView() {
             <button className="btn btn-sm btn-outline-secondary ms-2" onClick={handleResetAll}>Сбросить</button>
           </div>
 
-          {loading && !aiMode && (
-            <div className="masonry">
-              {Array.from({ length: 9 }).map((_, idx) => (
-                <div key={idx} className="masonry-item">
-                  <div className="skeleton" style={{ height: 120 }} />
-                </div>
-              ))}
-            </div>
-          )}
+          {loading && !aiMode && <LoadingState title="Загружаю результаты" description="Подбираем релевантные документы" lines={9} />}
 
-          <div className="masonry">
+          <div className="masonry catalogue-masonry">
             {items.map(file => (
               <FileCard
                 key={file.id}
@@ -221,9 +230,11 @@ export default function CatalogueView() {
                 onDelete={deleteFile}
                 onTagSubmit={updateTagsInline}
                 onStartChat={handleStartChat}
+                onSearchFeedback={sendSearchFeedback}
               />
             ))}
           </div>
+          {!loading && !aiMode && items.length === 0 && <EmptySearch query={dq || q} />}
 
           {!aiMode && canLoadMore && (
             <div ref={sentinelRef as any} className="mt-3 text-center muted">Подгружаю ещё…</div>

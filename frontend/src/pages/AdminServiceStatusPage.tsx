@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
+import { taskStatusRu } from '../utils/locale'
 
 type ServiceInfo = {
   enabled?: boolean
@@ -43,6 +44,135 @@ type FeedbackSchedulerStatus = {
   next_run_in_seconds?: number | null
   updated?: boolean
   manual_task?: { task_id: number; queued: boolean } | null
+}
+
+type OsintSourceProgress = {
+  status?: string
+  label?: string
+  type?: string
+  updated_at?: string | null
+  created_at?: string | null
+  error?: string | null
+  fallback?: boolean
+  fallback_url?: string | null
+  final_url?: string | null
+  links_collected?: number | null
+  results_on_page?: number | null
+  results_parsed?: number | null
+  pages_estimated?: number | null
+  pages_processed?: number | null
+  retry_available?: boolean
+}
+
+type OsintScheduleInfo = {
+  id?: number | null
+  label?: string | null
+  active?: boolean
+  running?: boolean
+  interval_minutes?: number | null
+  next_run_at?: string | null
+  last_run_at?: string | null
+  notify?: boolean
+  notify_channel?: string | null
+}
+
+type OsintJobSummary = {
+  id?: number | null
+  query?: string | null
+  status?: string | null
+  error?: string | null
+  created_at?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  sources_total?: number | null
+  sources_completed?: number | null
+  percent_complete?: number | null
+  progress?: Record<string, OsintSourceProgress>
+  schedule?: OsintScheduleInfo | null
+}
+
+type OsintStatus = {
+  queue?: {
+    name?: string | null
+    workers?: number | null
+    max_workers?: number | null
+    queued?: number | null
+    started?: boolean
+    shutdown?: boolean
+  } | null
+  active?: OsintJobSummary[]
+  recent?: OsintJobSummary[]
+}
+
+type RagJobSummary = {
+  id?: number | null
+  status?: string | null
+  progress?: number | null
+  created_at?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+  error?: string | null
+  collection_id?: number | null
+  collection_name?: string | null
+  total_files?: number | null
+}
+
+type LlmSummary = {
+  cache?: CacheInfo | null
+  endpoints?: {
+    total?: number | null
+    per_provider?: Record<string, number>
+  } | null
+  latency_ms?: {
+    total_avg_ms?: number | null
+    answer_avg_ms?: number | null
+    snippet_avg_ms?: number | null
+  } | null
+}
+
+type UserLoginSummary = {
+  user_id?: number | null
+  username?: string | null
+  full_name?: string | null
+  at?: string | null
+}
+
+type UserActivitySummary = {
+  total?: number | null
+  active_24h?: number | null
+  recent?: UserLoginSummary[]
+}
+
+type IntegrationBrowser = {
+  headless?: boolean
+  proxy?: string | null
+  viewport?: number[]
+  context_timeout_ms?: number | null
+  navigation_timeout_ms?: number | null
+}
+
+type IntegrationHttp = {
+  timeout?: number | null
+  connect_timeout?: number | null
+  retries?: number | null
+  backoff_factor?: number | null
+}
+
+type IntegrationOsint = {
+  cache_enabled?: boolean
+  cache_ttl_seconds?: number | null
+  retry_user_agents?: number | null
+  retry_proxies?: number | null
+  wait_after_load_ms?: number | null
+  navigation_timeout_ms?: number | null
+  user_agent_override?: string | null
+  queue?: Record<string, any> | null
+}
+
+type IntegrationsSummary = {
+  browser?: IntegrationBrowser | null
+  http?: IntegrationHttp | null
+  osint?: IntegrationOsint | null
 }
 
 type StatusPayload = {
@@ -173,7 +303,12 @@ type StatusPayload = {
   rag?: {
     ready?: number | null
     pending?: number | null
+    jobs?: RagJobSummary[]
   }
+  osint?: OsintStatus | null
+  llm?: LlmSummary | null
+  users?: UserActivitySummary | null
+  integrations?: IntegrationsSummary | null
 }
 
 const statusBadge: Record<string, string> = {
@@ -188,6 +323,28 @@ const serviceBadge: Record<string, string> = {
   idle: 'bg-secondary',
   warning: 'bg-warning text-dark',
 }
+
+const osintStatusBadge: Record<string, string> = {
+  running: 'bg-primary',
+  queued: 'bg-secondary',
+  pending: 'bg-secondary',
+  completed: 'bg-success',
+  error: 'bg-danger',
+  blocked: 'bg-warning text-dark',
+  cancelled: 'bg-warning text-dark',
+}
+
+const osintStatusLabel: Record<string, string> = {
+  running: 'Выполняется',
+  queued: 'В очереди',
+  pending: 'Подготовка',
+  completed: 'Готово',
+  error: 'Ошибка',
+  blocked: 'Блокировано',
+  cancelled: 'Отменено',
+}
+
+const osintFinalStatuses = new Set(['completed', 'error', 'blocked', 'cancelled'])
 
 const formatDateTime = (value?: string | null): string => {
   if (!value) return '—'
@@ -247,6 +404,51 @@ const formatTimeAgo = (value?: string | null): string => {
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)} мин назад`
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} ч назад`
   return `${Math.floor(diffSec / 86400)} дн назад`
+}
+
+const formatOsintStatus = (value?: string | null): string => {
+  if (!value) return '—'
+  const key = value.toLowerCase()
+  return osintStatusLabel[key] || value
+}
+
+const formatTaskStatus = (value?: string | null): string => {
+  if (!value) return '—'
+  return taskStatusRu(value)
+}
+
+const getOsintJobCounters = (job?: OsintJobSummary | null): { completed: number; total: number } => {
+  const progressEntries = Object.values(job?.progress || {})
+  const totalRaw = job?.sources_total ?? progressEntries.length
+  const total = Number.isFinite(totalRaw as number) ? Number(totalRaw) || 0 : progressEntries.length
+  const completedRaw = job?.sources_completed
+  let completed = 0
+  if (typeof completedRaw === 'number' && Number.isFinite(completedRaw)) {
+    completed = completedRaw
+  } else {
+    completed = progressEntries.filter(entry => osintFinalStatuses.has(String(entry?.status || '').toLowerCase())).length
+  }
+  return { completed, total: total || progressEntries.length }
+}
+
+const getOsintJobPercent = (job?: OsintJobSummary | null): number => {
+  if (!job) return 0
+  if (typeof job.percent_complete === 'number' && Number.isFinite(job.percent_complete)) {
+    return Math.min(100, Math.max(0, job.percent_complete))
+  }
+  const { completed, total } = getOsintJobCounters(job)
+  if (!total) return 0
+  return Math.min(100, Math.max(0, (completed / total) * 100))
+}
+
+const getOsintBadgeClass = (status?: string | null): string => {
+  if (!status) return 'bg-secondary'
+  return osintStatusBadge[status.toLowerCase()] || 'bg-secondary'
+}
+
+const formatViewport = (value?: number[] | null): string => {
+  if (!value || value.length < 2) return '—'
+  return `${value[0]}×${value[1]}`
 }
 
 export default function AdminServiceStatusPage() {
@@ -416,9 +618,24 @@ export default function AdminServiceStatusPage() {
   const warnings = data?.warnings || []
   const errors = data?.errors || {}
   const errorEntries = Object.entries(errors)
+  const osintInfo = data?.osint
+  const osintQueue = osintInfo?.queue
+  const osintActive = (osintInfo?.active ?? []).filter(
+    (job): job is OsintJobSummary => Boolean(job && typeof job === 'object')
+  )
+  const osintRecent = (osintInfo?.recent ?? []).filter(
+    (job): job is OsintJobSummary => Boolean(job && typeof job === 'object')
+  )
+  const osintRecentLimited = osintRecent.slice(0, 5)
+  const ragJobs = (data?.rag?.jobs ?? []).filter(
+    (job): job is RagJobSummary => Boolean(job && typeof job === 'object')
+  )
+  const llmSummary = data?.llm
+  const userActivity = data?.users
+  const integrations = data?.integrations
 
   return (
-    <div className="d-grid gap-3" aria-busy={loading}>
+    <div className="d-grid gap-3 admin-page-glass" aria-busy={loading}>
       <div className="card p-3" aria-busy={loading}>
         <div className="d-flex flex-column flex-lg-row justify-content-between gap-3">
           <div>
@@ -437,6 +654,9 @@ export default function AdminServiceStatusPage() {
             <div className="text-body-secondary small mt-1">
               Последнее обновление: {formatDateTime(data?.generated_at || data?.app?.created_at)}
               {data?.app?.uptime_human ? ` · Аптайм: ${data.app.uptime_human}` : ''}
+            </div>
+            <div className="text-body-secondary small">
+              Версия: 2.12.3 · 10.02.2026
             </div>
             {data?.app?.environment && (
               <div className="text-body-secondary small">
@@ -952,6 +1172,323 @@ export default function AdminServiceStatusPage() {
                       {formatDateTime(data.tasks.oldest_active.created_at)}
                     </div>
                   )}
+                </div>
+                <div className="mt-3 border-top pt-3">
+                  <div className="d-flex justify-content-between align-items-center mb-2">
+                    <h3 className="h6 mb-0">OSINT поиск</h3>
+                    {osintQueue && (
+                      <span className="text-body-secondary small">
+                        Потоков: {formatNumber(osintQueue.workers)} / {formatNumber(osintQueue.max_workers)} · В очереди:{' '}
+                        {formatNumber(osintQueue.queued)}
+                      </span>
+                    )}
+                  </div>
+                  {osintActive.length === 0 && (
+                    <div className="text-body-secondary small">Активных OSINT-задач нет</div>
+                  )}
+                  <div className="d-grid gap-2">
+                    {osintActive.map((job, idx) => {
+                      const key = job.id ?? `${job.query || 'job'}-${idx}`
+                      const { completed, total } = getOsintJobCounters(job)
+                      const percent = getOsintJobPercent(job)
+                      const sources = Object.entries(job.progress || {})
+                      return (
+                        <div key={key} className="border rounded-3 p-3">
+                          <div className="d-flex justify-content-between align-items-start gap-2">
+                            <div className="flex-grow-1">
+                              <div className="fw-semibold text-truncate" title={job.query || undefined}>
+                                {job.query || `OSINT #${job.id ?? idx + 1}`}
+                              </div>
+                              <div className="text-body-secondary small">
+                                ID: {formatNumber(job.id)} · Источники: {formatNumber(completed)} / {formatNumber(total)}
+                              </div>
+                            </div>
+                            <span className={`badge ${getOsintBadgeClass(job.status)}`}>{formatOsintStatus(job.status)}</span>
+                          </div>
+                          <div className="progress mt-2" style={{ height: '6px' }}>
+                            <div
+                              className="progress-bar"
+                              role="progressbar"
+                              style={{ width: `${percent}%` }}
+                              aria-valuenow={percent}
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                            />
+                          </div>
+                          <div className="text-body-secondary small mt-2">
+                            Создана {formatDateTime(job.created_at)}
+                            {job.started_at ? ` · Старт: ${formatDateTime(job.started_at)}` : ''}
+                            {job.schedule?.next_run_at ? ` · След. запуск: ${formatDateTime(job.schedule.next_run_at)}` : ''}
+                          </div>
+                          <div className="d-grid gap-1 mt-2">
+                            {sources.map(([sourceId, info]) => (
+                              <div key={sourceId} className="d-flex justify-content-between align-items-start gap-2">
+                                <div className="flex-grow-1">
+                                  <div className="fw-semibold small text-truncate" title={info?.label || sourceId}>
+                                    {info?.label || sourceId}
+                                  </div>
+                                  <div className="text-body-secondary small">
+                                    {info?.updated_at ? `Обновлено ${formatTimeAgo(info.updated_at)}` : 'Ожидает обработки'}
+                                    {typeof info?.links_collected === 'number'
+                                      ? ` · Ссылок: ${formatNumber(info.links_collected)}`
+                                      : ''}
+                                    {info?.fallback ? ' · Fallback' : ''}
+                                  </div>
+                                  {info?.error && <div className="text-danger small">Ошибка: {info.error}</div>}
+                                </div>
+                                <span className={`badge ${getOsintBadgeClass(info?.status)}`}>
+                                  {formatOsintStatus(info?.status)}
+                                </span>
+                              </div>
+                            ))}
+                            {sources.length === 0 && (
+                              <div className="text-body-secondary small">Нет данных об источниках</div>
+                            )}
+                          </div>
+                          {job.error && (
+                            <div className="alert alert-danger mt-2 mb-0 py-1 px-2 small">Ошибка: {job.error}</div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div className="mt-3">
+                    <div className="fw-semibold small mb-2">Недавние задачи</div>
+                    <div className="table-responsive">
+                      <table className="table table-sm align-middle mb-0">
+                        <thead>
+                          <tr>
+                            <th>ID</th>
+                            <th>Запрос</th>
+                            <th>Статус</th>
+                            <th>Источники</th>
+                            <th>Прогресс</th>
+                            <th>Создана</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {osintRecentLimited.map((job, idx) => {
+                            const rowKey = job.id ?? `${job.query || 'recent'}-${idx}`
+                            const { completed, total } = getOsintJobCounters(job)
+                            const percent = getOsintJobPercent(job)
+                            return (
+                              <tr key={rowKey}>
+                                <td>{formatNumber(job.id)}</td>
+                                <td className="text-truncate" title={job.query || undefined}>{job.query || '—'}</td>
+                                <td>
+                                  <span className={`badge ${getOsintBadgeClass(job.status)}`}>
+                                    {formatOsintStatus(job.status)}
+                                  </span>
+                                </td>
+                                <td>
+                                  {formatNumber(completed)} / {formatNumber(total)}
+                                </td>
+                                <td>{formatPercent(percent)}</td>
+                                <td>{formatDateTime(job.created_at)}</td>
+                              </tr>
+                            )
+                          })}
+                          {osintRecentLimited.length === 0 && (
+                            <tr>
+                              <td colSpan={6} className="text-center text-body-secondary small">Нет записей OSINT</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="row g-3">
+            <div className="col-12 col-xl-6">
+              <div className="card h-100 p-3">
+                <h2 className="h5 mb-3">RAG индексатор</h2>
+                <div className="d-flex flex-wrap gap-3">
+                  <div className="border rounded-3 p-3 text-center flex-grow-1">
+                    <div className="text-body-secondary small text-uppercase mb-1">Готово</div>
+                    <div className="fw-semibold fs-5">{formatNumber(data?.rag?.ready)}</div>
+                  </div>
+                  <div className="border rounded-3 p-3 text-center flex-grow-1">
+                    <div className="text-body-secondary small text-uppercase mb-1">В очереди</div>
+                    <div className="fw-semibold fs-5">{formatNumber(data?.rag?.pending)}</div>
+                  </div>
+                </div>
+                <div className="mt-3 border-top pt-3">
+                  <div className="fw-semibold mb-2">Активные задачи</div>
+                  {ragJobs.length === 0 && (
+                    <div className="text-body-secondary small">Нет запущенных задач построения RAG</div>
+                  )}
+                  <div className="d-grid gap-2">
+                    {ragJobs.map(job => {
+                      const percent = Math.round(Math.max(0, Math.min(100, (job.progress ?? 0) * 100)))
+                      const badge = statusBadge[(job.status || '').toLowerCase()] || 'bg-secondary'
+                      return (
+                        <div key={job.id ?? `${job.collection_id}-${job.created_at}`} className="border rounded-3 p-3">
+                          <div className="d-flex justify-content-between align-items-start gap-2">
+                            <div>
+                              <div className="fw-semibold">
+                                {job.collection_name || `Коллекция #${formatNumber(job.collection_id)}`}
+                              </div>
+                              <div className="text-body-secondary small">
+                                Задача #{formatNumber(job.id)} · Файлов: {formatNumber(job.total_files)}
+                              </div>
+                            </div>
+                            <span className={`badge ${badge}`}>{formatTaskStatus(job.status)}</span>
+                          </div>
+                          <div className="progress mt-2" style={{ height: '6px' }}>
+                            <div
+                              className="progress-bar"
+                              role="progressbar"
+                              style={{ width: `${percent}%` }}
+                              aria-valuenow={percent}
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                            />
+                          </div>
+                          <div className="text-body-secondary small mt-2">
+                            {job.started_at ? `Старт: ${formatDateTime(job.started_at)}` : `Создана: ${formatDateTime(job.created_at)}`}
+                          </div>
+                          {job.error && <div className="text-danger small mt-1">Ошибка: {job.error}</div>}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="col-12 col-xl-6">
+              <div className="card h-100 p-3">
+                <h2 className="h5 mb-3">LLM</h2>
+                <div className="row g-2">
+                  <div className="col-6">
+                    <div className="border rounded-3 p-3 text-center">
+                      <div className="text-body-secondary small text-uppercase mb-1">Кэш</div>
+                      <div className="fw-semibold">
+                        {formatNumber(llmSummary?.cache?.items)} / {formatNumber(llmSummary?.cache?.max_items)}
+                      </div>
+                      <div className="text-body-secondary small">TTL: {formatSeconds(llmSummary?.cache?.ttl_seconds)}</div>
+                    </div>
+                  </div>
+                  <div className="col-6">
+                    <div className="border rounded-3 p-3 text-center">
+                      <div className="text-body-secondary small text-uppercase mb-1">Эндпоинтов</div>
+                      <div className="fw-semibold">{formatNumber(llmSummary?.endpoints?.total)}</div>
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <div className="fw-semibold mb-2">Провайдеры</div>
+                  <div className="d-flex flex-wrap gap-2">
+                    {Object.entries(llmSummary?.endpoints?.per_provider || {}).map(([provider, count]) => (
+                      <span key={provider} className="badge bg-secondary">
+                        {provider}: {formatNumber(count)}
+                      </span>
+                    ))}
+                    {Object.keys(llmSummary?.endpoints?.per_provider || {}).length === 0 && (
+                      <span className="text-body-secondary small">Нет данных по провайдерам</span>
+                    )}
+                  </div>
+                </div>
+                <div className="mt-3 border-top pt-3">
+                  <div className="fw-semibold mb-2">Задержки</div>
+                  <dl className="row mb-0 small">
+                    <dt className="col-sm-6">Полный цикл</dt>
+                    <dd className="col-sm-6">{formatMs(llmSummary?.latency_ms?.total_avg_ms)}</dd>
+                    <dt className="col-sm-6">Ответ LLM</dt>
+                    <dd className="col-sm-6">{formatMs(llmSummary?.latency_ms?.answer_avg_ms)}</dd>
+                    <dt className="col-sm-6">LLM сниппеты</dt>
+                    <dd className="col-sm-6">{formatMs(llmSummary?.latency_ms?.snippet_avg_ms)}</dd>
+                  </dl>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="row g-3">
+            <div className="col-12 col-lg-6">
+              <div className="card h-100 p-3">
+                <h2 className="h5 mb-3">Активность пользователей</h2>
+                <div className="d-flex flex-wrap gap-3">
+                  <div className="border rounded-3 p-3 text-center flex-grow-1">
+                    <div className="text-body-secondary small text-uppercase mb-1">Всего</div>
+                    <div className="fw-semibold fs-5">{formatNumber(userActivity?.total)}</div>
+                  </div>
+                  <div className="border rounded-3 p-3 text-center flex-grow-1">
+                    <div className="text-body-secondary small text-uppercase mb-1">За 24 часа</div>
+                    <div className="fw-semibold fs-5">{formatNumber(userActivity?.active_24h)}</div>
+                  </div>
+                </div>
+                <div className="mt-3 border-top pt-3">
+                  <div className="fw-semibold mb-2">Недавние входы</div>
+                  <div className="table-responsive">
+                    <table className="table table-sm align-middle mb-0">
+                      <thead>
+                        <tr>
+                          <th>Пользователь</th>
+                          <th>Время</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(userActivity?.recent || []).map(entry => (
+                          <tr key={`${entry.user_id}-${entry.at}`}>
+                            <td>
+                              <div className="fw-semibold">{entry.username || 'Неизвестно'}</div>
+                              <div className="text-body-secondary small">{entry.full_name || '—'}</div>
+                            </td>
+                            <td>{formatDateTime(entry.at)}</td>
+                          </tr>
+                        ))}
+                        {(userActivity?.recent || []).length === 0 && (
+                          <tr>
+                            <td colSpan={2} className="text-center text-body-secondary small">Нет данных о входах</td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="col-12 col-lg-6">
+              <div className="card h-100 p-3">
+                <h2 className="h5 mb-3">Интеграции</h2>
+                <div className="d-grid gap-2">
+                  <div className="border rounded-3 p-3">
+                    <div className="fw-semibold mb-1">Браузер</div>
+                    <div className="text-body-secondary small">
+                      Headless: {formatBool(integrations?.browser?.headless, { truthy: 'Да', falsy: 'Нет' })} · Прокси:{' '}
+                      {integrations?.browser?.proxy || '—'}
+                      <br />
+                      Окно: {formatViewport(integrations?.browser?.viewport)} · Навигация:{' '}
+                      {formatMs(integrations?.browser?.navigation_timeout_ms)}
+                    </div>
+                  </div>
+                  <div className="border rounded-3 p-3">
+                    <div className="fw-semibold mb-1">HTTP клиент</div>
+                    <div className="text-body-secondary small">
+                      Таймаут: {formatSeconds(integrations?.http?.timeout)} · Подкл.:{' '}
+                      {formatSeconds(integrations?.http?.connect_timeout)} · Повторы:{' '}
+                      {formatNumber(integrations?.http?.retries)}
+                      <br />
+                      Backoff: {integrations?.http?.backoff_factor ?? '—'}
+                    </div>
+                  </div>
+                  <div className="border rounded-3 p-3">
+                    <div className="fw-semibold mb-1">OSINT</div>
+                    <div className="text-body-secondary small">
+                      Кэш: {formatBool(integrations?.osint?.cache_enabled, { truthy: 'Вкл', falsy: 'Выкл' })} · TTL:{' '}
+                      {formatSeconds(integrations?.osint?.cache_ttl_seconds)}
+                      <br />
+                      Ротация UA: {formatNumber(integrations?.osint?.retry_user_agents)} · Прокси:{' '}
+                      {formatNumber(integrations?.osint?.retry_proxies)}
+                      <br />
+                      Навигация: {formatMs(integrations?.osint?.navigation_timeout_ms)} · Очередь:{' '}
+                      {formatNumber(integrations?.osint?.queue?.queued)}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

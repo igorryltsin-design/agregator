@@ -34,6 +34,32 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
+# Pre-download faster-whisper models (small, base) into image
+RUN python - <<'PY'
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+base_dir = Path("/app")
+cache_dir = base_dir / "models" / "faster-whisper"
+cache_dir.mkdir(parents=True, exist_ok=True)
+
+repos = [
+    "Systran/faster-whisper-small",
+    "Systran/faster-whisper-base",
+]
+
+for repo in repos:
+    target_dir = cache_dir / repo.replace("/", "__")
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo,
+        local_dir=str(target_dir),
+        local_dir_use_symlinks=False,
+        revision=None,
+    )
+PY
+
 # Copy application sources
 COPY . ./
 

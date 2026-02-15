@@ -71,19 +71,25 @@ class SearchCache:
 _default_cache = SearchCache()
 
 
+def _scoped_key(key: str, scope: str | None = None) -> str:
+    if not scope:
+        return f"global::{key}"
+    return f"{scope}::{key}"
+
+
 def configure_search_cache(*, enabled: bool, max_items: int, ttl_seconds: int) -> None:
     _default_cache.configure(enabled=enabled, max_items=max_items, ttl_seconds=ttl_seconds)
 
 
-def search_cache_get(key: str) -> Optional[Any]:
-    entry = _default_cache.get(key)
+def search_cache_get(key: str, *, scope: str | None = None) -> Optional[Any]:
+    entry = _default_cache.get(_scoped_key(key, scope))
     if entry is None:
         return None
     return entry.payload
 
 
-def search_cache_set(key: str, payload: Any) -> None:
-    _default_cache.set(key, payload)
+def search_cache_set(key: str, payload: Any, *, scope: str | None = None) -> None:
+    _default_cache.set(_scoped_key(key, scope), payload)
 
 
 def search_cache_clear() -> None:

@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
 import DOMPurify from 'dompurify'
 import { materialTypeRu, materialTypeSlug } from '../../utils/locale'
 import { useToasts } from '../../ui/Toasts'
-import type { CollectionOption, FacetData, FileItem, ProgressItem, RagContextEntry, RagRisk, RagSourceEntry, RagValidationResult, Tag } from './types'
+import type { CollectionOption, FacetData, FileItem, ProgressItem, RagContextEntry, RagContextGroup, RagRisk, RagSourceEntry, RagValidationResult, Tag } from './types'
+import { useSearchState } from './useSearchState'
 
 const AI_ANSWER_ALLOWED_TAGS = ['a', 'b', 'strong', 'em', 'i', 'code', 'pre', 'p', 'br', 'ul', 'ol', 'li', 'span', 'div']
 const AI_ANSWER_ALLOWED_ATTRS = ['href', 'title', 'target', 'rel', 'class']
@@ -27,30 +27,16 @@ const configureDomPurify = () => {
   dompurifyConfigured = true
 }
 
-function useDebounced<T>(value: T, delay = 400) {
-  const [state, setState] = useState(value)
-  useEffect(() => {
-    const id = setTimeout(() => setState(value), delay)
-    return () => clearTimeout(id)
-  }, [value, delay])
-  return state
-}
-
 export function useCatalogueState() {
-  const [sp, setSp] = useSearchParams()
-  const q = sp.get('q') || ''
-  const type = sp.get('type') || ''
-  const year_from = sp.get('year_from') || ''
-  const year_to = sp.get('year_to') || ''
-  const size_min = sp.get('size_min') || ''
-  const size_max = sp.get('size_max') || ''
-  const collectionId = sp.get('collection_id') || ''
-  const page = Math.max(parseInt(sp.get('page') || '1'), 1)
-  const commit = sp.get('commit') || ''
-  const perPage = 50
-  const offset = (page - 1) * perPage
-
-  const dq = useDebounced(q, 350)
+  const {
+    searchParams,
+    page,
+    perPage,
+    offset,
+    localPage,
+    setLocalPage,
+  } = useSearchState()
+  const { sp, setSp, q, type, year_from, year_to, size_min, size_max, metadataQuality, collectionId, dq, params, commit } = searchParams
   const [aiMode, setAiMode] = useState(false)
   const [items, setItems] = useState<FileItem[]>([])
   const [total, setTotal] = useState(0)
@@ -89,6 +75,7 @@ export function useCatalogueState() {
   const [feedbackStatus, setFeedbackStatus] = useState<Record<string, string>>({})
   const [ragContext, setRagContext] = useState<RagContextEntry[]>([])
   const [ragValidation, setRagValidation] = useState<RagValidationResult | null>(null)
+  const [ragContextGroups, setRagContextGroups] = useState<RagContextGroup[]>([])
   const [ragWarnings, setRagWarnings] = useState<string[]>([])
   const [ragNotes, setRagNotes] = useState<string[]>([])
   const [ragFallback, setRagFallback] = useState<boolean>(false)
@@ -96,6 +83,10 @@ export function useCatalogueState() {
   const [ragRisk, setRagRisk] = useState<RagRisk | null>(null)
   const [ragSources, setRagSources] = useState<RagSourceEntry[]>([])
   const [ragRetry, setRagRetry] = useState<boolean>(false)
+  const resetRagContextState = useCallback(() => {
+    setRagContext([])
+    setRagContextGroups([])
+  }, [])
   const [ragHintVisible, setRagHintVisible] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true
     try {
@@ -117,10 +108,20 @@ export function useCatalogueState() {
   const [speechError, setSpeechError] = useState<string | null>(null)
   const sentinelRef = useRef<HTMLDivElement | null>(null)
   const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
-  const [localPage, setLocalPage] = useState(page)
   const [editItem, setEditItem] = useState<FileItem | null>(null)
   const [editForm, setEditForm] = useState<any>(null)
   const [collections, setCollections] = useState<CollectionOption[]>([])
+  const [exportState, setExportState] = useState<{
+    status: 'idle' | 'starting' | 'running' | 'ready' | 'error'
+    progress: number
+    label: string
+    error?: string
+    taskId?: number
+    downloadUrl?: string
+    processed?: number
+    total?: number
+  }>({ status: 'idle', progress: 0, label: '' })
+  const exportPollRef = useRef<number | undefined>(undefined)
   const toasts = useToasts()
   const logAction = useCallback((message: string, level: 'info' | 'error' | 'success' = 'info') => {
     const prefixed = `[catalogue] ${message}`
@@ -360,7 +361,7 @@ export function useCatalogueState() {
     setAiQueryHash('')
     setFeedbackStatus({})
     setAiAllLanguages(false)
-    setRagContext([])
+    resetRagContextState()
     setRagValidation(null)
     setRagWarnings([])
     setRagNotes([])
@@ -447,7 +448,7 @@ export function useCatalogueState() {
   }, [editForm, editItem])
 
   const refreshFile = useCallback(async (file: FileItem) => {
-    const url = `/api/files/${file.id}/refresh?use_llm=1&kws_audio=1&summarize=1`
+    const url = `/api/files/${file.id}/refresh?use_llm=1&kws_audio=1&summarize=1&async=1`
     logAction(`REFRESH ${url}`)
     try {
       const response = await fetch(url, { method: 'POST' })
@@ -455,14 +456,19 @@ export function useCatalogueState() {
       if (response.ok) {
         let payload: any = null
         try { payload = JSON.parse(text) } catch {}
-        if (payload && payload.file) {
-          setItems(list => list.map(x => x.id === payload.file.id ? payload.file : x))
+        if (payload?.async && payload?.task_id) {
+          toasts.push(`Обновление поставлено в очередь (задача #${payload.task_id})`, 'success')
+          logAction(`OK ${file.id} refresh queued task=${payload.task_id}`, 'success')
+        } else {
+          if (payload && payload.file) {
+            setItems(list => list.map(x => x.id === payload.file.id ? payload.file : x))
+          }
+          if (payload && Array.isArray(payload.log)) {
+            payload.log.forEach((entry: any) => logAction(String(entry), 'info'))
+          }
+          toasts.push('Теги обновлены', 'success')
+          logAction(`OK ${file.id} tags updated`, 'success')
         }
-        if (payload && Array.isArray(payload.log)) {
-          payload.log.forEach((entry: any) => logAction(String(entry), 'info'))
-        }
-        toasts.push('Теги обновлены', 'success')
-        logAction(`OK ${file.id} tags updated`, 'success')
       } else {
         toasts.push('Ошибка обновления тегов', 'error')
         logAction(`ERROR ${response.status} ${text.slice(0, 500)}`, 'error')
@@ -472,6 +478,23 @@ export function useCatalogueState() {
       logAction(`NETWORK ${String(error)}`, 'error')
     }
   }, [logAction, toasts])
+
+  const sendSearchFeedback = useCallback(async (file: FileItem, action: 'click' | 'relevant' | 'irrelevant') => {
+    try {
+      const queryText = (dq || q || '').trim()
+      await fetch('/api/search/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: queryText,
+          file_id: file.id,
+          action,
+        }),
+      })
+    } catch (error) {
+      console.debug('search feedback failed', error)
+    }
+  }, [dq, q])
 
   const renameFile = useCallback(async (file: FileItem) => {
     logAction(`RENAME-SUGGEST /api/files/${file.id}/rename-suggest`)
@@ -553,19 +576,6 @@ export function useCatalogueState() {
     if (previewRel) window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [previewRel])
-
-  const params = useMemo(() => {
-    const p = new URLSearchParams()
-    if (dq) p.set('q', dq)
-    if (dq) p.set('smart', '1')
-    if (type) p.set('type', type)
-    if (year_from) p.set('year_from', year_from)
-    if (year_to) p.set('year_to', year_to)
-    if (size_min) p.set('size_min', size_min)
-    if (size_max) p.set('size_max', size_max)
-    if (collectionId) p.set('collection_id', collectionId)
-    return p
-  }, [dq, type, year_from, year_to, size_min, size_max, collectionId])
 
   useEffect(() => {
     (async () => {
@@ -673,6 +683,8 @@ export function useCatalogueState() {
       setAiFilteredKeywords(Array.isArray(data.filtered_keywords) ? data.filtered_keywords : [])
       const ragContextData: RagContextEntry[] = Array.isArray(data.rag_context) ? data.rag_context : []
       setRagContext(ragContextData)
+      const ragContextGroupsData: RagContextGroup[] = Array.isArray(data.rag_context_groups) ? data.rag_context_groups : []
+      setRagContextGroups(ragContextGroupsData)
       const ragValidationData: RagValidationResult | null = data.rag_validation && typeof data.rag_validation === 'object' ? data.rag_validation : null
         setRagValidation(ragValidationData)
         const ragRiskData: RagRisk | null = data.rag_risk && typeof data.rag_risk === 'object' ? data.rag_risk : null
@@ -803,7 +815,7 @@ export function useCatalogueState() {
           setAiSources([])
           setAiFilteredKeywords([])
           setAiQueryHash('')
-          setRagContext([])
+          resetRagContextState()
           setRagValidation(null)
           setRagWarnings([])
           setRagNotes([])
@@ -840,7 +852,7 @@ export function useCatalogueState() {
             setAiProgress([`Ошибка поиска: ${normalized}`])
             setAiAnswer('')
             setAiKeywords([])
-            setRagContext([])
+            resetRagContextState()
             setRagValidation(null)
             setRagWarnings([])
             setRagNotes([])
@@ -861,7 +873,7 @@ export function useCatalogueState() {
             setAiSources([])
             setAiFilteredKeywords([])
             setAiQueryHash('')
-            setRagContext([])
+            resetRagContextState()
             setRagValidation(null)
             setRagWarnings([])
             setRagNotes([])
@@ -876,7 +888,7 @@ export function useCatalogueState() {
           setAiKeywords([])
           setAiSources([])
           setAiFilteredKeywords([])
-          setRagContext([])
+          resetRagContextState()
           setRagValidation(null)
           setRagWarnings([])
           setRagNotes([])
@@ -903,7 +915,7 @@ export function useCatalogueState() {
             setAiProgress([`Ошибка поиска: ${error instanceof Error ? error.message : String(error)}`])
             setAiAnswer('')
             setAiKeywords([])
-            setRagContext([])
+            resetRagContextState()
             setRagValidation(null)
             setRagWarnings([])
             setRagNotes([])
@@ -1050,7 +1062,7 @@ export function useCatalogueState() {
     setSelectedTags([])
     setAiAnswer('')
     setAiKeywords([])
-    setRagContext([])
+    resetRagContextState()
     setRagValidation(null)
     setRagWarnings([])
     setRagNotes([])
@@ -1064,15 +1076,123 @@ export function useCatalogueState() {
     setSp(params)
   }, [setSp])
 
+  const stopExportPoll = useCallback(() => {
+    if (exportPollRef.current !== undefined) {
+      window.clearInterval(exportPollRef.current)
+      exportPollRef.current = undefined
+    }
+  }, [])
+
+  useEffect(() => () => stopExportPoll(), [stopExportPoll])
+
+  const startExport = useCallback(async (options?: { includeFiles?: boolean; collectionId?: string }) => {
+    stopExportPoll()
+    setExportState({ status: 'starting', progress: 0, label: 'Подготовка экспорта…' })
+    try {
+      const payload: any = {
+        include_files: options?.includeFiles !== false,
+      }
+      if (options?.collectionId) {
+        payload.collection_id = options.collectionId
+      }
+      const resp = await fetch('/api/export/html/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const data = await resp.json().catch(() => null)
+      if (!resp.ok || !data?.task_id) {
+        throw new Error(data?.error || 'Не удалось запустить экспорт')
+      }
+
+      const taskId = Number(data.task_id)
+      const poll = async () => {
+        try {
+          const res = await fetch(`/api/export/html/jobs/${taskId}`)
+          const info = await res.json().catch(() => null)
+          if (!res.ok || !info?.task) {
+            throw new Error(info?.error || 'Ошибка чтения статуса экспорта')
+          }
+          const task = info.task
+          const payloadJson = task.payload_json || {}
+          const stageLabel = payloadJson.stage_label || payloadJson.stage || ''
+          const processed = Number(payloadJson.processed || 0)
+          const total = Number(payloadJson.total || 0)
+          const percent = Math.max(0, Math.min(100, Math.round((task.progress || 0) * 100)))
+
+          if (task.status === 'completed') {
+            stopExportPoll()
+            setExportState({
+              status: 'ready',
+              progress: 100,
+              label: stageLabel || 'Готово',
+              taskId,
+              downloadUrl: `/api/export/html/jobs/${taskId}/download`,
+              processed,
+              total,
+            })
+            return
+          }
+          if (task.status === 'error') {
+            stopExportPoll()
+            setExportState({
+              status: 'error',
+              progress: percent,
+              label: stageLabel || 'Ошибка экспорта',
+              error: task.error || 'Неизвестная ошибка',
+              taskId,
+              processed,
+              total,
+            })
+            return
+          }
+          setExportState({
+            status: 'running',
+            progress: percent,
+            label: stageLabel || 'Экспорт…',
+            taskId,
+            processed,
+            total,
+          })
+        } catch (error: any) {
+          stopExportPoll()
+          setExportState({
+            status: 'error',
+            progress: 0,
+            label: 'Ошибка экспорта',
+            error: error?.message || String(error),
+            taskId,
+          })
+        }
+      }
+
+      await poll()
+      exportPollRef.current = window.setInterval(poll, 1200)
+    } catch (error: any) {
+      stopExportPoll()
+      setExportState({
+        status: 'error',
+        progress: 0,
+        label: 'Ошибка экспорта',
+        error: error?.message || String(error),
+      })
+    }
+  }, [stopExportPoll])
+
+  const resetExport = useCallback(() => {
+    stopExportPoll()
+    setExportState({ status: 'idle', progress: 0, label: '' })
+  }, [stopExportPoll])
+
   return {
-    searchParams: { sp, setSp, q, type, year_from, year_to, size_min, size_max, collectionId, dq, params },
+    searchParams: { sp, setSp, q, type, year_from, year_to, size_min, size_max, metadataQuality, collectionId, dq, params },
     pagination: { page, pages, perPage, offset, localPage, canLoadMore },
     selectors: { selectedTags, setSelectedTags, removeTag, addTagFilter },
     list: { items, total, loading, sentinelRef },
     ai: {
       aiMode, setAiMode, aiLoading, aiProgress, progressItems, aiAnswer, safeAiAnswer, aiAnswerPlain,
       aiKeywords, aiSources, aiFilteredKeywords, aiQueryHash, feedbackStatus,
-      ragContext, ragValidation, ragRisk, ragSources, ragRetry, ragWarnings, ragNotes, ragFallback, ragSessionId,
+      ragContext, ragContextGroups, ragValidation, ragRisk, ragSources, ragRetry, ragWarnings, ragNotes, ragFallback, ragSessionId,
       aiTopK, setAiTopK, aiDeepSearch, setAiDeepSearch, aiUseTags, setAiUseTags,
       aiUseText, setAiUseText, aiMaxCandidates, setAiMaxCandidates, aiChunkChars, setAiChunkChars,
       aiMaxChunks, setAiMaxChunks, aiMaxSnippets, setAiMaxSnippets, aiFullText, setAiFullText,
@@ -1087,7 +1207,7 @@ export function useCatalogueState() {
       resetAiState,
     },
     modals: { previewRel, setPreviewRel, editItem, setEditItem, editForm, setEditForm, saveEdit, openEdit },
-    helpers: { toasts, logAction, updateTagsInline, refreshFile, renameFile, deleteFile },
+    helpers: { toasts, logAction, updateTagsInline, refreshFile, renameFile, deleteFile, sendSearchFeedback, startExport, resetExport },
     collections,
     facets,
     facetsLoading,
@@ -1095,5 +1215,6 @@ export function useCatalogueState() {
     config: {
       aiMaxCandidates, aiChunkChars, aiMaxChunks, aiMaxSnippets, aiFullText, aiUseLlmSnippets,
     },
+    exportState,
   }
 }

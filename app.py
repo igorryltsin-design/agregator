@@ -11,6 +11,7 @@ import math
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import io
 import itertools
 import heapq
 import copy
@@ -18,7 +19,9 @@ import queue
 import platform
 import shutil
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Mapping, cast
+from urllib.parse import quote_plus
 
 import click
 from flask import Blueprint, Flask, request, redirect, url_for, jsonify, send_from_directory, send_file, Response, make_response, session, g, abort, current_app, has_app_context, stream_with_context
@@ -41,8 +44,9 @@ except ImportError:  # запасной вариант для старых ве�
                 return func(*args, **kwargs)
 
         return wrapper
-from sqlalchemy import func, and_, or_, exists, text, event
+from sqlalchemy import func, and_, or_, exists, text, event, inspect as sa_inspect
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import aliased, joinedload
 from models import (
     db,
@@ -56,6 +60,7 @@ from models import (
     User,
     CollectionMember,
     UserActionLog,
+    UserPreference,
     TaskRecord,
     DocChatCache,
     LlmEndpoint,
@@ -125,13 +130,17 @@ def _configure_sqlite_pragmas(dbapi_connection, connection_record):
 import fitz  # библиотека PyMuPDF
 import requests
 from agregator.config import AppConfig, load_app_config
+from agregator.config_schema import CONFIG_FIELDS, field_api_key, field_snapshot_key
 from agregator.runtime_settings import runtime_settings_store
 from agregator.services import (
     HttpSettings,
     configure_http,
     configure_llm_cache,
     configure_search_cache,
+    configure_llm_pool,
     configure_logging,
+    get_browser_manager,
+    get_http_settings,
     get_rotating_log_handler as svc_get_rotating_log_handler,
     get_task_queue,
     llm_cache_get,
@@ -139,6 +148,8 @@ from agregator.services import (
     llm_cache_clear,
     llm_cache_stats,
     CachedLLMResponse,
+    LlmPoolRejected,
+    LlmPoolTimeout,
     FacetQueryParams,
     FacetService,
     SearchService,
@@ -146,11 +157,24 @@ from agregator.services import (
     search_cache_set,
     search_cache_clear,
     search_cache_stats,
+    get_llm_pool,
     http_request,
     list_system_log_files as svc_list_system_log_files,
     resolve_log_name as svc_resolve_log_name,
     tail_log_file as svc_tail_log_file,
 )
+from agregator.osint import (
+    OsintSearchService,
+    SerpFetcher,
+    SerpParser,
+    SerpSettings,
+    OsintRepositoryConfig,
+    SUPPORTED_ENGINES,
+    SUPPORTED_OSINT_LOCALES,
+)
+from agregator.osint.remote_browser import remote_browser_manager
+from agregator.osint.proxy import fetch_proxied_page, rewrite_html_for_proxy
+from agregator.osint.artifacts import resolve_artifact_path
 from agregator.rag import (
     ChunkConfig,
     ContextSelector,
@@ -585,51 +609,7 @@ def _check_pipeline_access() -> tuple[bool, Optional[Response]]:
     return True, None
 
 
-class TimedCache:
-    def __init__(self, max_items: int = 128, ttl: float = 60.0):
-        self.max_items = max(1, int(max_items))
-        self.ttl = float(ttl)
-        self._store: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def _prune(self) -> None:
-        now = time.time()
-        dead = [key for key, (expires, _val) in self._store.items() if expires <= now]
-        for key in dead:
-            self._store.pop(key, None)
-        while len(self._store) > self.max_items:
-            self._store.popitem(last=False)
-
-    def get(self, key: tuple) -> object | None:
-        with self._lock:
-            item = self._store.get(key)
-            if not item:
-                return None
-            expires, value = item
-            if expires <= time.time():
-                self._store.pop(key, None)
-                return None
-            self._store.move_to_end(key)
-            return value
-
-    def set(self, key: tuple, value: object) -> None:
-        with self._lock:
-            self._store[key] = (time.time() + self.ttl, value)
-            self._store.move_to_end(key)
-            self._prune()
-
-    def get_or_set(self, key: tuple, factory):
-        cached = self.get(key)
-        if cached is not None:
-            return cached
-        value = factory()
-        self.set(key, value)
-        return value
-
-    def clear(self) -> None:
-        with self._lock:
-            self._store.clear()
-
+from agregator.caching import TimedCache  # extracted — single source of truth
 
 FACET_CACHE = TimedCache(max_items=256, ttl=60)
 facet_service = FacetService(FACET_CACHE)
@@ -776,6 +756,13 @@ def _delete_file_from_fts(file_id: int | None):
 def _search_candidate_ids(query: str, limit: int = 4000) -> list[int] | None:
     return search_service.candidate_ids(query, limit=limit)
 
+def _search_ranked_candidates(query: str, limit: int = 4000, profile: str | None = None) -> list[tuple[int, float]]:
+    ranked = search_service.ranked_candidates(query, limit=limit, profile=profile)
+    return [(int(fid), float(score)) for fid, score in ranked]
+
+def _search_ranked_candidate_ids(query: str, limit: int = 4000, profile: str | None = None) -> list[int]:
+    return [fid for fid, _score in _search_ranked_candidates(query, limit=limit, profile=profile)]
+
 
 def _apply_like_filter(base_query, query: str):
     return search_service.apply_like_filter(base_query, query)
@@ -785,51 +772,15 @@ def _apply_text_search_filter(base_query, query: str):
     return search_service.apply_text_search_filter(base_query, query)
 
 
-class TimedCache:
-    def __init__(self, max_items: int = 128, ttl: float = 60.0):
-        self.max_items = max(1, int(max_items))
-        self.ttl = float(ttl)
-        self._store: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
-        self._lock = threading.Lock()
+# Second TimedCache definition removed — using import from agregator.caching
 
-    def _prune(self) -> None:
-        now = time.time()
-        dead = [key for key, (expires, _val) in self._store.items() if expires <= now]
-        for key in dead:
-            self._store.pop(key, None)
-        while len(self._store) > self.max_items:
-            self._store.popitem(last=False)
-
-    def get(self, key: tuple) -> object | None:
-        with self._lock:
-            item = self._store.get(key)
-            if not item:
-                return None
-            expires, value = item
-            if expires <= time.time():
-                self._store.pop(key, None)
-                return None
-            self._store.move_to_end(key)
-            return value
-
-    def set(self, key: tuple, value: object) -> None:
-        with self._lock:
-            self._store[key] = (time.time() + self.ttl, value)
-            self._store.move_to_end(key)
-            self._prune()
-
-    def get_or_set(self, key: tuple, factory):
-        cached = self.get(key)
-        if cached is not None:
-            return cached
-        value = factory()
-        self.set(key, value)
-        return value
-
-    def clear(self) -> None:
-        with self._lock:
-            self._store.clear()
-
+from agregator.services.nlp import (  # extracted NLP module
+    ru_tokens as _ru_tokens_impl,
+    lemma as _lemma_impl,
+    lemmas as _lemmas_impl,
+    expand_synonyms as _expand_synonyms_impl,
+    RU_SYNONYMS as _RU_SYNONYMS_EXT,
+)
 _RU_SYNONYMS = {
     'машина': ['автомобиль', 'авто', 'тачка', 'car'],
     'изображение': ['картинка', 'фото', 'фотография', 'image', 'picture', 'снимок', 'скриншот', 'screenshot'],
@@ -842,41 +793,28 @@ _RU_SYNONYMS = {
     'год': ['лет', 'г'],
 }
 
+# NLP functions delegate to agregator.services.nlp (extracted module)
 def _ru_tokens(text: str) -> list[str]:
-    s = (text or '').lower()
-    if _ru_tokenize:
-        try:
-            return [t.text for t in _ru_tokenize(s)]
-        except Exception:
-            pass
-    import re as _re
-    return _re.sub(r"[^\w\d]+", " ", s).strip().split()
+    return _ru_tokens_impl(text)
 
 def _lemma(word: str) -> str:
-    if _morph:
-        try:
-            p = _morph.parse(word)
-            if p:
-                return p[0].normal_form
-        except Exception:
-            pass
-    return word.lower()
+    return _lemma_impl(word)
 
 def _lemmas(text: str) -> list[str]:
-    return [_lemma(w) for w in _ru_tokens(text)]
+    return _lemmas_impl(text)
 
 def _expand_synonyms(lemmas: list[str]) -> set[str]:
-    out = set(lemmas)
-    for l in list(lemmas):
-        for s in _RU_SYNONYMS.get(l, []):
-            out.add(_lemma(s))
-    return out
+    return _expand_synonyms_impl(lemmas)
 
 LLM_ROUND_ROBIN: dict[str, itertools.cycle] = {}
 LLM_ENDPOINT_SIGNATURE: dict[str, tuple[tuple[int, float, tuple[str, ...]], ...]] = {}
 LLM_ENDPOINT_POOLS: dict[str, list[dict[str, str]]] = {}
 LLM_ENDPOINT_UNIQUE: dict[str, list[dict[str, str]]] = {}
 LLM_SCHEMA_READY = False
+LMSTUDIO_IDLE_UNLOAD_THREAD_STARTED = False
+LMSTUDIO_LAST_ACTIVITY_TS = time.time()
+LMSTUDIO_IDLE_UNLOADED = False
+LMSTUDIO_IDLE_LOCK = threading.Lock()
 LLM_BUSY_HTTP_CODES = {409, 423, 429, 503}
 LLM_BUSY_STATUS_VALUES = {'busy', 'processing', 'in_progress', 'queued', 'pending', 'rate_limited'}
 LLM_PURPOSES = [
@@ -1026,6 +964,15 @@ except Exception:
 
 FEEDBACK_SCHEDULER_EVENT = threading.Event()
 FEEDBACK_LAST_TRIGGER_AT = 0.0
+FEEDBACK_ONLINE_TRAIN_LAST_AT = 0.0
+try:
+    FEEDBACK_ONLINE_TRAIN_MIN_INTERVAL_SEC = float(os.getenv("AI_FEEDBACK_ONLINE_TRAIN_MIN_INTERVAL_SEC", "900") or 900.0)
+except Exception:
+    FEEDBACK_ONLINE_TRAIN_MIN_INTERVAL_SEC = 900.0
+try:
+    FEEDBACK_ONLINE_TRAIN_EVERY_EVENTS = int(os.getenv("AI_FEEDBACK_ONLINE_TRAIN_EVERY_EVENTS", "25") or 25)
+except Exception:
+    FEEDBACK_ONLINE_TRAIN_EVERY_EVENTS = 25
 
 def _now() -> float:
     return time.time()
@@ -1038,8 +985,13 @@ def _sha256(s: str) -> str:
 
 def _query_fingerprint(query: str, payload: dict | None = None) -> str:
     payload = payload or {}
+    allowed_scope = _current_allowed_collections()
+    user = _load_current_user()
+    scope_collections = None if allowed_scope is None else sorted(int(x) for x in allowed_scope)
     serialized = {
         'query': query.strip(),
+        'user_id': getattr(user, 'id', None),
+        'scope_collections': scope_collections,
         'top_k': payload.get('top_k'),
         'deep_search': bool(payload.get('deep_search')),
         'full_text': bool(payload.get('full_text')),
@@ -1058,6 +1010,19 @@ def _query_fingerprint(query: str, payload: dict | None = None) -> str:
     except Exception:
         data = str(serialized)
     return _sha256(data)
+
+
+def _cache_scope_identity() -> dict[str, Any]:
+    user = _load_current_user()
+    allowed_scope = _current_allowed_collections()
+    try:
+        scope_collections = None if allowed_scope is None else sorted(int(x) for x in allowed_scope)
+    except Exception:
+        scope_collections = None
+    return {
+        'user_id': getattr(user, 'id', None),
+        'scope_collections': scope_collections,
+    }
 
 def _get_cached_snippet(file_id: int, query_hash: str, llm_variant: bool):
     if not file_id or not query_hash:
@@ -1291,6 +1256,7 @@ def _load_runtime_settings_from_disk() -> None:
         logger.warning("Не удалось прочитать настройки: %s", exc)
         return
     runtime_settings_store.apply_updates(data)
+    runtime_settings_store.current.apply_env()
     _reset_rag_rerank_cache()
     runtime = _rt()
     if runtime.lm_default_provider not in LLM_PROVIDER_CHOICES:
@@ -1333,22 +1299,13 @@ def _apply_runtime_settings_to_config(app_obj: Flask) -> None:
 
 # ------------------- Lightweight response helpers -------------------
 
-def json_error(message: str, status: int = 400):
-    """Shortcut для JSON-ошибок."""
-    return jsonify({"error": str(message)}), int(status)
-
-
-def _html_page(title: str, body: str, *, extra_head: str = "", status: int = 200) -> Response:
-    head = f"""
-    <meta charset=\"utf-8\" />
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>{escape(title)}</title>
-    {extra_head}
-    """
-    html = f"""<!doctype html><html lang=\"ru\"><head>{head}</head><body>{body}</body></html>"""
-    resp = make_response(html, status)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    return resp
+# Error helpers delegate to agregator.middleware.errors (extracted module)
+from agregator.middleware.errors import (
+    json_error,
+    html_page as _html_page,
+    add_pipeline_cors_headers as _add_pipeline_cors_headers_impl,
+    pipeline_cors_preflight as _pipeline_cors_preflight_impl,
+)
 
 
 
@@ -1435,9 +1392,7 @@ def _docx_to_html(path: Path, limit_chars: int = 60000) -> str | None:
             result = mammoth.convert_to_html(docx_file)
         html_fragment = result.value or ''
         sanitized = _sanitize_html_fragment(html_fragment)
-        if limit_chars:
-            return sanitized[:limit_chars]
-        return sanitized
+        return _limit_text_length(sanitized, limit_chars)
     except Exception as exc:
         app.logger.warning(f"DOCX preview conversion failed for {path}: {exc}")
         return None
@@ -1590,6 +1545,94 @@ def _normalize_year(val):
         return s[:16] if s else None
     except Exception:
         return None
+
+
+def _normalize_keywords_text(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parts = [p.strip() for p in re.split(r"[,;\n|]+", raw) if p and p.strip()]
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for item in parts:
+        norm = item.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        dedup.append(item)
+        if len(dedup) >= 50:
+            break
+    return ", ".join(dedup) if dedup else None
+
+
+def _normalize_material_type_value(value: Any, *, ext: str = "", text_excerpt: str = "", filename: str = "") -> str:
+    current = normalize_material_type(str(value or "").strip())
+    allowed = _allowed_material_type_keys()
+    if current in allowed and current:
+        return current
+    ext_l = (ext or "").lower()
+    if ext_l in AUDIO_EXTS:
+        return "audio"
+    if ext_l in IMAGE_EXTS:
+        return "image"
+    cand = _detect_type_pre_llm(ext_l, text_excerpt or "", filename or "")
+    if cand and cand in allowed:
+        return cand
+    guessed = guess_material_type(ext_l, text_excerpt or "", filename or "")
+    guessed_norm = normalize_material_type(guessed)
+    if guessed_norm in allowed and guessed_norm:
+        return guessed_norm
+    return "document"
+
+
+def _apply_metadata_quality_rules(file_obj: File, *, ext: str = "", text_excerpt: str = "", filename: str = "") -> dict[str, Any]:
+    changed: list[str] = []
+    original_author = file_obj.author
+    author_norm = _normalize_author(file_obj.author)
+    if author_norm:
+        author_norm = _normalize_author_name(author_norm)
+    if author_norm and author_norm != (original_author or "").strip():
+        file_obj.author = author_norm
+        changed.append("author")
+
+    original_year = file_obj.year
+    year_norm = _normalize_year(file_obj.year)
+    if year_norm:
+        try:
+            year_int = int(year_norm)
+            if year_int < 1500 or year_int > 2100:
+                year_norm = None
+        except Exception:
+            pass
+    if year_norm and year_norm != (original_year or "").strip():
+        file_obj.year = year_norm
+        changed.append("year")
+
+    original_keywords = file_obj.keywords
+    keywords_norm = _normalize_keywords_text(file_obj.keywords)
+    if keywords_norm and keywords_norm != (original_keywords or "").strip():
+        file_obj.keywords = keywords_norm
+        changed.append("keywords")
+
+    original_type = file_obj.material_type
+    type_norm = _normalize_material_type_value(
+        file_obj.material_type,
+        ext=ext or (file_obj.ext or ""),
+        text_excerpt=text_excerpt or (file_obj.text_excerpt or ""),
+        filename=filename or (file_obj.filename or ""),
+    )
+    if type_norm and type_norm != (original_type or "").strip():
+        file_obj.material_type = type_norm
+        changed.append("material_type")
+
+    if not (file_obj.title or "").strip() and (filename or file_obj.filename):
+        cleaned_title = re.sub(r"[_\-]+", " ", str(filename or file_obj.filename)).strip()
+        if cleaned_title:
+            file_obj.title = cleaned_title[:300]
+            changed.append("title")
+
+    quality = _metadata_quality(file_obj)
+    return {"changed": changed, "quality": quality}
 
 # --------- Расширенное извлечение тегов (общие и специфичные по типу) ---------
 def extract_richer_tags(material_type: str, text: str, filename: str = "") -> dict:
@@ -1797,8 +1840,133 @@ app = Flask(__name__)
 DOC_CHAT_LOCK = threading.Lock()
 DOC_CHAT_SESSIONS: dict[str, dict[str, Any]] = {}
 DOC_CHAT_TTL_SECONDS = 6 * 3600  # 6 часов
-DOC_CHAT_IMAGE_LIMIT = 12
+DOC_CHAT_IMAGE_LIMIT = 0  # 0 — без ограничения количества изображений
+DOC_CHAT_TEXT_LIMIT = 0  # 0 — индексация полного текста документа
 DOC_CHAT_HISTORY_LIMIT = 12
+DOC_CHAT_MODE_CONFIG: dict[str, dict[str, Any]] = {
+    'default': {
+        'label': 'Стандартный',
+        'instruction': 'Используй сбалансированный режим: комбинируй краткие цитаты и пояснения, обязательно указывай ссылки вида «Текст N».',
+        'max_chunks': 4,
+        'score_threshold_factor': 0.45,
+        'low_score_threshold_factor': 0.6,
+        'min_threshold': 0.05,
+        'fallback_chunks': 2,
+        'image_limit': 3,
+    },
+    'quote': {
+        'label': 'Цитата',
+        'instruction': 'Режим «Цитата»: найди точный фрагмент текста, цитируй дословно и обязательно укажи страницу и ссылку на «Текст N». Если данных мало, честно укажи это.',
+        'max_chunks': 3,
+        'score_threshold_factor': 0.6,
+        'low_score_threshold_factor': 0.75,
+        'min_threshold': 0.1,
+        'fallback_chunks': 2,
+        'require_terms': True,
+        'image_limit': 2,
+    },
+    'overview': {
+        'label': 'Структурный обзор',
+        'instruction': 'Режим «Структурный обзор»: сделай сжатый конспект по ключевым разделам, перечисли основные идеи и связи между ними.',
+        'max_chunks': 6,
+        'score_threshold_factor': 0.3,
+        'low_score_threshold_factor': 0.45,
+        'min_threshold': 0.0,
+        'fallback_chunks': 4,
+        'image_limit': 3,
+    },
+    'formulas': {
+        'label': 'Формулы и графики',
+        'instruction': 'Режим «Формулы и графики»: сосредоточься на формулах, графиках и других технических деталях. Если приводишь формулу, сохрани оригинальное написание.',
+        'max_chunks': 5,
+        'score_threshold_factor': 0.4,
+        'low_score_threshold_factor': 0.55,
+        'min_threshold': 0.02,
+        'fallback_chunks': 3,
+        'prefer_math_chunks': True,
+        'prefer_technical_images': True,
+        'image_limit': 2,
+    },
+}
+DOC_CHAT_MODE_ALIASES: dict[str, str] = {
+    '': 'default',
+    'standard': 'default',
+    'стандарт': 'default',
+    'цитата': 'quote',
+    'citation': 'quote',
+    'quotes': 'quote',
+    'overview': 'overview',
+    'structure': 'overview',
+    'структурный': 'overview',
+    'формулы': 'formulas',
+    'формулы_и_графики': 'formulas',
+    'math': 'formulas',
+    'graphs': 'formulas',
+}
+DOC_CHAT_FORMULA_KEYWORDS = (
+    'формул', 'уравн', 'уравнение', 'уравнения', 'интеграл', 'сумма', '∑', '∫', '√', '≈', 'график', 'графика', 'графиков',
+    'diagram', 'chart', 'plot', 'formula', 'equation', 'matrix', 'матриц', 'теорема', 'lemma', 'proof'
+)
+DOC_CHAT_FORMULA_PATTERN = re.compile(r"(?:\\[a-zA-Z]+|[А-Яа-яA-Za-z0-9]+?\s*(?:=|≥|≤|≈)\s*[А-Яа-яA-Za-z0-9]+?|[∑∫√±×÷])")
+DOC_CHAT_TECH_IMAGE_KEYWORDS = (
+    'формул', 'equation', 'formula', 'graph', 'график', 'diagram', 'chart', 'plot', 'figure', 'матриц', 'схема', 'schema'
+)
+DOC_CHAT_CITATION_RE = re.compile(r"(текст|text|изображение|image)\s+(\d+)", re.IGNORECASE)
+DOC_CHAT_TONE_OPTIONS: dict[str, dict[str, Any]] = {
+    'neutral': {
+        'label': 'Нейтральный',
+        'instruction': 'Сохраняй спокойный и официально-нейтральный тон, избегай эмоциональных оценок.',
+    },
+    'academic': {
+        'label': 'Академичный',
+        'instruction': 'Пиши академично: используй строгий стиль, подчёркивай термины и аккуратно цитируй источники.',
+    },
+    'friendly': {
+        'label': 'Дружелюбный',
+        'instruction': 'Объясняй дружелюбно и простыми словами, добавляй короткие контекстуальные пояснения.',
+    },
+}
+DOC_CHAT_DETAIL_OPTIONS: dict[str, dict[str, Any]] = {
+    'brief': {
+        'label': 'Кратко',
+        'instruction': 'Делай сжатый ответ: до 3 ключевых мыслей, без лишних подробностей.',
+        'max_tokens': 650,
+    },
+    'balanced': {
+        'label': 'Стандартно',
+        'instruction': 'Держись баланса между краткостью и деталями, добавляй краткие цитаты и выводы.',
+        'max_tokens': 900,
+    },
+    'deep': {
+        'label': 'Подробно',
+        'instruction': 'Раскрывай детали максимально полно, перечисляй ключевые аргументы и числовые данные.',
+        'max_tokens': 1100,
+    },
+}
+DOC_CHAT_LANGUAGE_OPTIONS: dict[str, dict[str, Any]] = {
+    'ru': {
+        'label': 'Русский',
+        'instruction': 'Отвечай на русском языке, даже если вопрос задан иначе.',
+    },
+    'en': {
+        'label': 'English',
+        'instruction': 'Answer in English regardless of the question language.',
+    },
+    'auto': {
+        'label': 'Авто',
+        'instruction': 'Определи язык вопроса и отвечай на нём; если язык неясен, используй русский.',
+    },
+}
+DOC_CHAT_PREFERENCE_DEFAULTS: dict[str, str] = {
+    'tone': 'neutral',
+    'detail': 'balanced',
+    'language': 'ru',
+}
+DOC_CHAT_PREFERENCE_OPTIONS: dict[str, dict[str, dict[str, Any]]] = {
+    'tone': DOC_CHAT_TONE_OPTIONS,
+    'detail': DOC_CHAT_DETAIL_OPTIONS,
+    'language': DOC_CHAT_LANGUAGE_OPTIONS,
+}
 
 
 def _doc_chat_now() -> float:
@@ -1946,6 +2114,8 @@ def _doc_chat_create_session(user: User, file_obj: File) -> dict[str, Any]:
         'error': None,
         'data': None,
         'history': [],
+        'phase_history': [],
+        'image_filter_summary': {},
         'created_at': now,
         'updated_at': now,
         'cache_path': str(cache_dir),
@@ -1990,6 +2160,19 @@ def _doc_chat_progress(session_id: str, line: str, *, percent: float | None = No
             app.logger.info("%s %s", label, line)
     except Exception:
         pass
+
+
+def _doc_chat_record_phase(session_id: str, label: str, *, details: Optional[str] = None) -> None:
+    now = _doc_chat_now()
+    with DOC_CHAT_LOCK:
+        session = DOC_CHAT_SESSIONS.get(session_id)
+        if not session:
+            return
+        history = session.setdefault('phase_history', [])
+        history.append({'label': label, 'details': details, 'ts': now})
+        if len(history) > 6:
+            session['phase_history'] = history[-6:]
+        session['updated_at'] = now
 
 
 def _doc_chat_set_status(session_id: str, status: str, *, error: Optional[str] = None, percent: float | None = None) -> None:
@@ -2226,7 +2409,314 @@ def _doc_chat_owner_id(session_id: str) -> Optional[int]:
             return None
 
 
-def _doc_chat_extract_pdf_images(path: Path, session_id: str, limit: int) -> list[dict[str, Any]]:
+def _doc_chat_resolve_mode(mode_name: Optional[str]) -> tuple[str, dict[str, Any]]:
+    key = (mode_name or '').strip().lower()
+    resolved = DOC_CHAT_MODE_ALIASES.get(key, key or 'default')
+    if resolved not in DOC_CHAT_MODE_CONFIG:
+        resolved = 'default'
+    config = dict(DOC_CHAT_MODE_CONFIG[resolved])
+    runtime = _rt()
+    max_chunks_override = getattr(runtime, 'doc_chat_max_chunks', 0) or 0
+    fallback_override = getattr(runtime, 'doc_chat_fallback_chunks', 0) or 0
+    if max_chunks_override > 0:
+        config['max_chunks'] = max(1, int(max_chunks_override))
+    if fallback_override > 0:
+        config['fallback_chunks'] = max(1, int(fallback_override))
+    return resolved, config
+
+
+def _doc_chat_trim_context(text: Optional[str], limit: int = 600) -> Optional[str]:
+    if not text:
+        return None
+    cleaned = re.sub(r'\s+', ' ', text).strip()
+    if not cleaned:
+        return None
+    if limit > 0 and len(cleaned) > limit:
+        trimmed = cleaned[:limit]
+        last_space = trimmed.rfind(' ')
+        if last_space > 40:  # avoid chopping words too aggressively
+            trimmed = trimmed[:last_space]
+        cleaned = trimmed.rstrip() + '…'
+    return cleaned
+
+
+def _doc_chat_snippet_has_math(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(token in lowered for token in DOC_CHAT_FORMULA_KEYWORDS):
+        return True
+    return bool(DOC_CHAT_FORMULA_PATTERN.search(text))
+
+
+def _doc_chat_safe_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _doc_chat_image_min_settings() -> tuple[int, int]:
+    runtime = _rt()
+    min_width = max(0, int(getattr(runtime, 'doc_chat_image_min_width', 0) or 0))
+    min_height = max(0, int(getattr(runtime, 'doc_chat_image_min_height', 0) or 0))
+    return min_width, min_height
+
+
+def _doc_chat_image_meets_min_size(width: Optional[int], height: Optional[int], min_width: int, min_height: int) -> bool:
+    if min_width <= 0 and min_height <= 0:
+        return True
+    if width is None or height is None:
+        return True
+    if min_width > 0 and width < min_width:
+        return False
+    if min_height > 0 and height < min_height:
+        return False
+    return True
+
+
+def _doc_chat_image_is_technical(image: dict[str, Any]) -> bool:
+    description = str(image.get('description') or '').lower()
+    keywords = ' '.join(str(k).lower() for k in (image.get('keywords') or []) if k)
+    before_ctx = str(image.get('context_before') or '').lower()
+    after_ctx = str(image.get('context_after') or '').lower()
+    haystack = ' '.join((description, keywords, before_ctx, after_ctx))
+    return any(token in haystack for token in DOC_CHAT_TECH_IMAGE_KEYWORDS)
+
+
+def _doc_chat_history_context(history: Sequence[dict[str, Any]], *, max_pairs: int = 3, max_chars: int = 1200) -> str:
+    if not history or max_pairs <= 0:
+        return ""
+    segments: list[str] = []
+    user_turns = 0
+    for turn in reversed(history):
+        role = turn.get('role')
+        if role not in {'user', 'assistant'}:
+            continue
+        content = str(turn.get('content') or '').strip()
+        if not content:
+            continue
+        role_label = 'Пользователь' if role == 'user' else 'Помощник'
+        mode_key = str(turn.get('mode') or '').strip()
+        mode_label = DOC_CHAT_MODE_CONFIG.get(mode_key, {}).get('label')
+        if mode_label:
+            role_label = f"{role_label} ({mode_label})"
+        segments.append(f"{role_label}: {content}")
+        if role == 'user':
+            user_turns += 1
+            if user_turns >= max_pairs:
+                break
+    if not segments:
+        return ""
+    segments.reverse()
+    text = "\n".join(segments)
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+        first_newline = text.find('\n')
+        if 0 < first_newline < len(text) - 20:
+            text = text[first_newline + 1 :]
+    return text.strip()
+
+
+def _doc_chat_recent_chunk_ids(history: Sequence[dict[str, Any]], *, limit: int = 4) -> list[int]:
+    if not history or limit <= 0:
+        return []
+    chunk_ids: list[int] = []
+    seen: set[int] = set()
+    for turn in reversed(history):
+        if turn.get('role') != 'assistant':
+            continue
+        sources = turn.get('sources') or {}
+        text_sources = sources.get('texts') or []
+        for source in text_sources:
+            chunk_id = source.get('chunk_id')
+            try:
+                chunk_id_int = int(chunk_id)
+            except Exception:
+                continue
+            if chunk_id_int in seen:
+                continue
+            seen.add(chunk_id_int)
+            chunk_ids.append(chunk_id_int)
+            if len(chunk_ids) >= limit:
+                return chunk_ids
+    return chunk_ids
+
+
+def _doc_chat_pref_options_payload() -> dict[str, list[dict[str, str]]]:
+    payload: dict[str, list[dict[str, str]]] = {}
+    for key, options in DOC_CHAT_PREFERENCE_OPTIONS.items():
+        entries: list[dict[str, str]] = []
+        for value_key, meta in options.items():
+            entries.append({
+                'id': value_key,
+                'label': meta.get('label', value_key.title()),
+                'description': meta.get('description') or meta.get('instruction') or '',
+            })
+        payload[key] = entries
+    return payload
+
+
+def _doc_chat_normalize_pref_value(key: str, value: Any) -> Optional[str]:
+    if key not in DOC_CHAT_PREFERENCE_OPTIONS:
+        return None
+    options = DOC_CHAT_PREFERENCE_OPTIONS[key]
+    value_str = str(value or '').strip().lower()
+    if not value_str:
+        return DOC_CHAT_PREFERENCE_DEFAULTS.get(key)
+    if value_str not in options:
+        return DOC_CHAT_PREFERENCE_DEFAULTS.get(key)
+    return value_str
+
+
+def _doc_chat_get_user_preferences(user: Optional[User]) -> dict[str, str]:
+    prefs = dict(DOC_CHAT_PREFERENCE_DEFAULTS)
+    if not user:
+        return prefs
+    try:
+        rows: List[UserPreference] = UserPreference.query.filter(UserPreference.user_id == user.id).all()
+    except Exception:
+        return prefs
+    for row in rows:
+        normalized = _doc_chat_normalize_pref_value(row.key, row.value)
+        if normalized:
+            prefs[row.key] = normalized
+    return prefs
+
+
+def _doc_chat_set_user_preferences(user: User, updates: Mapping[str, Any]) -> dict[str, str]:
+    if not user:
+        raise RuntimeError("user required for preferences update")
+    changed = False
+    for key, value in updates.items():
+        if key not in DOC_CHAT_PREFERENCE_OPTIONS:
+            continue
+        normalized = _doc_chat_normalize_pref_value(key, value)
+        if normalized is None:
+            continue
+        default_value = DOC_CHAT_PREFERENCE_DEFAULTS.get(key)
+        current_pref = UserPreference.query.filter_by(user_id=user.id, key=key).one_or_none()
+        if normalized == default_value:
+            if current_pref:
+                db.session.delete(current_pref)
+                changed = True
+            continue
+        if current_pref:
+            if current_pref.value != normalized:
+                current_pref.value = normalized
+                changed = True
+        else:
+            db.session.add(UserPreference(user_id=user.id, key=key, value=normalized))
+            changed = True
+    if changed:
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            raise
+    return _doc_chat_get_user_preferences(user)
+
+
+def _doc_chat_pdf_block_text(block: dict[str, Any]) -> str:
+    if not block or block.get('type') != 0:
+        return ''
+    lines = block.get('lines') or []
+    parts: list[str] = []
+    for line in lines:
+        spans = line.get('spans') or []
+        span_text = ''.join(str(span.get('text') or '') for span in spans).strip()
+        if span_text:
+            parts.append(span_text)
+    return '\n'.join(parts).strip()
+
+
+def _doc_chat_pdf_neighbor_text(blocks: Sequence[dict[str, Any]], start_idx: int, direction: int) -> Optional[str]:
+    idx = start_idx + direction
+    while 0 <= idx < len(blocks):
+        block = blocks[idx]
+        if isinstance(block, dict) and block.get('type') == 0:
+            text = _doc_chat_trim_context(_doc_chat_pdf_block_text(block))
+            if text:
+                return text
+        idx += direction
+    return None
+
+
+def _doc_chat_docx_image_context(zf: "zipfile.ZipFile") -> dict[str, dict[str, Optional[str]]]:
+    contexts: dict[str, dict[str, Optional[str]]] = {}
+    try:
+        document_xml = zf.read('word/document.xml')
+        rels_xml = zf.read('word/_rels/document.xml.rels')
+    except KeyError:
+        return contexts
+    ns = {
+        'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        'rel': 'http://schemas.openxmlformats.org/package/2006/relationships',
+    }
+    rels_root = ET.fromstring(rels_xml)
+    rels_map: dict[str, str] = {}
+    for rel in rels_root.findall('rel:Relationship', ns):
+        rel_id = rel.attrib.get('Id')
+        target = rel.attrib.get('Target')
+        if not rel_id or not target:
+            continue
+        normalized = target.replace('\\', '/').lstrip('./')
+        if not normalized.startswith('word/'):
+            normalized = f"word/{normalized}"
+        rels_map[rel_id] = normalized
+
+    doc_root = ET.fromstring(document_xml)
+    paragraphs = doc_root.findall('.//w:p', ns)
+    paragraph_texts: list[str] = []
+    paragraph_images: list[list[str]] = []
+    for paragraph in paragraphs:
+        texts: list[str] = []
+        for node in paragraph.findall('.//w:t', ns):
+            val = node.text
+            if val:
+                texts.append(val)
+        paragraph_text = _doc_chat_trim_context(' '.join(texts), limit=600) or ''
+        paragraph_texts.append(paragraph_text)
+        images_in_paragraph: list[str] = []
+        for blip in paragraph.findall('.//a:blip', ns):
+            embed = blip.attrib.get(f"{{{ns['r']}}}embed")
+            if not embed:
+                continue
+            target = rels_map.get(embed)
+            if target:
+                images_in_paragraph.append(target)
+        paragraph_images.append(images_in_paragraph)
+
+    total = len(paragraphs)
+    for idx, targets in enumerate(paragraph_images):
+        if not targets:
+            continue
+        before = None
+        for j in range(idx - 1, -1, -1):
+            if paragraph_texts[j]:
+                before = paragraph_texts[j]
+                break
+        after = None
+        for j in range(idx + 1, total):
+            if paragraph_texts[j]:
+                after = paragraph_texts[j]
+                break
+        for target in targets:
+            contexts.setdefault(target, {'before': before, 'after': after})
+    return contexts
+
+
+def _doc_chat_extract_pdf_images(
+    path: Path,
+    session_id: str,
+    limit: int,
+    *,
+    min_width: int,
+    min_height: int,
+    stats: dict[str, int],
+) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
     try:
         doc = fitz.open(path)
@@ -2234,17 +2724,29 @@ def _doc_chat_extract_pdf_images(path: Path, session_id: str, limit: int) -> lis
         return images
     try:
         seen: set[int] = set()
+        context_map: dict[int, tuple[Optional[str], Optional[str]]] = {}
         for page_index, page in enumerate(doc):
-            page_images = page.get_images(full=True) or []
-            for img in page_images:
+            try:
+                raw = page.get_text('rawdict') or {}
+                page_blocks = raw.get('blocks') or []
+            except Exception:
+                page_blocks = []
+            if not page_blocks:
+                page_blocks = []
+            for block_index, block in enumerate(page_blocks):
+                if not isinstance(block, dict) or block.get('type') != 1:
+                    continue
                 try:
-                    xref = int(img[0])
+                    xref = int(block.get('image') or block.get('xref') or block.get('number') or 0)
+                except Exception:
+                    xref = 0
+                stats['candidates'] += 1
+                if not xref or xref in seen:
+                    continue
+                try:
+                    base_image = doc.extract_image(xref) or {}
                 except Exception:
                     continue
-                if xref in seen:
-                    continue
-                seen.add(xref)
-                base_image = doc.extract_image(xref) or {}
                 image_bytes = base_image.get('image')
                 if not image_bytes:
                     continue
@@ -2259,15 +2761,79 @@ def _doc_chat_extract_pdf_images(path: Path, session_id: str, limit: int) -> lis
                 except Exception:
                     continue
                 rel_path = f"cache/doc_chat/{session_id}/{filename}"
+                before_text = _doc_chat_pdf_neighbor_text(page_blocks, block_index, -1)
+                after_text = _doc_chat_pdf_neighbor_text(page_blocks, block_index, 1)
+                context_map[xref] = (before_text, after_text)
+                width = _doc_chat_safe_int(base_image.get('width'))
+                height = _doc_chat_safe_int(base_image.get('height'))
+                if not _doc_chat_image_meets_min_size(width, height, min_width, min_height):
+                    stats['skipped_size'] += 1
+                    seen.add(xref)
+                    continue
                 images.append({
                     'page': page_index + 1,
                     'ext': ext,
                     'rel_path': rel_path,
                     'path': str(file_path),
-                    'width': base_image.get('width'),
-                    'height': base_image.get('height'),
+                    'width': width,
+                    'height': height,
+                    'context_before': before_text,
+                    'context_after': after_text,
                 })
-                if len(images) >= limit:
+                stats['kept'] += 1
+                seen.add(xref)
+                if limit > 0 and len(images) >= limit:
+                    return images
+            try:
+                page_images = page.get_images(full=True) or []
+            except Exception:
+                page_images = []
+            for img in page_images:
+                try:
+                    xref = int(img[0])
+                except Exception:
+                    continue
+                stats['candidates'] += 1
+                if not xref or xref in seen:
+                    continue
+                try:
+                    base_image = doc.extract_image(xref) or {}
+                except Exception:
+                    continue
+                image_bytes = base_image.get('image')
+                if not image_bytes:
+                    continue
+                cache_dir = _doc_chat_get_cache_path(session_id)
+                if cache_dir is None:
+                    continue
+                ext = str(base_image.get('ext') or 'png').lower()
+                filename = f"page{page_index + 1:03d}_img{len(images) + 1:02d}.{ext}"
+                file_path = cache_dir / filename
+                try:
+                    file_path.write_bytes(image_bytes)
+                except Exception:
+                    continue
+                rel_path = f"cache/doc_chat/{session_id}/{filename}"
+                before_text, after_text = context_map.get(xref, (None, None))
+                width = _doc_chat_safe_int(base_image.get('width'))
+                height = _doc_chat_safe_int(base_image.get('height'))
+                if not _doc_chat_image_meets_min_size(width, height, min_width, min_height):
+                    stats['skipped_size'] += 1
+                    seen.add(xref)
+                    continue
+                images.append({
+                    'page': page_index + 1,
+                    'ext': ext,
+                    'rel_path': rel_path,
+                    'path': str(file_path),
+                    'width': width,
+                    'height': height,
+                    'context_before': before_text,
+                    'context_after': after_text,
+                })
+                stats['kept'] += 1
+                seen.add(xref)
+                if limit > 0 and len(images) >= limit:
                     return images
     finally:
         try:
@@ -2276,12 +2842,20 @@ def _doc_chat_extract_pdf_images(path: Path, session_id: str, limit: int) -> lis
             pass
     return images
 
-
-def _doc_chat_extract_docx_images(path: Path, session_id: str, limit: int) -> list[dict[str, Any]]:
+def _doc_chat_extract_docx_images(
+    path: Path,
+    session_id: str,
+    limit: int,
+    *,
+    min_width: int,
+    min_height: int,
+    stats: dict[str, int],
+) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
     try:
         import zipfile
         with zipfile.ZipFile(path) as zf:
+            context_map = _doc_chat_docx_image_context(zf)
             for name in zf.namelist():
                 if not name.startswith('word/media/'):
                     continue
@@ -2289,8 +2863,22 @@ def _doc_chat_extract_docx_images(path: Path, session_id: str, limit: int) -> li
                 if not data:
                     continue
                 ext = Path(name).suffix.lstrip('.').lower() or 'png'
+                width = None
+                height = None
+                if PILImage is not None:
+                    try:
+                        with PILImage.open(io.BytesIO(data)) as im:
+                            w, h = im.size
+                            width = int(w)
+                            height = int(h)
+                    except Exception:
+                        width = None
+                        height = None
+                stats['candidates'] += 1
                 cache_dir = _doc_chat_get_cache_path(session_id)
                 if cache_dir is None:
+                    continue
+                if not _doc_chat_image_meets_min_size(width, height, min_width, min_height):
                     continue
                 filename = f"docx{len(images) + 1:02d}.{ext}"
                 file_path = cache_dir / filename
@@ -2299,32 +2887,125 @@ def _doc_chat_extract_docx_images(path: Path, session_id: str, limit: int) -> li
                 except Exception:
                     continue
                 rel_path = f"cache/doc_chat/{session_id}/{filename}"
+                normalized_name = name.replace('\\', '/')
+                ctx = context_map.get(normalized_name)
                 images.append({
                     'page': None,
                     'ext': ext,
                     'rel_path': rel_path,
                     'path': str(file_path),
+                    'width': width,
+                    'height': height,
+                    'context_before': ctx.get('before') if ctx else None,
+                    'context_after': ctx.get('after') if ctx else None,
                 })
-                if len(images) >= limit:
+                stats['kept'] += 1
+                if limit > 0 and len(images) >= limit:
                     break
     except Exception:
         return images
     return images
 
 
-def _doc_chat_extract_images(source_path: Optional[Path], session_id: str, limit: int = DOC_CHAT_IMAGE_LIMIT) -> list[dict[str, Any]]:
+def _doc_chat_extract_images(source_path: Optional[Path], session_id: str, limit: int = DOC_CHAT_IMAGE_LIMIT) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    stats_template = {'candidates': 0, 'kept': 0, 'skipped_size': 0}
+    min_width, min_height = _doc_chat_image_min_settings()
+    stats_template['min_width'] = min_width
+    stats_template['min_height'] = min_height
     if not source_path or not source_path.exists():
-        return []
+        return [], stats_template
     ext = source_path.suffix.lower()
     if ext == '.pdf':
-        return _doc_chat_extract_pdf_images(source_path, session_id, limit)
+        result = _doc_chat_extract_pdf_images(
+            source_path,
+            session_id,
+            limit,
+            min_width=min_width,
+            min_height=min_height,
+            stats=stats_template,
+        )
+        return result, stats_template
     if ext == '.docx':
-        return _doc_chat_extract_docx_images(source_path, session_id, limit)
-    return []
+        result = _doc_chat_extract_docx_images(
+            source_path,
+            session_id,
+            limit,
+            min_width=min_width,
+            min_height=min_height,
+            stats=stats_template,
+        )
+        return result, stats_template
+    return [], stats_template
 
 
-def _doc_chat_enrich_images(images: list[dict[str, Any]], *, vision_enabled: bool) -> list[dict[str, Any]]:
+def _doc_chat_extract_image_ocr(image_path: Path, *, words_limit: int = 200) -> dict[str, Any]:
+    if pytesseract is None:
+        return {}
+    try:
+        data = pytesseract.image_to_data(
+            str(image_path),
+            output_type=pytesseract.Output.DICT,
+            lang=os.getenv('OCR_LANGS', 'rus+eng'),
+        )
+    except Exception as exc:
+        app.logger.debug("doc-chat: image OCR failed for %s: %s", image_path, exc)
+        return {}
+    words: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    total = int(data.get('level') and len(data.get('level'))) if isinstance(data, dict) else 0
+    if total <= 0:
+        total = len(data.get('text') or []) if isinstance(data, dict) else 0
+    for idx in range(total):
+        word = ""
+        try:
+            word = str((data.get('text') or [])[idx] or "").strip()
+        except Exception:
+            word = ""
+        if not word:
+            continue
+        try:
+            conf_raw = data.get('conf')[idx] if isinstance(data.get('conf'), list) else None
+            conf = float(conf_raw) if conf_raw is not None else None
+        except Exception:
+            conf = None
+        try:
+            left = int((data.get('left') or [0])[idx])
+            top = int((data.get('top') or [0])[idx])
+            width = int((data.get('width') or [0])[idx])
+            height = int((data.get('height') or [0])[idx])
+        except Exception:
+            left = top = width = height = 0
+        words.append({
+            'text': word,
+            'confidence': conf,
+            'bbox': [left, top, width, height],
+        })
+        text_parts.append(word)
+        if len(words) >= words_limit:
+            break
+    ocr_text = " ".join(text_parts).strip()
+    if not ocr_text:
+        return {}
+    preview = ocr_text[:400].strip()
+    has_math = _doc_chat_snippet_has_math(ocr_text)
+    return {
+        'text': ocr_text,
+        'preview': preview,
+        'words': words,
+        'has_math': has_math,
+    }
+
+
+def _doc_chat_enrich_images(
+    images: list[dict[str, Any]],
+    *,
+    vision_enabled: bool,
+    ocr_enabled: bool,
+    session_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
+    total = len(images)
+    processed = 0
     for image in images:
         entry = dict(image)
         rel_path = entry.get('rel_path')
@@ -2344,7 +3025,22 @@ def _doc_chat_enrich_images(images: list[dict[str, Any]], *, vision_enabled: boo
                 entry['vision_error'] = str(exc)
         if not entry.get('description'):
             entry['description'] = 'Описание не получено.' if vision_enabled else 'Анализ изображений отключён.'
+        if ocr_enabled and entry.get('path'):
+            try:
+                ocr_payload = _doc_chat_extract_image_ocr(Path(entry['path']))
+            except Exception as exc:
+                ocr_payload = {}
+                entry['ocr_error'] = str(exc)
+            if ocr_payload:
+                entry['ocr_text'] = ocr_payload.get('text')
+                entry['ocr_preview'] = ocr_payload.get('preview')
+                entry['ocr_words'] = ocr_payload.get('words')
+            entry['ocr_has_math'] = bool(ocr_payload.get('has_math'))
         enriched.append(entry)
+        processed += 1
+        if session_id and total > 0:
+            percent = 70 + min(15, (processed / total) * 15)
+            _doc_chat_progress(session_id, f"Обработано изображений: {processed}/{total}", percent=percent)
     return enriched
 
 
@@ -2441,12 +3137,20 @@ def _doc_chat_prepare_worker(session_id: str, file_id: int, user_id: int | None,
                 return
 
             runtime = _rt()
-            text, source_path = _collect_text_for_rag(file_obj, limit_chars=120_000)
+            text, source_path = _collect_text_for_rag(file_obj, limit_chars=DOC_CHAT_TEXT_LIMIT)
             if not text.strip():
                 raise RuntimeError("Не удалось извлечь текст из документа.")
             _doc_chat_progress(session_id, f"Извлечение текста завершено ({len(text)} символов)", percent=20)
+            _doc_chat_record_phase(session_id, 'Извлечение текста', details=f"{len(text)} символов")
 
-            chunk_config = ChunkConfig(max_tokens=700, overlap=120, min_tokens=80)
+            chunk_max_tokens = runtime.doc_chat_chunk_max_tokens or 700
+            chunk_overlap = runtime.doc_chat_chunk_overlap or 120
+            chunk_min_tokens = runtime.doc_chat_chunk_min_tokens or 80
+            chunk_config = ChunkConfig(
+                max_tokens=max(16, int(chunk_max_tokens)),
+                overlap=max(0, int(chunk_overlap)),
+                min_tokens=max(1, int(chunk_min_tokens)),
+            )
             indexer = RagIndexer(chunk_config=chunk_config, normalizer_version='v1')
             ingest_result = indexer.ingest_document(
                 file_obj,
@@ -2460,6 +3164,7 @@ def _doc_chat_prepare_worker(session_id: str, file_id: int, user_id: int | None,
             else:
                 chunks_count = int(ingest_result.get('chunks') or 0)
                 _doc_chat_progress(session_id, f"RAG: создано чанков {chunks_count}", percent=35)
+                _doc_chat_record_phase(session_id, 'Чанкование', details=f"{chunks_count} чанков")
 
             document = file_obj.rag_document
             if not document or not document.is_ready_for_rag:
@@ -2517,6 +3222,7 @@ def _doc_chat_prepare_worker(session_id: str, file_id: int, user_id: int | None,
                 _doc_chat_progress(session_id, f"Эмбеддинги обновлены: {created_embeddings}", percent=55)
             else:
                 _doc_chat_progress(session_id, "Эмбеддинги актуальны", percent=55)
+            _doc_chat_record_phase(session_id, 'Эмбеддинги', details=f"{created_embeddings or 0} новых")
 
             variant = _doc_chat_resolve_embedding_variant(document.id) or {
                 'model_name': embedding_info['model_name'],
@@ -2538,13 +3244,30 @@ def _doc_chat_prepare_worker(session_id: str, file_id: int, user_id: int | None,
                         source_path = candidate
                         break
 
-            images_raw = _doc_chat_extract_images(source_path if isinstance(source_path, Path) else None, session_id, DOC_CHAT_IMAGE_LIMIT)
+            images_raw, image_stats = _doc_chat_extract_images(
+                source_path if isinstance(source_path, Path) else None,
+                session_id,
+                DOC_CHAT_IMAGE_LIMIT,
+            )
             vision_enabled = bool(getattr(runtime, 'images_vision_enabled', False))
-            images_enriched = _doc_chat_enrich_images(images_raw, vision_enabled=vision_enabled) if images_raw else []
+            ocr_enabled = bool(getattr(runtime, 'images_ocr_enabled', pytesseract is not None)) and pytesseract is not None
+            images_enriched = _doc_chat_enrich_images(
+                images_raw,
+                vision_enabled=vision_enabled,
+                ocr_enabled=ocr_enabled,
+                session_id=session_id,
+            ) if images_raw else []
             if images_enriched:
                 _doc_chat_progress(session_id, f"Обработано изображений: {len(images_enriched)}", percent=80)
             else:
                 _doc_chat_progress(session_id, "Изображения не найдены", percent=70)
+            skip_count = image_stats.get('skipped_size', 0)
+            phase_details = [f"обработано {len(images_enriched)}"]
+            if skip_count:
+                phase_details.append(f"пропущено {skip_count} по размеру")
+            if image_stats.get('min_width') or image_stats.get('min_height'):
+                phase_details.append(f"min={image_stats.get('min_width')}×{image_stats.get('min_height')}")
+            _doc_chat_record_phase(session_id, 'Изображения', details=', '.join(phase_details))
 
             previews = _doc_chat_collect_chunk_previews(document.id)
 
@@ -2560,6 +3283,11 @@ def _doc_chat_prepare_worker(session_id: str, file_id: int, user_id: int | None,
                 'preview_chunks': previews,
                 'text_size': len(text),
                 'vision_enabled': vision_enabled,
+                'ocr_enabled': ocr_enabled,
+                'image_filter_summary': {
+                    **image_stats,
+                    'processed': len(images_enriched),
+                } if image_stats else {},
             }
             if source_path:
                 session_data['source_name'] = source_path.name
@@ -2703,6 +3431,11 @@ def setup_app(config: AppConfig | None = None, *, ensure_database: bool = True) 
         max_items=cfg.search_cache_max_items,
         ttl_seconds=cfg.search_cache_ttl_seconds,
     )
+    configure_llm_pool(
+        workers=cfg.llm_pool_global_concurrency,
+        per_user_limit=cfg.llm_pool_per_user_concurrency,
+        max_queue=cfg.llm_queue_max_size,
+    )
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -2725,11 +3458,12 @@ def setup_app(config: AppConfig | None = None, *, ensure_database: bool = True) 
     db.init_app(app)
     try:
         with app.app_context():
-            with db.engine.connect() as conn:
-                conn.execute(text("PRAGMA foreign_keys = 1"))
-                conn.execute(text("PRAGMA trusted_schema = 1"))
-                conn.execute(text("PRAGMA recursive_triggers = 1"))
-            db.engine.dispose()
+            if db.engine.dialect.name == 'sqlite':
+                with db.engine.connect() as conn:
+                    conn.execute(text("PRAGMA foreign_keys = 1"))
+                    conn.execute(text("PRAGMA trusted_schema = 1"))
+                    conn.execute(text("PRAGMA recursive_triggers = 1"))
+                db.engine.dispose()
     except Exception as pragma_exc:
         logger.warning('Failed to apply SQLite PRAGMA settings: %s', pragma_exc)
     _load_runtime_settings_from_disk()
@@ -2738,6 +3472,8 @@ def setup_app(config: AppConfig | None = None, *, ensure_database: bool = True) 
         app.register_blueprint(admin_bp)
     if 'users_api' not in app.blueprints:
         app.register_blueprint(users_bp)
+    if 'osint_api' not in app.blueprints:
+        app.register_blueprint(osint_bp)
     if ensure_database:
         _initialize_database_structures(app)
     with app.app_context():
@@ -3033,6 +3769,35 @@ def _llm_normalize_purposes(value) -> str | None:
     return ','.join(ordered) if ordered else None
 
 
+def _llm_pick_default_endpoint() -> LlmEndpoint | None:
+    """Pick endpoint used as default route in common settings."""
+    try:
+        eps = LlmEndpoint.query.order_by(LlmEndpoint.weight.desc(), LlmEndpoint.created_at.desc()).all()
+    except Exception:
+        return None
+    for ep in eps:
+        if 'default' in _llm_parse_purposes(ep.purpose):
+            return ep
+    return None
+
+
+def _sync_runtime_default_route_from_llm_endpoints() -> None:
+    """Persist current default endpoint into runtime global LLM route."""
+    ep = _llm_pick_default_endpoint()
+    if ep is None:
+        return
+    provider = str(ep.provider or '').strip().lower() or 'openai'
+    runtime_settings_store.apply_updates({
+        'LMSTUDIO_API_BASE': ep.base_url,
+        'LMSTUDIO_MODEL': ep.model,
+        'LMSTUDIO_API_KEY': ep.api_key or '',
+        'LM_DEFAULT_PROVIDER': provider,
+    })
+    _refresh_runtime_globals()
+    _rt().apply_to_flask_config(app)
+    _save_runtime_settings_to_disk()
+
+
 def _invalidate_llm_cache() -> None:
     LLM_ROUND_ROBIN.clear()
     LLM_ENDPOINT_SIGNATURE.clear()
@@ -3284,6 +4049,7 @@ def _llm_send_chat(
     cache_bucket: str | None = None,
     cache_only: bool | None = None,
 ):
+    _lmstudio_mark_activity()
     provider = _llm_choice_provider(choice)
     url = _llm_choice_url(choice)
     if not url:
@@ -3330,6 +4096,7 @@ def _llm_send_chat(
             'url': url,
             'model': model,
             'payload': payload,
+            'scope': _cache_scope_identity(),
         }
         cache_key = hashlib.sha256(json.dumps(cache_key_material, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
         cached_resp = llm_cache_get(cache_key)
@@ -3339,14 +4106,47 @@ def _llm_send_chat(
         if cache_only:
             raise RuntimeError('llm_cache_only_mode')
 
-    response = http_request(
-        'POST',
-        url,
-        headers=_llm_choice_headers(choice),
-        json=payload,
-        timeout=_llm_timeout_pair(timeout),
-        logger=app.logger,
-    )
+    owner_id: int | None = None
+    try:
+        req_user = _load_current_user()
+        if req_user is not None and getattr(req_user, 'id', None) is not None:
+            owner_id = int(req_user.id)
+    except Exception:
+        owner_id = None
+    retry_count = max(0, int(app.config.get('LLM_RETRY_COUNT', 1) or 0))
+    retry_backoff_ms = max(0, int(app.config.get('LLM_RETRY_BACKOFF_MS', 500) or 0))
+    pool_timeout = max(1, int(app.config.get('LLM_REQUEST_TIMEOUT_SEC', timeout) or timeout))
+    per_user_queue_max = max(1, int(app.config.get('LLM_QUEUE_PER_USER_MAX', 10) or 10))
+    response = None
+    last_exc: Exception | None = None
+    for attempt in range(retry_count + 1):
+        try:
+            response = get_llm_pool().submit_and_wait(
+                owner_id=owner_id,
+                timeout_sec=pool_timeout,
+                per_user_queue_max=per_user_queue_max,
+                fn=lambda: http_request(
+                    'POST',
+                    url,
+                    headers=_llm_choice_headers(choice),
+                    json=payload,
+                    timeout=_llm_timeout_pair(timeout),
+                    logger=app.logger,
+                ),
+            )
+        except LlmPoolRejected as exc:
+            raise RuntimeError(str(exc)) from exc
+        except LlmPoolTimeout as exc:
+            raise RuntimeError(str(exc)) from exc
+        except Exception as exc:
+            last_exc = exc
+            response = None
+        if response is not None and getattr(response, 'status_code', 0) < 500:
+            break
+        if attempt < retry_count and retry_backoff_ms > 0:
+            time.sleep(float(retry_backoff_ms) / 1000.0)
+    if response is None and last_exc is not None:
+        raise RuntimeError(f'llm_request_failed:{last_exc}')
 
     if response is None:
         raise RuntimeError('llm_response_none')
@@ -3376,6 +4176,7 @@ def _llm_send_chat(
         )
         cached.headers.setdefault('X-LLM-Cache', 'store')
         llm_cache_set(cache_key, cached)
+    _lmstudio_mark_activity()
     return provider, response
 
 
@@ -3572,6 +4373,504 @@ def require_admin(fn):
 
 admin_bp = Blueprint('admin_api', __name__, url_prefix='/api/admin')
 users_bp = Blueprint('users_api', __name__, url_prefix='/api/users')
+osint_bp = Blueprint('osint_api', __name__, url_prefix='/api/osint')
+
+_OSINT_SERVICE: OsintSearchService | None = None
+_OSINT_LOCK = threading.Lock()
+
+
+def _osint_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    token = str(raw).strip().lower()
+    return token in {"1", "true", "yes", "on"}
+
+
+def _osint_env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.getenv(name)
+    value = default
+    if raw is not None:
+        text = str(raw).strip()
+        if text:
+            try:
+                value = int(text)
+            except ValueError:
+                value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _osint_sanitize_params(raw: Mapping[str, Any] | None) -> dict[str, str] | None:
+    if not raw:
+        return None
+    sanitized: dict[str, str] = {}
+    for key, value in raw.items():
+        try:
+            k = str(key).strip()
+            if not k:
+                continue
+            sanitized[k] = str(value)
+        except Exception:
+            continue
+    return sanitized or None
+
+
+def _osint_llm_chat(messages: list[dict[str, str]]) -> dict:
+    max_tokens = _osint_env_int("OSINT_LLM_MAX_TOKENS", 512, minimum=64, maximum=2048)
+    timeout = _osint_env_int("OSINT_LLM_TIMEOUT_SECONDS", 120, minimum=30, maximum=300)
+    last_error: Exception | None = None
+    for choice in _llm_iter_choices("osint"):
+        label = _llm_choice_label(choice)
+        try:
+            provider, response = _llm_send_chat(
+                choice,
+                messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                cache_bucket="osint-serp",
+            )
+            if _llm_response_indicates_busy(response):
+                app.logger.info("OSINT LLM endpoint busy (%s)", label)
+                last_error = RuntimeError("busy")
+                continue
+            response.raise_for_status()
+            data = response.json()
+            content = _llm_extract_content(provider, data)
+            if content:
+                return {
+                    "content": content,
+                    "model": choice.get("model") or provider,
+                    "raw": getattr(response, "text", ""),
+                }
+            last_error = RuntimeError(f"empty response from {label}")
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            app.logger.info("OSINT LLM attempt failed (%s): %s", label, exc)
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("osint_llm_no_response")
+
+
+def _get_osint_service() -> OsintSearchService:
+    global _OSINT_SERVICE
+    if _OSINT_SERVICE is not None:
+        return _OSINT_SERVICE
+    with _OSINT_LOCK:
+        if _OSINT_SERVICE is not None:
+            return _OSINT_SERVICE
+        llm_enabled = _osint_env_bool("OSINT_LLM_ENABLED", True)
+        parser = SerpParser(
+            llm_chat=_osint_llm_chat if llm_enabled else None,
+            max_items=_osint_env_int("OSINT_MAX_ITEMS", 10, minimum=1, maximum=30),
+            max_html_chars=_osint_env_int("OSINT_MAX_HTML_CHARS", 20000, minimum=2000, maximum=120000),
+        )
+        retry_agents_env = os.getenv("OSINT_RETRY_USER_AGENTS") or ""
+        retry_agents = tuple(
+            filter(
+                None,
+                (token.strip() for token in retry_agents_env.split(",") if token.strip()),
+            )
+        )
+        retry_proxies_env = os.getenv("OSINT_RETRY_PROXIES") or ""
+        retry_proxies = tuple(
+            filter(
+                None,
+                (token.strip() for token in retry_proxies_env.replace(";", ",").split(",") if token.strip()),
+            )
+        )
+        search_api_url = os.getenv("OSINT_SEARCH_API_URL") or None
+        search_api_method = (os.getenv("OSINT_SEARCH_API_METHOD") or "POST").strip()
+        search_api_key = os.getenv("OSINT_SEARCH_API_KEY") or None
+        settings = SerpSettings(
+            cache_enabled=_osint_env_bool("OSINT_CACHE_ENABLED", True),
+            cache_ttl_seconds=_osint_env_int("OSINT_CACHE_TTL_SECONDS", 900, minimum=30, maximum=86400),
+            cache_max_items=_osint_env_int("OSINT_CACHE_MAX_ITEMS", 128, minimum=16, maximum=512),
+            wait_after_load_ms=_osint_env_int("OSINT_WAIT_AFTER_LOAD_MS", 1200, minimum=0, maximum=10000),
+            wait_selector=os.getenv("OSINT_WAIT_SELECTOR") or None,
+            navigation_timeout_ms=_osint_env_int("OSINT_NAVIGATION_TIMEOUT_MS", 45000, minimum=5000, maximum=240000),
+            reuse_cache_on_block=_osint_env_bool("OSINT_REUSE_CACHE_ON_BLOCK", True),
+            user_agent_override=os.getenv("OSINT_USER_AGENT") or None,
+            retry_user_agents=retry_agents,
+            retry_proxies=retry_proxies,
+            search_api_url=search_api_url,
+            search_api_method=search_api_method,
+            search_api_key=search_api_key,
+        )
+        fetcher = SerpFetcher(settings=settings)
+        repo_config = OsintRepositoryConfig(
+            url=os.getenv("OSINT_DATABASE_URL") or None,
+            echo=_osint_env_bool("OSINT_DB_ECHO", False),
+        )
+        _OSINT_SERVICE = OsintSearchService(
+            fetcher=fetcher,
+            parser=parser,
+            repository_config=repo_config,
+        )
+        return _OSINT_SERVICE
+
+
+@osint_bp.route('/engines', methods=['GET'])
+def api_osint_engines():
+    _require_admin()
+    return jsonify({'ok': True, 'engines': list(SUPPORTED_ENGINES)})
+
+
+@osint_bp.route('/history', methods=['GET'])
+def api_osint_history():
+    _require_admin()
+    try:
+        limit = int(request.args.get('limit', '10') or '10')
+    except Exception:
+        limit = 10
+    limit = max(1, min(limit, 50))
+    service = _get_osint_service()
+    items = service.list_jobs(limit)
+    return jsonify({'ok': True, 'items': items})
+
+
+@osint_bp.route('/search', methods=['POST'])
+def api_osint_search():
+    user = _require_admin()
+    data = request.get_json(silent=True) or {}
+    query = (data.get('query') or '').strip()
+    if not query:
+        return jsonify({'ok': False, 'error': 'Укажите поисковый запрос'}), 400
+    locale = (data.get('locale') or 'ru-RU').strip() or 'ru-RU'
+    if locale not in SUPPORTED_OSINT_LOCALES:
+        locale = SUPPORTED_OSINT_LOCALES[0]
+    region = data.get('region')
+    if region is not None:
+        region = str(region).strip() or None
+    safe = bool(data.get('safe'))
+    include_html = bool(data.get('include_html'))
+    include_llm = bool(data.get('include_llm_payload'))
+    build_ontology = bool(data.get('build_ontology'))
+    schedule_payload = data.get('schedule')
+    if schedule_payload is not None and not isinstance(schedule_payload, Mapping):
+        return jsonify({'ok': False, 'error': 'Поле schedule должно быть объектом'}), 400
+    max_results_value = data.get('max_results')
+    max_results: int | None = None
+    if max_results_value not in (None, ''):
+        try:
+            max_results = int(max_results_value)
+        except Exception:
+            return jsonify({'ok': False, 'error': 'Некорректное значение max_results'}), 400
+        max_results = max(1, min(max_results, 50))
+
+    locales = OsintSearchService._normalize_requested_locales(data.get('locales'), locale)
+    raw_sources = data.get('sources')
+    sources: list[dict]
+    if raw_sources is None:
+        engine_raw = str(data.get('engine') or 'google').strip().lower()
+        if engine_raw not in SUPPORTED_ENGINES:
+            return jsonify({
+                'ok': False,
+                'error': 'Неподдерживаемая поисковая система',
+                'supported': list(SUPPORTED_ENGINES),
+            }), 400
+        sources = [{'type': 'engine', 'engine': engine_raw}]
+    elif isinstance(raw_sources, list):
+        sources = []
+        for entry in raw_sources:
+            if isinstance(entry, str):
+                engine_candidate = entry.strip().lower()
+                if engine_candidate not in SUPPORTED_ENGINES and engine_candidate != 'local':
+                    return jsonify({
+                        'ok': False,
+                        'error': f"Неподдерживаемый источник: {entry}",
+                        'supported': list(SUPPORTED_ENGINES) + ['local'],
+                    }), 400
+                if engine_candidate == 'local':
+                    sources.append({'type': 'local'})
+                else:
+                    sources.append({'type': 'engine', 'engine': engine_candidate})
+            elif isinstance(entry, Mapping):
+                obj = dict(entry)
+                src_type = str(obj.get('type') or obj.get('source') or obj.get('engine') or '').lower()
+                if src_type in SUPPORTED_ENGINES:
+                    obj['type'] = 'engine'
+                    obj['engine'] = src_type
+                elif src_type in {'local', 'filesystem', 'catalog'}:
+                    obj['type'] = 'local'
+                    if src_type in {'filesystem', 'catalog'}:
+                        options = dict(obj.get('options') or {})
+                        options.setdefault('mode', src_type)
+                        obj['options'] = options
+                elif obj.get('engine'):
+                    eng = str(obj['engine']).lower()
+                    if eng not in SUPPORTED_ENGINES:
+                        return jsonify({
+                            'ok': False,
+                            'error': f"Неподдерживаемая поисковая система: {eng}",
+                            'supported': list(SUPPORTED_ENGINES),
+                        }), 400
+                    obj['engine'] = eng
+                    obj['type'] = 'engine'
+                else:
+                    return jsonify({'ok': False, 'error': f"Неподдерживаемый источник: {entry}"}), 400
+                sources.append(obj)
+            else:
+                return jsonify({'ok': False, 'error': f"Неподдерживаемый источник: {entry}"}), 400
+    else:
+        return jsonify({'ok': False, 'error': 'Поле sources должно быть массивом'}), 400
+
+    for src in sources:
+        if src.get('type') == 'engine':
+            engine_name = str(src.get('engine') or '').lower()
+            if engine_name not in SUPPORTED_ENGINES:
+                return jsonify({
+                    'ok': False,
+                    'error': f"Неподдерживаемая поисковая система: {engine_name}",
+                    'supported': list(SUPPORTED_ENGINES),
+                }), 400
+            src.setdefault('max_results', max_results)
+            src.setdefault('force_refresh', bool(data.get('force_refresh')))
+            extra_params_raw = src.get('extra_params')
+            if extra_params_raw and isinstance(extra_params_raw, Mapping):
+                src['extra_params'] = _osint_sanitize_params(extra_params_raw)
+        elif src.get('type') == 'local':
+            opts = dict(src.get('options') or {})
+            if src.get('mode'):
+                opts.setdefault('mode', src.get('mode'))
+            src['options'] = opts
+
+    service = _get_osint_service()
+    try:
+        job = service.start_job(
+            query=query,
+            locale=locale,
+            region=region,
+            safe=safe,
+            sources=sources,
+            params={
+                "include_html": include_html,
+                "include_llm_payload": include_llm,
+                "max_results": max_results,
+                "build_ontology": build_ontology,
+                "locales": locales,
+                **({"schedule": schedule_payload} if schedule_payload is not None else {}),
+            },
+            user_id=getattr(user, "id", None),
+        )
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("OSINT search failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'Не удалось выполнить поиск', 'details': str(exc)}), 500
+    try:
+        _log_user_action(
+            user,
+            'osint_search_start',
+            'osint',
+            job.get('id'),
+            detail=json.dumps({'query': query, 'sources': sources}, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'job': job})
+
+
+@osint_bp.route('/jobs/<int:job_id>/schedule', methods=['POST'])
+def api_osint_job_schedule(job_id: int):
+    user = _require_admin()
+    payload = request.get_json(silent=True) or {}
+    schedule_data = payload.get('schedule') if isinstance(payload.get('schedule'), Mapping) else payload
+    service = _get_osint_service()
+    try:
+        job = service.update_schedule(job_id, schedule_data)
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("OSINT schedule update failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'Не удалось обновить расписание', 'details': str(exc)}), 500
+    try:
+        _log_user_action(
+            user,
+            'osint_schedule_update',
+            'osint',
+            job_id,
+            detail=json.dumps(schedule_data or {}, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'job': job})
+
+
+@osint_bp.route('/artifacts/<path:relative_path>', methods=['GET'])
+def api_osint_artifact(relative_path: str):
+    _require_admin()
+    try:
+        artifact_path = resolve_artifact_path(relative_path)
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'invalid_artifact_path'}), 400
+    if not artifact_path.exists() or not artifact_path.is_file():
+        return jsonify({'ok': False, 'error': 'artifact_not_found'}), 404
+    return send_file(artifact_path, conditional=True)
+
+
+@osint_bp.route('/jobs/<int:job_id>', methods=['GET', 'DELETE'])
+def api_osint_job_detail(job_id: int):
+    user = _require_admin()
+    service = _get_osint_service()
+    if request.method == 'DELETE':
+        deleted = service.delete_job(job_id)
+        if not deleted:
+            return jsonify({'ok': False, 'error': 'Задача не найдена'}), 404
+        try:
+            _log_user_action(user, 'osint_search_delete', 'osint', job_id)
+        except Exception:
+            pass
+        return jsonify({'ok': True})
+    snapshot = service.get_job(job_id)
+    if not snapshot:
+        return jsonify({'ok': False, 'error': 'Задача не найдена'}), 404
+    return jsonify({'ok': True, 'job': snapshot})
+
+
+@osint_bp.route('/jobs/<int:job_id>/export', methods=['GET'])
+def api_osint_job_export(job_id: int):
+    _require_admin()
+    service = _get_osint_service()
+    format_param = (request.args.get('format') or 'markdown').strip().lower()
+    if format_param not in {'markdown', 'json'}:
+        return jsonify({'ok': False, 'error': 'Поддерживаются только форматы markdown/json'}), 400
+    snapshot = service.get_job(job_id)
+    if not snapshot:
+        return jsonify({'ok': False, 'error': 'Задача не найдена'}), 404
+    if format_param == 'json':
+        payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        response = make_response(payload)
+        response.headers['Content-Type'] = 'application/json; charset=utf-8'
+        response.headers['Content-Disposition'] = f'attachment; filename="osint-job-{job_id}.json"'
+        return response
+    try:
+        markdown = service.export_job_markdown(job_id)
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'Задача не найдена'}), 404
+    response = make_response(markdown)
+    response.headers['Content-Type'] = 'text/markdown; charset=utf-8'
+    response.headers['Content-Disposition'] = f'attachment; filename="osint-job-{job_id}.md"'
+    return response
+
+
+@osint_bp.route('/jobs/<int:job_id>/sources/<source_id>/retry', methods=['POST'])
+def api_osint_job_retry_source(job_id: int, source_id: str):
+    _require_admin()
+    payload = request.get_json(silent=True) or {}
+    force_refresh = bool(payload.get('force_refresh', True))
+    service = _get_osint_service()
+    try:
+        snapshot = service.retry_source(job_id, source_id, force_refresh=force_refresh)
+    except ValueError as exc:
+        message = str(exc)
+        if message == "osint_job_not_found":
+            return jsonify({'ok': False, 'error': 'Задача не найдена'}), 404
+        if message == "osint_source_not_found":
+            return jsonify({'ok': False, 'error': 'Источник не найден'}), 404
+        return jsonify({'ok': False, 'error': message}), 400
+    return jsonify({'ok': True, 'job': snapshot})
+
+
+@osint_bp.route('/browser/<source_id>', methods=['GET', 'POST'])
+def api_osint_browser(source_id: str):
+    if source_id is None:
+        abort(404)
+    target_url = request.args.get('next') or request.args.get('url')
+    if not target_url:
+        return jsonify({'ok': False, 'error': 'missing_target_url'}), 400
+    method = request.method
+    params = None
+    data = None
+    if method == 'GET':
+        params = {key: value for key, value in request.args.items() if key not in {'next', 'url'}}
+    else:
+        data = request.form.to_dict(flat=False)
+    try:
+        proxied = fetch_proxied_page(
+            source_id,
+            target_url,
+            method=method,
+            params=params or None,
+            data=data or None,
+            allow_redirects=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 502
+    html_content = rewrite_html_for_proxy(source_id, target_url, proxied.text)
+    response = make_response(html_content, proxied.status_code)
+    response.headers['Content-Type'] = proxied.headers.get('Content-Type', 'text/html')
+    response.headers['X-Frame-Options'] = 'ALLOWALL'
+    response.headers['Content-Security-Policy'] = "frame-ancestors *"
+    return response
+
+
+@osint_bp.route('/browser-session', methods=['POST'])
+def api_osint_browser_session():
+    _require_admin()
+    data = request.get_json(silent=True) or {}
+    source_id = (data.get('source_id') or '').strip()
+    url = (data.get('url') or '').strip()
+    if not source_id or not url:
+        return jsonify({'ok': False, 'error': 'source_id_and_url_required'}), 400
+    try:
+        session = remote_browser_manager.create(source_id, url)
+    except Exception as exc:
+        app.logger.exception("remote browser creation failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'remote_browser_failed'}), 500
+    return jsonify({'ok': True, 'viewport': session.viewport()})
+
+
+@osint_bp.route('/browser-session/<source_id>/snapshot', methods=['GET'])
+def api_osint_browser_session_snapshot(source_id: str):
+    _require_admin()
+    session = remote_browser_manager.get(source_id)
+    if not session:
+        return jsonify({'ok': False, 'error': 'session_not_found'}), 404
+    image = session.screenshot()
+    if not image:
+        return jsonify({'ok': False, 'error': 'snapshot_unavailable'}), 204
+    return Response(image, mimetype='image/png')
+
+
+@osint_bp.route('/browser-session/<source_id>/action', methods=['POST'])
+def api_osint_browser_session_action(source_id: str):
+    _require_admin()
+    session = remote_browser_manager.get(source_id)
+    if not session:
+        return jsonify({'ok': False, 'error': 'session_not_found'}), 404
+    data = request.get_json(silent=True) or {}
+    action_type = (data.get('type') or '').strip().lower()
+    viewport = session.viewport()
+    try:
+        if action_type == 'click':
+            rel_x = float(data.get('x', 0))
+            rel_y = float(data.get('y', 0))
+            x = rel_x * viewport.get('width', 1366)
+            y = rel_y * viewport.get('height', 768)
+            session.click(x, y)
+        elif action_type == 'type':
+            text = str(data.get('text') or '')
+            session.type_text(text)
+        else:
+            return jsonify({'ok': False, 'error': 'unsupported_action'}), 400
+    except Exception as exc:
+        app.logger.exception("remote browser action failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'action_failed'}), 500
+    return jsonify({'ok': True})
+
+
+@osint_bp.route('/browser-session/<source_id>', methods=['DELETE'])
+def api_osint_browser_session_close(source_id: str):
+    _require_admin()
+    remote_browser_manager.close(source_id)
+    return jsonify({'ok': True})
 
 def _admin_count(exclude_id: int | None = None) -> int:
     q = User.query.filter(User.role == 'admin')
@@ -3720,20 +5019,33 @@ def ensure_collections_schema():
             try:
                 from sqlalchemy import text as _text
                 with db.engine.begin() as conn:
-                    rows = list(conn.execute(_text("PRAGMA table_info(files)")))
-                    cols = {r[1] for r in rows}
-                    if 'collection_id' not in cols:
+                    insp = sa_inspect(conn)
+
+                    def _columns(table_name: str) -> set[str]:
+                        try:
+                            return {str(col.get("name")) for col in insp.get_columns(table_name)}
+                        except Exception:
+                            return set()
+
+                    files_cols = _columns("files")
+                    if "collection_id" not in files_cols:
                         conn.execute(_text("ALTER TABLE files ADD COLUMN collection_id INTEGER"))
-                    rows = list(conn.execute(_text("PRAGMA table_info(collections)")))
-                    ccols = {r[1] for r in rows}
-                    if 'owner_id' not in ccols:
+
+                    collections_cols = _columns("collections")
+                    if "owner_id" not in collections_cols:
                         conn.execute(_text("ALTER TABLE collections ADD COLUMN owner_id INTEGER"))
-                    if 'is_private' not in ccols:
-                        conn.execute(_text("ALTER TABLE collections ADD COLUMN is_private BOOLEAN NOT NULL DEFAULT 0"))
-                    rows = list(conn.execute(_text("PRAGMA table_info(users)")))
-                    ucols = {r[1] for r in rows}
-                    if 'full_name' not in ucols:
+                    if "is_private" not in collections_cols:
+                        conn.execute(_text("ALTER TABLE collections ADD COLUMN is_private BOOLEAN NOT NULL DEFAULT FALSE"))
+
+                    users_cols = _columns("users")
+                    if "full_name" not in users_cols:
                         conn.execute(_text("ALTER TABLE users ADD COLUMN full_name TEXT"))
+
+                    tasks_cols = _columns("task_records")
+                    if "user_id" not in tasks_cols:
+                        conn.execute(_text("ALTER TABLE task_records ADD COLUMN user_id INTEGER"))
+                    if "collection_id" not in tasks_cols:
+                        conn.execute(_text("ALTER TABLE task_records ADD COLUMN collection_id INTEGER"))
             except Exception:
                 pass
             # Убедиться, что базовая коллекция существует
@@ -3761,10 +5073,14 @@ def ensure_llm_schema():
             try:
                 from sqlalchemy import text as _text
                 with db.engine.begin() as conn:
-                    rows = list(conn.execute(_text("PRAGMA table_info(llm_endpoints)")))
-                    cols = {r[1] for r in rows}
-                    if 'provider' not in cols:
+                    insp = sa_inspect(conn)
+                    cols = {str(col.get("name")) for col in insp.get_columns("llm_endpoints")}
+                    if "provider" not in cols:
                         conn.execute(_text("ALTER TABLE llm_endpoints ADD COLUMN provider TEXT DEFAULT 'openai'"))
+                    if "context_length" not in cols:
+                        conn.execute(_text("ALTER TABLE llm_endpoints ADD COLUMN context_length INTEGER"))
+                    if "instances" not in cols:
+                        conn.execute(_text("ALTER TABLE llm_endpoints ADD COLUMN instances INTEGER NOT NULL DEFAULT 1"))
             except Exception:
                 pass
     except Exception:
@@ -3777,6 +5093,184 @@ def _ensure_llm_schema_once():
         return
     ensure_llm_schema()
     LLM_SCHEMA_READY = True
+
+
+def _lmstudio_base_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/v1"):
+        return base[:-3]
+    return base
+
+
+def _lmstudio_headers(api_key: str | None) -> dict:
+    headers = {"Content-Type": "application/json"}
+    token = str(api_key or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _lmstudio_extract_models(payload: object) -> list[dict]:
+    """Extract model list from LM Studio responses across versions/formats."""
+
+    def _iter_candidate_nodes(node: object):
+        if isinstance(node, list):
+            for item in node:
+                yield item
+                yield from _iter_candidate_nodes(item)
+        elif isinstance(node, dict):
+            # prioritize common top-level containers
+            for key in ("data", "models", "available", "loaded", "items", "results"):
+                value = node.get(key)
+                if isinstance(value, (list, dict)):
+                    yield value
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    yield from _iter_candidate_nodes(value)
+
+    def _pick_id_from_dict(d: dict) -> str:
+        for key in (
+            "id",
+            "key",
+            "model",
+            "model_id",
+            "modelId",
+            "model_key",
+            "modelKey",
+            "identifier",
+            "slug",
+            "uid",
+            "path",
+            "name",
+        ):
+            value = d.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        model_node = d.get("model")
+        if isinstance(model_node, dict):
+            for key in ("id", "key", "identifier", "name", "modelKey"):
+                value = model_node.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    def _normalize_item(item: object) -> dict | None:
+        if isinstance(item, str):
+            token = item.strip()
+            if not token:
+                return None
+            return {"id": token, "name": token, "loaded": None}
+        if not isinstance(item, dict):
+            return None
+        ident = _pick_id_from_dict(item)
+        if not ident:
+            return None
+        loaded_raw = item.get("loaded")
+        if loaded_raw is None:
+            state = str(item.get("state") or item.get("status") or "").strip().lower()
+            if state:
+                loaded_raw = state in {"loaded", "active", "ready"}
+        loaded = bool(loaded_raw) if loaded_raw is not None else None
+        model_node = item.get("model") if isinstance(item.get("model"), dict) else None
+        name = str(
+            item.get("name")
+            or item.get("display_name")
+            or item.get("displayName")
+            or item.get("title")
+            or (model_node.get("name") if model_node else None)
+            or ident
+        ).strip() or ident
+        return {"id": ident, "name": name, "loaded": loaded}
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    roots: list[object] = [payload]
+    roots.extend(list(_iter_candidate_nodes(payload)))
+    for root in roots:
+        if isinstance(root, list):
+            iterable = root
+        elif isinstance(root, dict):
+            iterable = [root]
+        else:
+            continue
+        for raw in iterable:
+            norm = _normalize_item(raw)
+            if not norm:
+                continue
+            ident = norm["id"]
+            if ident in seen:
+                continue
+            seen.add(ident)
+            out.append(norm)
+    return out
+
+
+def _lmstudio_mark_activity() -> None:
+    global LMSTUDIO_LAST_ACTIVITY_TS, LMSTUDIO_IDLE_UNLOADED
+    with LMSTUDIO_IDLE_LOCK:
+        LMSTUDIO_LAST_ACTIVITY_TS = time.time()
+        LMSTUDIO_IDLE_UNLOADED = False
+
+
+def _lmstudio_unload_all_if_idle() -> None:
+    global LMSTUDIO_IDLE_UNLOADED
+    idle_minutes = max(0, int(getattr(_rt(), "lmstudio_idle_unload_minutes", 0) or 0))
+    if idle_minutes <= 0:
+        return
+    with LMSTUDIO_IDLE_LOCK:
+        elapsed = time.time() - LMSTUDIO_LAST_ACTIVITY_TS
+        if elapsed < idle_minutes * 60:
+            return
+        if LMSTUDIO_IDLE_UNLOADED:
+            return
+        LMSTUDIO_IDLE_UNLOADED = True
+    try:
+        endpoints = LlmEndpoint.query.all()
+    except Exception:
+        endpoints = []
+    seen: set[tuple[str, str]] = set()
+    for ep in endpoints:
+        if (ep.provider or "openai") not in {"openai", "openrouter", "azure_openai"}:
+            continue
+        base = _lmstudio_base_url(ep.base_url)
+        model = str(ep.model or "").strip()
+        if not base or not model:
+            continue
+        ident = (base, model)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        try:
+            http_request(
+                "POST",
+                f"{base}/api/v1/models/unload",
+                headers=_lmstudio_headers(ep.api_key),
+                json={"model": model},
+                timeout=(HTTP_CONNECT_TIMEOUT, max(10, HTTP_DEFAULT_TIMEOUT)),
+                logger=app.logger,
+            )
+        except Exception:
+            app.logger.debug("LM Studio idle unload failed for %s / %s", base, model)
+
+
+def _start_lmstudio_idle_unload_scheduler() -> None:
+    global LMSTUDIO_IDLE_UNLOAD_THREAD_STARTED
+    if LMSTUDIO_IDLE_UNLOAD_THREAD_STARTED:
+        return
+
+    def loop():
+        while True:
+            try:
+                with app.app_context():
+                    _lmstudio_unload_all_if_idle()
+            except Exception:
+                app.logger.exception("LM Studio idle unload loop error")
+            time.sleep(30)
+
+    threading.Thread(target=loop, name="lmstudio-idle-unloader", daemon=True).start()
+    LMSTUDIO_IDLE_UNLOAD_THREAD_STARTED = True
 
 # ------------------- Вспомогательные функции безопасности путей -------------------
 def _resolve_under_base(rel_path: str) -> tuple[Path, Path | None]:
@@ -3829,6 +5323,12 @@ def health_check():
     if queue_status != 'ok':
         overall_status = 'degraded'
     checks['task_queue'] = {'status': queue_status, 'stats': queue_stats}
+    llm_stats = get_llm_pool().stats()
+    llm_status = 'ok'
+    if int(llm_stats.get('queued') or 0) >= int(llm_stats.get('max_queue') or 1):
+        llm_status = 'warning'
+        overall_status = 'degraded'
+    checks['llm_queue'] = {'status': llm_status, 'stats': llm_stats}
 
     # Проверка фонового шедулера очистки кэша
     if CACHE_CLEANUP_INTERVAL_HOURS > 0 and not _CLEANUP_THREAD_STARTED:
@@ -3844,10 +5344,14 @@ def health_check():
 def metrics():
     lines: list[str] = []
     queue_stats = get_task_queue().stats()
+    llm_pool_stats = get_llm_pool().stats()
     lines.append(f"task_queue_queued {queue_stats.get('queued', 0)}")
     lines.append(f"task_queue_workers {queue_stats.get('workers', 0)}")
     lines.append(f"task_queue_started {int(bool(queue_stats.get('started')))}")
     lines.append(f"task_queue_shutdown {int(bool(queue_stats.get('shutdown')))}")
+    lines.append(f"llm_queue_queued {llm_pool_stats.get('queued', 0)}")
+    lines.append(f"llm_queue_running {llm_pool_stats.get('running', 0)}")
+    lines.append(f"llm_pool_workers {llm_pool_stats.get('workers', 0)}")
 
     try:
         totals = (
@@ -3977,7 +5481,14 @@ def api_import_jobs_create():
         'initial_preview': initial_preview,
     }
     try:
-        task = TaskRecord(name='import_file', status='queued', payload=json.dumps(payload, ensure_ascii=False), progress=0.0)
+        task = TaskRecord(
+            name='import_file',
+            status='queued',
+            payload=json.dumps(payload, ensure_ascii=False),
+            progress=0.0,
+            user_id=user.id,
+            collection_id=collection_id,
+        )
         db.session.add(task)
         db.session.commit()
     except Exception as exc:
@@ -4233,8 +5744,14 @@ def _import_file_record(
                 fobj.material_type = 'audio'
             elif ext in IMAGE_EXTS:
                 fobj.material_type = 'image'
-            elif TYPE_LLM_OVERRIDE and mt_meta:
-                fobj.material_type = mt_meta
+            else:
+                merged_type = _merge_llm_material_type(
+                    fobj.material_type,
+                    mt_meta,
+                    allow_override=bool(TYPE_LLM_OVERRIDE),
+                )
+                if merged_type:
+                    fobj.material_type = merged_type
             title_meta = (metadata.get('title') or '').strip()
             if title_meta:
                 fobj.title = title_meta
@@ -4263,6 +5780,15 @@ def _import_file_record(
             except Exception:
                 db.session.rollback()
                 db.session.add(fobj)
+    try:
+        _apply_metadata_quality_rules(
+            fobj,
+            ext=ext,
+            text_excerpt=fobj.text_excerpt or "",
+            filename=save_path.stem,
+        )
+    except Exception:
+        pass
 
     try:
         _sync_file_to_fts(fobj)
@@ -4300,7 +5826,17 @@ def _enqueue_import_job(task_id: int, spec: dict, description: str | None = None
     def _runner():
         _run_import_job(task_id, spec)
 
-    get_task_queue().submit(_runner, description=description or f"import-{spec.get('filename', '')}")
+    owner_id = None
+    try:
+        if spec.get('user_id') is not None:
+            owner_id = int(spec.get('user_id'))
+    except Exception:
+        owner_id = None
+    get_task_queue().submit(
+        _runner,
+        description=description or f"import-{spec.get('filename', '')}",
+        owner_id=owner_id,
+    )
 
 
 def _run_import_job(task_id: int, spec: dict) -> None:
@@ -4614,6 +6150,7 @@ def import_files():
                 0,
                 paths_for_scan,
                 description="scan-import-batch",
+                owner_id=getattr(_load_current_user(), 'id', None),
             )
             scan_started = True
 
@@ -4890,6 +6427,30 @@ def sha1_of_file(fp: Path, chunk=1<<20):
             h.update(b)
     return h.hexdigest()
 
+def _count_matches(text: str, pattern: str) -> int:
+    try:
+        return len(re.findall(pattern, text))
+    except Exception:
+        return 0
+
+
+def _analyze_extracted_text(text: str) -> dict[str, Any]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return {"has_text": False, "suspicious_mojibake": False}
+    letters = _count_matches(normalized, r"[A-Za-zА-Яа-яЁё]")
+    cyrillic = _count_matches(normalized, r"[А-Яа-яЁё]")
+    mojibake_markers = _count_matches(normalized, r"[ÐÑÃâ\uFFFD]")
+    mojibake_pairs = _count_matches(normalized, r"(?:Ð.|Ñ.|Ã.|â.)")
+    marker_ratio = (mojibake_markers / len(normalized)) if normalized else 0.0
+    cyrillic_ratio = (cyrillic / letters) if letters else 0.0
+    suspicious = (
+        mojibake_pairs >= 6
+        or (marker_ratio > 0.03 and cyrillic_ratio < 0.05 and letters >= 40)
+        or (mojibake_markers >= 20 and cyrillic == 0)
+    )
+    return {"has_text": True, "suspicious_mojibake": suspicious}
+
 def extract_text_pdf(fp: Path, limit_chars=40000, force_ocr_first_page: bool = False):
     """Извлечение текста из PDF.
     Fallback: если текста крайне мало — OCR до первых 5 страниц (если установлен pytesseract).
@@ -4897,106 +6458,97 @@ def extract_text_pdf(fp: Path, limit_chars=40000, force_ocr_first_page: bool = F
     """
     try:
         import time as _time
-        doc = fitz.open(fp)
-        text_parts = []
+        import tempfile
         max_ocr_pages = int(os.getenv('PDF_OCR_PAGES', '5'))
+        ocr_langs = os.getenv('OCR_LANGS', 'rus+eng')
         used_ocr_pages = 0
         ocr_time_total = 0.0
-        # Попробуем первые N страниц улучшить OCR-ом, если обычный текст слишком скуден
-        for idx, page in enumerate(doc):
-            raw = page.get_text("text") or ""
-            # Для диссертаций может потребоваться OCR первой страницы независимо от настроек
-            if idx == 0 and force_ocr_first_page and pytesseract is not None:
-                try:
-                    t0 = _time.time()
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
-                        pix.save(tf.name)
-                        ocr = pytesseract.image_to_string(tf.name, lang=os.getenv('OCR_LANGS', 'rus+eng'))
-                        if (ocr or '').strip():
-                            # если есть оригинальный текст, добавляем OCR в начало; иначе заменяем
-                            if len((raw or '').strip()) < 200:
-                                raw = (ocr or '')
-                            else:
-                                raw = (ocr or '') + "\n" + raw
-                            used_ocr_pages += 1
-                    ocr_time_total += (_time.time() - t0)
-                except Exception as oe:
-                    app.logger.info(f"OCR(first page) failed for {fp}: {oe}")
-            # Эвристический OCR первых N страниц, когда исходный текст слишком короткий
-            if idx < max_ocr_pages and pytesseract is not None and len((raw or '').strip()) < 30:
-                try:
-                    t0 = _time.time()
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
-                        pix.save(tf.name)
-                        ocr = pytesseract.image_to_string(tf.name, lang=os.getenv('OCR_LANGS', 'rus+eng'))
-                        if (ocr or '').strip():
-                            raw = (ocr or '')
-                            used_ocr_pages += 1
-                    ocr_time_total += (_time.time() - t0)
-                except Exception as oe:
-                    app.logger.info(f"OCR failed for page {idx} {fp}: {oe}")
-            text_parts.append(raw)
-            if sum(len(x) for x in text_parts) >= limit_chars:
-                break
-        text = "\n".join(text_parts)
-        # Эвристика: выявляем «кашу» в тексте (защита от копирования/битые глифы) и переходим к OCR
-        try:
-            def _ratio_latin_cyr(s: str) -> float:
-                if not s:
-                    return 0.0
-                good = sum(1 for ch in s if ('a' <= ch.lower() <= 'z') or ('а' <= ch.lower() <= 'я') or (ch in 'ёЁ'))
-                return good / max(1, len(s))
-            # очень мало латинских/кириллических букв и много символов
-            rat = _ratio_latin_cyr(text)
-            if len(text) >= 400 and rat < 0.15 and pytesseract is not None:
-                tstart = _time.time()
-                text_ocr = []
-                pages_to_ocr = min(len(doc), int(os.getenv('PDF_OCR_PAGES', '5')))
-                for idx in range(pages_to_ocr):
-                    page = doc[idx]
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
-                        pix.save(tf.name)
-                        ocr = pytesseract.image_to_string(tf.name, lang=os.getenv('OCR_LANGS', 'rus+eng'))
-                        if ocr:
-                            text_ocr.append(ocr)
-                if text_ocr:
-                    text = ("\n".join(text_ocr) or text)[:limit_chars]
-                    used_ocr_pages = max(used_ocr_pages, pages_to_ocr)
-                    ocr_time_total += (_time.time() - tstart)
-                    try:
-                        _scan_log("OCR: заменил искажённый текст извлечённым OCR")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        # Резервный проход: если после обработки текст остаётся коротким — выполняем OCR до 5 страниц без условия длины
-        if len(text.strip()) < 200 and pytesseract is not None:
-            try:
-                tstart = _time.time()
-                text_ocr = []
-                pages_to_ocr = min(len(doc), int(os.getenv('PDF_OCR_PAGES', '5')))
-                for idx in range(pages_to_ocr):
-                    page = doc[idx]
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
-                        pix.save(tf.name)
-                        ocr = pytesseract.image_to_string(tf.name, lang=os.getenv('OCR_LANGS', 'rus+eng'))
-                        if ocr:
-                            text_ocr.append(ocr)
-                text = ("\n".join(text_ocr) or text)[:limit_chars]
-                used_ocr_pages = max(used_ocr_pages, pages_to_ocr)
-                ocr_time_total += (_time.time() - tstart)
-            except Exception as oe:
-                app.logger.info(f"OCR fallback failed {fp}: {oe}")
 
-        # Логирование в прогресс (если доступно)
+        def _ocr_page(page_obj) -> str:
+            nonlocal used_ocr_pages, ocr_time_total
+            t0 = _time.time()
+            pix = page_obj.get_pixmap(matrix=fitz.Matrix(2, 2))
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
+                pix.save(tf.name)
+                ocr_text = pytesseract.image_to_string(tf.name, lang=ocr_langs)
+            ocr_time_total += (_time.time() - t0)
+            if (ocr_text or '').strip():
+                used_ocr_pages += 1
+            return ocr_text or ""
+
+        with fitz.open(fp) as doc:
+            text_parts = []
+            for idx, page in enumerate(doc):
+                raw = page.get_text("text") or ""
+                if idx == 0 and pytesseract is not None:
+                    first_analysis = _analyze_extracted_text(raw)
+                    should_ocr_first = (
+                        force_ocr_first_page
+                        or not first_analysis.get("has_text")
+                        or bool(first_analysis.get("suspicious_mojibake"))
+                    )
+                    if should_ocr_first:
+                        try:
+                            ocr = _ocr_page(page)
+                            if ocr.strip():
+                                ocr_analysis = _analyze_extracted_text(ocr)
+                                if first_analysis.get("suspicious_mojibake") and not ocr_analysis.get("suspicious_mojibake"):
+                                    raw = ocr
+                                elif not raw.strip():
+                                    raw = ocr
+                                elif ocr.strip() not in raw:
+                                    raw = f"{ocr}\n{raw}"
+                        except Exception as oe:
+                            app.logger.info(f"OCR(first page) failed for {fp}: {oe}")
+                if idx < max_ocr_pages and pytesseract is not None and len((raw or '').strip()) < 30:
+                    try:
+                        ocr = _ocr_page(page)
+                        if ocr.strip():
+                            raw = ocr
+                    except Exception as oe:
+                        app.logger.info(f"OCR failed for page {idx} {fp}: {oe}")
+                text_parts.append(raw)
+                if limit_chars > 0 and sum(len(x) for x in text_parts) >= limit_chars:
+                    break
+
+            text = "\n".join(text_parts)
+            analysis = _analyze_extracted_text(text)
+            should_run_bulk_ocr = (
+                pytesseract is not None
+                and (
+                    len(text.strip()) < 200
+                    or bool(analysis.get("suspicious_mojibake"))
+                )
+            )
+            if should_run_bulk_ocr:
+                try:
+                    text_ocr = []
+                    pages_to_ocr = min(len(doc), max_ocr_pages)
+                    for idx in range(pages_to_ocr):
+                        ocr = _ocr_page(doc[idx])
+                        if ocr.strip():
+                            text_ocr.append(ocr)
+                    if text_ocr:
+                        ocr_joined = "\n".join(text_ocr).strip()
+                        ocr_analysis = _analyze_extracted_text(ocr_joined)
+                        base = (text or "").strip()
+                        if analysis.get("suspicious_mojibake") and not ocr_analysis.get("suspicious_mojibake"):
+                            text = ocr_joined
+                            try:
+                                _scan_log("OCR: заменил искажённый текст извлечённым OCR")
+                            except Exception:
+                                pass
+                        elif not base:
+                            text = ocr_joined
+                        elif ocr_joined not in base:
+                            text = f"{ocr_joined}\n\n{base}"
+                            try:
+                                _scan_log("OCR: объединён с базовым текстом PDF")
+                            except Exception:
+                                pass
+                except Exception as oe:
+                    app.logger.info(f"OCR fallback failed {fp}: {oe}")
+
         try:
             if used_ocr_pages > 0:
                 _scan_log(f"OCR: использовано страниц {used_ocr_pages}, время {int(ocr_time_total*1000)} мс")
@@ -5004,7 +6556,7 @@ def extract_text_pdf(fp: Path, limit_chars=40000, force_ocr_first_page: bool = F
                 _scan_log("OCR недоступен (pytesseract не установлен)")
         except Exception:
             pass
-        return text[:limit_chars]
+        return _limit_text_length(text, limit_chars)
     except Exception as e:
         app.logger.warning(f"PDF extract failed for {fp}: {e}")
         return ""
@@ -5015,7 +6567,7 @@ def extract_text_docx(fp: Path, limit_chars=40000):
     try:
         d = docx.Document(str(fp))
         text = "\n".join([p.text for p in d.paragraphs])
-        return text[:limit_chars]
+        return _limit_text_length(text, limit_chars)
     except Exception as e:
         app.logger.warning(f"DOCX extract failed for {fp}: {e}")
         return ""
@@ -5025,7 +6577,7 @@ def extract_text_rtf(fp: Path, limit_chars=40000):
         return ""
     try:
         text = rtf_to_text(fp.read_text(encoding="utf-8", errors="ignore"))
-        return text[:limit_chars]
+        return _limit_text_length(text, limit_chars)
     except Exception as e:
         app.logger.warning(f"RTF extract failed for {fp}: {e}")
         return ""
@@ -5039,9 +6591,9 @@ def extract_text_epub(fp: Path, limit_chars=40000):
         for item in book.get_items():
             if item.get_type() == epub.ITEM_DOCUMENT:
                 text += item.get_content().decode(errors="ignore")
-                if len(text) >= limit_chars:
+                if limit_chars > 0 and len(text) >= limit_chars:
                     break
-        return text[:limit_chars]
+        return _limit_text_length(text, limit_chars)
     except Exception as e:
         app.logger.warning(f"EPUB extract failed for {fp}: {e}")
         return ""
@@ -5054,9 +6606,9 @@ def extract_text_djvu(fp: Path, limit_chars=40000):
             text = ""
             for page in d.pages:
                 text += page.get_text()
-                if len(text) >= limit_chars:
+                if limit_chars > 0 and len(text) >= limit_chars:
                     break
-        return text[:limit_chars]
+        return _limit_text_length(text, limit_chars)
     except Exception as e:
         app.logger.warning(f"DjVu extract failed for {fp}: {e}")
         return ""
@@ -5141,7 +6693,7 @@ def transcribe_audio(fp: Path, limit_chars=40000,
                     text = _fw_try(vad=False, lng=lang)
                 if not text:
                     text = _fw_try(vad=False, lng=None)
-            return (text or '')[:limit_chars]
+            return _limit_text_length(text or '', limit_chars)
     except Exception as e:
         app.logger.warning(f"Транскрибация не удалась для {fp}: {e}")
     return ""
@@ -5665,6 +7217,40 @@ def normalize_material_type(s: str) -> str:
     return s or 'document'
 
 
+def _allowed_material_type_keys() -> set[str]:
+    keys = {'document', 'audio', 'image'}
+    try:
+        for entry in _material_type_profiles():
+            key = str((entry or {}).get('key') or '').strip()
+            if key:
+                keys.add(key)
+    except Exception:
+        pass
+    return keys
+
+
+def _merge_llm_material_type(
+    current_type: str | None,
+    llm_type: str | None,
+    *,
+    allow_override: bool,
+) -> str | None:
+    current = normalize_material_type(current_type or '')
+    candidate = normalize_material_type(llm_type or '')
+    allowed = _allowed_material_type_keys()
+    if current and current not in allowed:
+        current = 'document'
+    if candidate and candidate not in allowed:
+        candidate = ''
+    if not candidate:
+        return current or None
+    if current and not allow_override:
+        return current
+    if current and current != 'document' and candidate == 'document':
+        return current
+    return candidate
+
+
 def _looks_like_author_line(line: str) -> bool:
     line = (line or '').strip()
     if not line or len(line.split()) > 16:
@@ -6120,10 +7706,16 @@ def extract_tags_for_type(material_type: str, text: str, filename: str = "") -> 
 
     return tags
 
-def prune_missing_files():
+def prune_missing_files(allowed_collection_ids: set[int] | None = None):
     """Удаляет из БД файлы, которых нет на диске."""
     removed = 0
-    for f in File.query.all():
+    query = File.query
+    if allowed_collection_ids is not None:
+        if not allowed_collection_ids:
+            query = query.filter(File.collection_id == -1)
+        else:
+            query = query.filter(File.collection_id.in_(allowed_collection_ids))
+    for f in query.all():
         try:
             if not Path(f.path).exists():
                 fid = f.id
@@ -6346,10 +7938,116 @@ def aiword_vite_svg():
     return ("Not found", 404)
 
 
+def _metadata_quality(file_obj: File | None) -> dict[str, Any]:
+    if not file_obj:
+        return {"score": 0.0, "bucket": "low", "filled": 0, "total": 8}
+    checks = {
+        "title": bool((file_obj.title or "").strip()),
+        "author": bool((file_obj.author or "").strip()),
+        "year": bool((file_obj.year or "").strip()),
+        "material_type": bool((file_obj.material_type or "").strip()),
+        "keywords": bool((file_obj.keywords or "").strip()),
+        "abstract": bool((getattr(file_obj, "abstract", None) or "").strip()),
+        "text_excerpt": bool((file_obj.text_excerpt or "").strip()),
+        "tags": bool(getattr(file_obj, "tags", None)),
+    }
+    total = len(checks)
+    filled = sum(1 for v in checks.values() if v)
+    score = round((filled / total) if total else 0.0, 3)
+    if score >= 0.75:
+        bucket = "high"
+    elif score >= 0.45:
+        bucket = "medium"
+    else:
+        bucket = "low"
+    return {"score": score, "bucket": bucket, "filled": filled, "total": total}
+
+
+def _serialize_search_file(file_obj: File) -> dict[str, Any]:
+    return {
+        "id": file_obj.id,
+        "title": file_obj.title,
+        "author": file_obj.author,
+        "year": file_obj.year,
+        "material_type": file_obj.material_type,
+        "path": file_obj.path,
+        "rel_path": file_obj.rel_path,
+        "text_excerpt": file_obj.text_excerpt,
+        "abstract": getattr(file_obj, 'abstract', None),
+        "tags": [{"key": t.key, "value": t.value} for t in file_obj.tags],
+        "metadata_quality": _metadata_quality(file_obj),
+    }
+
+
+def _ranked_rows_with_feedback(
+    rows: Sequence[File],
+    ranked_pairs: Sequence[tuple[int, float]],
+    *,
+    feedback_scale: float = 0.25,
+) -> List[File]:
+    if not rows:
+        return []
+    if not ranked_pairs:
+        return list(rows)
+    rank_score_map = {int(fid): float(score) for fid, score in ranked_pairs}
+    feedback = _get_feedback_weights()
+    row_ids = [int(row.id) for row in rows if getattr(row, "id", None)]
+    realtime_delta: Dict[int, float] = {}
+    if row_ids:
+        try:
+            agg_rows = (
+                db.session.query(
+                    AiSearchKeywordFeedback.file_id,
+                    AiSearchKeywordFeedback.action,
+                    func.count(AiSearchKeywordFeedback.id),
+                )
+                .filter(AiSearchKeywordFeedback.file_id.in_(row_ids))
+                .group_by(AiSearchKeywordFeedback.file_id, AiSearchKeywordFeedback.action)
+                .all()
+            )
+            per_file: Dict[int, Dict[str, int]] = {}
+            for fid, action, cnt in agg_rows:
+                if fid is None:
+                    continue
+                bucket = per_file.setdefault(int(fid), {"relevant": 0, "irrelevant": 0, "click": 0})
+                key = str(action or "").strip().lower()
+                if key in bucket:
+                    bucket[key] += int(cnt or 0)
+            for fid, stats in per_file.items():
+                pos = float(stats.get("relevant", 0) or 0) + (float(stats.get("click", 0) or 0) * FEEDBACK_CLICK_WEIGHT)
+                neg = float(stats.get("irrelevant", 0) or 0)
+                realtime_delta[fid] = max(-1.2, min(1.2, math.log((1.0 + pos) / (1.0 + neg))))
+        except Exception:
+            realtime_delta = {}
+    feedback_scale = max(0.0, float(feedback_scale or 0.0))
+    scored: List[tuple[float, float, File]] = []
+    for row in rows:
+        base = rank_score_map.get(int(row.id), 0.0)
+        fb_weight = float((feedback.get(int(row.id), {}) or {}).get("weight", 0.0) or 0.0)
+        fb_weight += float(realtime_delta.get(int(row.id), 0.0) or 0.0)
+        meta_score = float(_metadata_quality(row).get("score", 0.0) or 0.0)
+        final = base + (fb_weight * feedback_scale) + (meta_score * 0.05)
+        scored.append((final, row.mtime or 0.0, row))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored]
+
+
+def _filter_rows_by_metadata_quality(rows: Sequence[File], bucket: str) -> List[File]:
+    wanted = (bucket or "").strip().lower()
+    if wanted not in {"low", "medium", "high"}:
+        return list(rows)
+    out: List[File] = []
+    for row in rows:
+        if _metadata_quality(row).get("bucket") == wanted:
+            out.append(row)
+    return out
+
+
 @app.route("/api/search")
 def api_search():
     q = request.args.get("q", "").strip()
     smart = str(request.args.get('smart', '')).lower() in ('1','true','yes','on')
+    rank_profile = (request.args.get('rank_profile') or 'balanced').strip().lower()
     material_type = request.args.get("type", "").strip()
     tag_filters = request.args.getlist("tag")
 
@@ -6358,6 +8056,7 @@ def api_search():
     year_to = (request.args.get("year_to") or "").strip()
     size_min = (request.args.get("size_min") or "").strip()
     size_max = (request.args.get("size_max") or "").strip()
+    metadata_quality_bucket = (request.args.get("metadata_quality") or "").strip().lower()
     collection_filter = _parse_collection_param(request.args.get('collection_id'))
 
     query = File.query.join(Collection, File.collection_id == Collection.id)
@@ -6393,32 +8092,41 @@ def api_search():
             query = query.join(t, t.file_id == File.id).filter(and_(t.key == k, t.value.ilike(f"%{v}%")))
     query = query.distinct()
 
+    ranked_ids: list[int] = []
+    ranked_pairs: list[tuple[int, float]] = []
     if q and smart:
-        candidates = _search_candidate_ids(q)
-        if candidates:
-            query = query.filter(File.id.in_(candidates))
-        elif candidates == []:
+        ranked_pairs = _search_ranked_candidates(q, limit=10000, profile=rank_profile)
+        ranked_ids = [fid for fid, _ in ranked_pairs]
+        if ranked_ids:
+            query = query.filter(File.id.in_(ranked_ids))
+        else:
+            candidates = _search_candidate_ids(q)
+            if candidates:
+                ranked_ids = list(candidates)
+                query = query.filter(File.id.in_(candidates))
+            elif candidates == []:
+                return jsonify([])
+    elif q:
+        ranked_pairs = _search_ranked_candidates(q, limit=10000, profile=rank_profile)
+        ranked_ids = [fid for fid, _ in ranked_pairs]
+        if ranked_ids:
+            query = query.filter(File.id.in_(ranked_ids))
+        else:
             return jsonify([])
 
-    rows = query.order_by(File.mtime.desc().nullslast()).limit(200).all()
+    rows = query.order_by(File.mtime.desc().nullslast()).limit(10000 if q else 200).all()
+    if ranked_pairs:
+        rows = _ranked_rows_with_feedback(rows, ranked_pairs)
+    rows = rows[:200]
     if q and smart:
         qlem = list(_expand_synonyms(_lemmas(q)))
         def _match(f: File) -> bool:
             lab = set(_lemmas(_row_text_for_search(f)))
             return any(l in lab for l in qlem)
         rows = [r for r in rows if _match(r)]
-    return jsonify([{
-        "id": r.id,
-        "title": r.title,
-        "author": r.author,
-        "year": r.year,
-        "material_type": r.material_type,
-        "path": r.path,
-        "rel_path": r.rel_path,
-        "text_excerpt": r.text_excerpt,
-        "abstract": getattr(r, 'abstract', None),
-        "tags": [{"key": t.key, "value": t.value} for t in r.tags]
-    } for r in rows])
+    if metadata_quality_bucket in {"low", "medium", "high"}:
+        rows = _filter_rows_by_metadata_quality(rows, metadata_quality_bucket)
+    return jsonify([_serialize_search_file(r) for r in rows])
 
 @app.route("/api/search_v2")
 def api_search_v2():
@@ -6428,12 +8136,14 @@ def api_search_v2():
     """
     q = request.args.get("q", "").strip()
     smart = str(request.args.get('smart', '')).lower() in ('1','true','yes','on')
+    rank_profile = (request.args.get('rank_profile') or 'balanced').strip().lower()
     material_type = request.args.get("type", "").strip()
     tag_filters = request.args.getlist("tag")
     year_from = (request.args.get("year_from") or "").strip()
     year_to = (request.args.get("year_to") or "").strip()
     size_min = (request.args.get("size_min") or "").strip()
     size_max = (request.args.get("size_max") or "").strip()
+    metadata_quality_bucket = (request.args.get("metadata_quality") or "").strip().lower()
     try:
         limit = min(max(int(request.args.get("limit", 50)), 1), 200)
     except Exception:
@@ -6481,39 +8191,106 @@ def api_search_v2():
                 qx = qx.join(t, t.file_id == File.id).filter(and_(t.key == k, t.value.ilike(f"%{v}%")))
     qx = qx.distinct()
 
-    if q and smart:
-        candidates = _search_candidate_ids(q)
-        if candidates:
-            qx = qx.filter(File.id.in_(candidates))
-        elif candidates == []:
-            return jsonify({"items": [], "total": 0})
-        # Морфологическая фильтрация на сервере с синонимами
-        qlem = list(_expand_synonyms(_lemmas(q)))
-        # Ограничиваем выборку разумным числом для подсчёта, упорядоченным по свежести
+    if q:
+        ranked_pairs = _search_ranked_candidates(q, limit=10000, profile=rank_profile)
+        ranked_ids = [fid for fid, _ in ranked_pairs]
+        if ranked_ids:
+            qx = qx.filter(File.id.in_(ranked_ids))
+        else:
+            candidates = _search_candidate_ids(q)
+            if candidates:
+                ranked_ids = list(candidates)
+                qx = qx.filter(File.id.in_(candidates))
+            else:
+                return jsonify({"items": [], "total": 0})
         cap = 10000
         cand = qx.order_by(File.mtime.desc().nullslast()).limit(cap).all()
-        def _match(f: File) -> bool:
-            lab = set(_lemmas(_row_text_for_search(f)))
-            return any(l in lab for l in qlem)
-        matched = [r for r in cand if _match(r)]
-        total = len(matched)
-        rows = matched[offset:offset+limit]
+        if ranked_pairs:
+            cand = _ranked_rows_with_feedback(cand, ranked_pairs)
+        if smart:
+            # Морфологическая фильтрация на сервере с синонимами
+            qlem = list(_expand_synonyms(_lemmas(q)))
+            def _match(f: File) -> bool:
+                lab = set(_lemmas(_row_text_for_search(f)))
+                return any(l in lab for l in qlem)
+            cand = [r for r in cand if _match(r)]
+        if metadata_quality_bucket in {"low", "medium", "high"}:
+            cand = _filter_rows_by_metadata_quality(cand, metadata_quality_bucket)
+        total = len(cand)
+        rows = cand[offset:offset+limit]
     else:
-        total = qx.count()
-        rows = qx.order_by(File.mtime.desc().nullslast()).offset(offset).limit(limit).all()
-    items = [{
-        "id": r.id,
-        "title": r.title,
-        "author": r.author,
-        "year": r.year,
-        "material_type": r.material_type,
-        "path": r.path,
-        "rel_path": r.rel_path,
-        "text_excerpt": r.text_excerpt,
-        "abstract": getattr(r, 'abstract', None),
-        "tags": [{"key": t.key, "value": t.value} for t in r.tags]
-    } for r in rows]
+        if metadata_quality_bucket in {"low", "medium", "high"}:
+            cand = qx.order_by(File.mtime.desc().nullslast()).limit(10000).all()
+            cand = _filter_rows_by_metadata_quality(cand, metadata_quality_bucket)
+            total = len(cand)
+            rows = cand[offset:offset+limit]
+        else:
+            total = qx.count()
+            rows = qx.order_by(File.mtime.desc().nullslast()).offset(offset).limit(limit).all()
+    items = [_serialize_search_file(r) for r in rows]
     return jsonify({"items": items, "total": total})
+
+
+@app.route("/api/metadata/low-quality")
+def api_metadata_low_quality():
+    try:
+        limit = min(max(int(request.args.get("limit", 200)), 1), 1000)
+    except Exception:
+        limit = 200
+    collection_filter = _parse_collection_param(request.args.get('collection_id'))
+    query = File.query
+    query = _apply_file_access_filter(query)
+    if collection_filter is not None:
+        query = query.filter(File.collection_id == collection_filter)
+    rows = query.order_by(File.mtime.desc().nullslast()).limit(5000).all()
+    low_rows = [row for row in rows if _metadata_quality(row).get("bucket") == "low"]
+    payload = [_serialize_search_file(row) for row in low_rows[:limit]]
+    return jsonify({"ok": True, "items": payload, "total": len(low_rows)})
+
+
+@app.route("/api/metadata/normalize", methods=["POST"])
+@require_admin
+def api_metadata_normalize():
+    data = request.get_json(silent=True) or {}
+    only_low = bool(data.get("only_low", True))
+    try:
+        limit = min(max(int(data.get("limit", 2000)), 1), 20000)
+    except Exception:
+        limit = 2000
+    collection_id = data.get("collection_id")
+    payload = {
+        "status": "queued",
+        "only_low": only_low,
+        "limit": limit,
+        "collection_id": collection_id,
+    }
+    task = TaskRecord(
+        name='metadata_normalize',
+        status='queued',
+        progress=0.0,
+        payload=json.dumps(payload, ensure_ascii=False),
+        user_id=getattr(_load_current_user(), 'id', None),
+        collection_id=int(collection_id) if collection_id else None,
+    )
+    try:
+        db.session.add(task)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    options = {
+        "only_low": only_low,
+        "limit": limit,
+        "collection_id": collection_id,
+    }
+    get_task_queue().submit(
+        _run_metadata_normalization_job,
+        int(task.id),
+        options,
+        description="metadata-normalize",
+        owner_id=getattr(_load_current_user(), 'id', None),
+    )
+    return jsonify({"ok": True, "task_id": int(task.id)})
 
 
 @app.route('/api/voice-search', methods=['POST'])
@@ -6581,8 +8358,40 @@ def api_settings():
     _require_admin()
     runtime = _rt()
     provider_default = runtime.lm_default_provider or 'openai'
+    runtime_snapshot = runtime_settings_store.snapshot()
+    runtime_fields_payload = []
+    for field_def in CONFIG_FIELDS:
+        snapshot_key = field_snapshot_key(field_def)
+        value = runtime_snapshot.get(snapshot_key)
+        if value is None and field_def.visibility == "env_only" and field_def.env_key:
+            value = os.getenv(field_def.env_key, app.config.get(field_def.env_key))
+        runtime_fields_payload.append({
+            "name": field_def.name,
+            "api_key": field_api_key(field_def),
+            "group": field_def.group,
+            "type": field_def.type_hint,
+            "description": field_def.doc,
+            "env_key": field_def.env_key,
+            "runtime_mutable": bool(field_def.runtime_mutable),
+            "visibility": field_def.visibility,
+            "restart_required": bool(field_def.restart_required),
+            "constraints": field_def.constraints or {},
+            "ui_component": field_def.ui_component,
+            "depends_on": field_def.depends_on,
+            "risk_level": field_def.risk_level,
+            "aliases": list(field_def.aliases),
+            "value": value,
+        })
     if request.method == 'GET':
         _ensure_llm_schema_once()
+        db_dialect = _db_dialect_name()
+        db_uri_raw = _active_database_uri()
+        db_uri_safe = db_uri_raw
+        if db_uri_raw:
+            try:
+                db_uri_safe = make_url(db_uri_raw).render_as_string(hide_password=True)
+            except Exception:
+                db_uri_safe = db_uri_raw
         try:
             cols = Collection.query.order_by(Collection.name.asc()).all()
             counts = {}
@@ -6604,6 +8413,11 @@ def api_settings():
             collections = []
         try:
             llms = LlmEndpoint.query.order_by(LlmEndpoint.created_at.desc()).all()
+            preferred = _llm_pick_default_endpoint()
+            effective_base = preferred.base_url if preferred else runtime.lmstudio_api_base
+            effective_model = preferred.model if preferred else runtime.lmstudio_model
+            effective_key = (preferred.api_key if preferred else runtime.lmstudio_api_key) or ''
+            effective_provider = (preferred.provider if preferred else provider_default) or provider_default
             llm_items = [{
                 'id': ep.id,
                 'name': ep.name,
@@ -6613,8 +8427,14 @@ def api_settings():
                 'purpose': ep.purpose,
                 'purposes': _llm_parse_purposes(ep.purpose),
                 'provider': (ep.provider or provider_default),
+                'context_length': int(ep.context_length) if getattr(ep, 'context_length', None) else None,
+                'instances': int(getattr(ep, 'instances', 1) or 1),
             } for ep in llms]
         except Exception:
+            effective_base = runtime.lmstudio_api_base
+            effective_model = runtime.lmstudio_model
+            effective_key = runtime.lmstudio_api_key
+            effective_provider = provider_default
             llm_items = []
         try:
             ai_entries = AiWordAccess.query.join(User, AiWordAccess.user_id == User.id).all()
@@ -6628,10 +8448,10 @@ def api_settings():
         return jsonify({
             'scan_root': str(runtime.scan_root),
             'extract_text': bool(runtime.extract_text),
-            'lm_base': runtime.lmstudio_api_base,
-            'lm_model': runtime.lmstudio_model,
-            'lm_key': runtime.lmstudio_api_key,
-            'lm_provider': provider_default,
+            'lm_base': effective_base,
+            'lm_model': effective_model,
+            'lm_key': effective_key,
+            'lm_provider': effective_provider,
             'rag_embedding_backend': runtime.rag_embedding_backend,
             'rag_embedding_model': runtime.rag_embedding_model,
             'rag_embedding_dim': int(runtime.rag_embedding_dim),
@@ -6647,6 +8467,13 @@ def api_settings():
             'audio_keywords_llm': bool(runtime.audio_keywords_llm),
             'vision_images': bool(runtime.images_vision_enabled),
             'kw_to_tags': bool(runtime.keywords_to_tags_enabled),
+            'doc_chat_chunk_max_tokens': int(runtime.doc_chat_chunk_max_tokens),
+            'doc_chat_chunk_overlap': int(runtime.doc_chat_chunk_overlap),
+            'doc_chat_chunk_min_tokens': int(runtime.doc_chat_chunk_min_tokens),
+            'doc_chat_max_chunks': int(runtime.doc_chat_max_chunks),
+            'doc_chat_fallback_chunks': int(runtime.doc_chat_fallback_chunks),
+            'doc_chat_image_min_width': int(runtime.doc_chat_image_min_width),
+            'doc_chat_image_min_height': int(runtime.doc_chat_image_min_height),
             'type_detect_flow': runtime.type_detect_flow,
             'type_llm_override': bool(runtime.type_llm_override),
             'import_subdir': runtime.import_subdir,
@@ -6678,14 +8505,58 @@ def api_settings():
             'default_use_llm': bool(runtime.default_use_llm),
             'default_prune': bool(runtime.default_prune),
             'material_types': runtime.material_types,
+            'runtime_fields': runtime_fields_payload,
+            'settings_hub_v2_enabled': str(os.getenv('SETTINGS_HUB_V2_ENABLED', '1')).strip().lower() in {'1', 'true', 'yes', 'on'},
+            'database_dialect': db_dialect,
+            'database_uri': db_uri_safe,
+            'database_type_options': ['sqlite', 'postgresql'],
         })
 
     data = request.json or {}
     before = runtime_settings_store.snapshot()
     update_payload = {}
+    field_errors = {}
 
     def _set(key: str, value):
         update_payload[key] = value
+
+    def _validate_schema_field(field_def, raw_value, source_key: str):
+        try:
+            type_hint = (field_def.type_hint or "").lower()
+            if "bool" in type_hint:
+                if isinstance(raw_value, bool):
+                    value = raw_value
+                else:
+                    value = str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+            elif "int" in type_hint:
+                value = int(raw_value)
+            elif "float" in type_hint:
+                value = float(raw_value)
+            elif "list" in type_hint:
+                if isinstance(raw_value, list):
+                    value = raw_value
+                elif isinstance(raw_value, str):
+                    value = [part.strip() for part in raw_value.split(",") if part.strip()]
+                else:
+                    raise ValueError("Ожидается список")
+            elif "dict" in type_hint:
+                if not isinstance(raw_value, dict):
+                    raise ValueError("Ожидается объект")
+                value = raw_value
+            else:
+                value = raw_value
+
+            constraints = field_def.constraints or {}
+            if "enum" in constraints and value not in constraints["enum"]:
+                raise ValueError(f"Допустимые значения: {', '.join(str(v) for v in constraints['enum'])}")
+            if isinstance(value, (int, float)):
+                if "min" in constraints and value < constraints["min"]:
+                    raise ValueError(f"Минимум: {constraints['min']}")
+                if "max" in constraints and value > constraints["max"]:
+                    raise ValueError(f"Максимум: {constraints['max']}")
+            _set(field_snapshot_key(field_def), value)
+        except Exception as exc:
+            field_errors[source_key] = str(exc)
 
     if 'scan_root' in data:
         value = data.get('scan_root') or str(runtime.scan_root)
@@ -6740,6 +8611,55 @@ def api_settings():
         _set('IMAGES_VISION_ENABLED', data.get('vision_images'))
     if 'kw_to_tags' in data:
         _set('KEYWORDS_TO_TAGS_ENABLED', data.get('kw_to_tags'))
+    if 'doc_chat_chunk_max_tokens' in data:
+        try:
+            value = max(16, int(data.get('doc_chat_chunk_max_tokens') or 0))
+        except Exception:
+            value = None
+        if value is not None:
+            _set('DOC_CHAT_CHUNK_MAX_TOKENS', value)
+    if 'doc_chat_chunk_overlap' in data:
+        try:
+            value = max(0, int(data.get('doc_chat_chunk_overlap') or 0))
+        except Exception:
+            value = None
+        if value is not None:
+            _set('DOC_CHAT_CHUNK_OVERLAP', value)
+    if 'doc_chat_chunk_min_tokens' in data:
+        try:
+            value = max(1, int(data.get('doc_chat_chunk_min_tokens') or 0))
+        except Exception:
+            value = None
+        if value is not None:
+            _set('DOC_CHAT_CHUNK_MIN_TOKENS', value)
+    if 'doc_chat_max_chunks' in data:
+        try:
+            value = max(0, int(data.get('doc_chat_max_chunks') or 0))
+        except Exception:
+            value = None
+        if value is not None:
+            _set('DOC_CHAT_MAX_CHUNKS', value)
+    if 'doc_chat_fallback_chunks' in data:
+        try:
+            value = max(0, int(data.get('doc_chat_fallback_chunks') or 0))
+        except Exception:
+            value = None
+        if value is not None:
+            _set('DOC_CHAT_FALLBACK_CHUNKS', value)
+    if 'doc_chat_image_min_width' in data:
+        try:
+            value = max(0, int(data.get('doc_chat_image_min_width') or 0))
+        except Exception:
+            value = None
+        if value is not None:
+            _set('DOC_CHAT_IMAGE_MIN_WIDTH', value)
+    if 'doc_chat_image_min_height' in data:
+        try:
+            value = max(0, int(data.get('doc_chat_image_min_height') or 0))
+        except Exception:
+            value = None
+        if value is not None:
+            _set('DOC_CHAT_IMAGE_MIN_HEIGHT', value)
     if 'type_detect_flow' in data:
         _set('TYPE_DETECT_FLOW', data.get('type_detect_flow'))
     if 'type_llm_override' in data:
@@ -6809,6 +8729,28 @@ def api_settings():
         _set('RAG_RERANK_MAX_LENGTH', data.get('rag_rerank_max_length'))
     if 'rag_rerank_max_chars' in data:
         _set('RAG_RERANK_MAX_CHARS', data.get('rag_rerank_max_chars'))
+    runtime_fields_data = data.get('runtime_fields')
+    if isinstance(runtime_fields_data, dict):
+        for field_def in CONFIG_FIELDS:
+            field_name = field_def.name
+            if field_name not in runtime_fields_data:
+                continue
+            if not field_def.runtime_mutable:
+                field_errors[field_name] = "Поле доступно только через env и требует перезапуска"
+                continue
+            _validate_schema_field(field_def, runtime_fields_data.get(field_name), field_name)
+
+    for field_def in CONFIG_FIELDS:
+        api_key = field_api_key(field_def)
+        if api_key not in data:
+            continue
+        if not field_def.runtime_mutable:
+            field_errors[api_key] = "Поле доступно только через env и требует перезапуска"
+            continue
+        _validate_schema_field(field_def, data.get(api_key), api_key)
+
+    if field_errors:
+        return jsonify({"ok": False, "error": "validation_error", "field_errors": field_errors}), 400
 
     if update_payload:
         runtime_settings_store.apply_updates(update_payload)
@@ -6830,6 +8772,11 @@ def api_settings():
         enabled=runtime.search_cache_enabled,
         max_items=runtime.search_cache_max_items,
         ttl_seconds=runtime.search_cache_ttl_seconds,
+    )
+    configure_llm_pool(
+        workers=runtime.llm_pool_global_concurrency,
+        per_user_limit=runtime.llm_pool_per_user_concurrency,
+        max_queue=runtime.llm_queue_max_size,
     )
     runtime.apply_to_flask_config(app)
 
@@ -7117,6 +9064,7 @@ def settings_redirect():
     return redirect('/app/settings')
 
 @app.route('/settings/collections', methods=['POST'])
+@require_admin
 def settings_collections():
     # Обновляем флаги у существующих коллекций и при необходимости добавляем новую
     try:
@@ -7139,21 +9087,164 @@ def settings_collections():
         db.session.rollback()
         return json_error(f'Ошибка обновления коллекций: {e}', 500)
 
+
+def _db_dialect_name() -> str:
+    try:
+        name = str(getattr(db.engine.dialect, "name", "") or "").strip().lower()
+    except Exception:
+        name = ""
+    if name == "postgres":
+        return "postgresql"
+    return name or "unknown"
+
+
+def _active_database_uri() -> str:
+    return str(
+        current_app.config.get("SQLALCHEMY_DATABASE_URI")
+        or os.getenv("SQLALCHEMY_DATABASE_URI")
+        or os.getenv("DATABASE_URL")
+        or ""
+    ).strip()
+
+
+def _normalize_db_type(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"postgres", "postgresql"}:
+        return "postgresql"
+    if raw in {"sqlite", "sqlite3"}:
+        return "sqlite"
+    return ""
+
+
+def _requested_db_type() -> str:
+    payload = request.get_json(silent=True) if request.is_json else None
+    requested = ""
+    if isinstance(payload, dict):
+        requested = _normalize_db_type(payload.get("db_type"))
+    if not requested:
+        requested = _normalize_db_type(request.form.get("db_type"))
+    if not requested:
+        requested = _normalize_db_type(request.args.get("db_type"))
+    return requested or _db_dialect_name()
+
+
+def _pg_cli_connection(db_uri: str) -> tuple[list[str], dict[str, str], str]:
+    try:
+        parsed = make_url(db_uri)
+    except Exception as exc:
+        raise ValueError(f"Некорректный URI базы данных: {exc}") from exc
+    if not str(parsed.drivername or "").startswith("postgresql"):
+        raise ValueError("Текущая база не PostgreSQL")
+    dbname = str(parsed.database or "").strip()
+    if not dbname:
+        raise ValueError("В URI PostgreSQL не указано имя базы")
+
+    args: list[str] = []
+    if parsed.host:
+        args.extend(["-h", str(parsed.host)])
+    if parsed.port:
+        args.extend(["-p", str(parsed.port)])
+    if parsed.username:
+        args.extend(["-U", str(parsed.username)])
+
+    env = os.environ.copy()
+    if parsed.password is not None:
+        env["PGPASSWORD"] = str(parsed.password)
+    return args, env, dbname
+
+
+def _run_cli(command: list[str], env: dict[str, str]) -> tuple[int, str]:
+    proc = subprocess.run(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    detail = stderr or stdout
+    return int(proc.returncode or 0), detail[:4000]
+
+
+def _clear_file_caches() -> None:
+    try:
+        static_dir = Path(app.static_folder)
+        txt_cache = static_dir / 'cache' / 'text_excerpts'
+        if txt_cache.exists():
+            for fp in txt_cache.glob('*.txt'):
+                try:
+                    fp.unlink()
+                except Exception:
+                    pass
+        thumbs = static_dir / 'thumbnails'
+        if thumbs.exists():
+            for fp in thumbs.glob('*.png'):
+                try:
+                    fp.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 @app.route('/admin/backup-db', methods=['POST'])
 @require_admin
 def backup_db():
-    # Создаём и отправляем резервную копию SQLite с отметкой времени
+    # Создаём и отправляем резервную копию БД для выбранного/текущего типа
     try:
+        requested_type = _requested_db_type()
+        active_type = _db_dialect_name()
+        if requested_type != active_type:
+            return json_error(
+                f"Выбран тип '{requested_type}', но приложение подключено к '{active_type}'. "
+                "Смените тип БД в настройках UI или подключение приложения.",
+                400,
+            )
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        src = BASE_DIR / 'catalogue.db'
-        if not src.exists():
-            return json_error('Файл базы не найден', 404)
         bdir = BASE_DIR / 'backups'
         bdir.mkdir(exist_ok=True)
-        dst = bdir / f'catalogue_{ts}.db'
-        import shutil
-        shutil.copy2(src, dst)
-        return send_from_directory(bdir, dst.name, as_attachment=True)
+        if active_type == 'sqlite':
+            src = BASE_DIR / 'catalogue.db'
+            if not src.exists():
+                return json_error('Файл базы не найден', 404)
+            dst = bdir / f'catalogue_{ts}.db'
+            shutil.copy2(src, dst)
+            return send_from_directory(bdir, dst.name, as_attachment=True)
+
+        if active_type == 'postgresql':
+            payload = request.get_json(silent=True) if request.is_json else {}
+            fmt = str(
+                (payload or {}).get("format")
+                or request.form.get("format")
+                or request.args.get("format")
+                or "dump"
+            ).strip().lower()
+            if fmt not in {"dump", "sql"}:
+                fmt = "dump"
+            pg_format = "c" if fmt == "dump" else "p"
+            suffix = ".dump" if fmt == "dump" else ".sql"
+            dst = bdir / f'catalogue_{ts}{suffix}'
+            db_uri = _active_database_uri()
+            conn_args, env, dbname = _pg_cli_connection(db_uri)
+            cmd = [
+                "pg_dump",
+                *conn_args,
+                "--no-owner",
+                "--no-privileges",
+                "--clean",
+                "--if-exists",
+                f"--format={pg_format}",
+                "--file",
+                str(dst),
+                dbname,
+            ]
+            code, detail = _run_cli(cmd, env)
+            if code != 0:
+                return json_error(f"Ошибка pg_dump: {detail or 'неизвестная ошибка'}", 500)
+            return send_from_directory(bdir, dst.name, as_attachment=True)
+
+        return json_error(f"Неподдерживаемый тип БД: {active_type}", 400)
     except Exception as e:
         return json_error(f'Ошибка резервного копирования: {e}', 500)
 
@@ -7189,101 +9280,252 @@ def clear_db():
 @app.route('/admin/import-db', methods=['POST'])
 @require_admin
 def import_db():
-    """Replace current SQLite database with uploaded file.
-    Creates an automatic timestamped backup of the current DB before replacing.
-    """
+    """Import DB dump/file for the selected current backend (sqlite/postgresql)."""
+    requested_type = _requested_db_type()
+    active_type = _db_dialect_name()
+    if requested_type != active_type:
+        return json_error(
+            f"Выбран тип '{requested_type}', но приложение подключено к '{active_type}'. "
+            "Смените тип БД в настройках UI или подключение приложения.",
+            400,
+        )
+
     file = request.files.get('dbfile')
     if not file or not file.filename:
         return json_error('Файл базы не выбран', 400)
     filename = secure_filename(file.filename)
-    if not filename.lower().endswith('.db'):
-        return json_error('Ожидался файл .db (SQLite)', 400)
-
+    tmp: Path | None = None
     try:
-        head = file.stream.read(16)
-        if head[:15] != b'SQLite format 3':
-            file.stream.seek(0)
-            return json_error('Файл не похож на SQLite базу', 400)
-    except Exception:
-        pass
-    finally:
-        try:
-            file.stream.seek(0)
-        except Exception:
-            pass
-
-    tmp = None
-    try:
-        dst = BASE_DIR / 'catalogue.db'
-        if dst.exists():
-            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-            bdir = BASE_DIR / 'backups'
-            bdir.mkdir(exist_ok=True)
-            backup_path = bdir / f'catalogue_before_import_{ts}.db'
-            import shutil
-            shutil.copy2(dst, backup_path)
-
-        tmp = BASE_DIR / f'.upload_import_tmp_{os.getpid()}_{int(time.time())}.db'
-        file.save(tmp)
-
-        # Проверка схемы
-        try:
-            con = sqlite3.connect(str(tmp))
-            cur = con.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = {r[0] for r in cur.fetchall()}
-            required = {'files', 'tags', 'tag_schemas', 'changelog'}
-            missing = required - tables
-            con.close()
-            if missing:
+        if active_type == "sqlite":
+            if not filename.lower().endswith('.db'):
+                return json_error('Ожидался файл .db (SQLite)', 400)
+            try:
+                head = file.stream.read(16)
+                if head[:15] != b'SQLite format 3':
+                    file.stream.seek(0)
+                    return json_error('Файл не похож на SQLite базу', 400)
+            except Exception:
+                pass
+            finally:
                 try:
-                    tmp.unlink()
+                    file.stream.seek(0)
                 except Exception:
                     pass
-                return json_error('В файле базы нет требуемых таблиц: ' + ', '.join(sorted(missing)), 400)
-        except Exception as e:
-            if tmp and tmp.exists():
-                tmp.unlink()
-            return json_error(f'Не удалось проверить схему базы: {e}', 500)
 
-        # Убеждаемся, что SQLAlchemy освобождает файловые дескрипторы
-        try:
-            db.session.close()
-            db.session.remove()
-        except Exception:
-            pass
-        try:
-            db.engine.dispose()
-        except Exception:
-            pass
+            dst = BASE_DIR / 'catalogue.db'
+            if dst.exists():
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                bdir = BASE_DIR / 'backups'
+                bdir.mkdir(exist_ok=True)
+                backup_path = bdir / f'catalogue_before_import_{ts}.db'
+                shutil.copy2(dst, backup_path)
 
-        import shutil
-        shutil.move(str(tmp), str(dst))
-        tmp = None
+            tmp = BASE_DIR / f'.upload_import_tmp_{os.getpid()}_{int(time.time())}.db'
+            file.save(tmp)
 
-        try:
-            static_dir = Path(app.static_folder)
-            txt_cache = static_dir / 'cache' / 'text_excerpts'
-            if txt_cache.exists():
-                for fp in txt_cache.glob('*.txt'):
-                    try: fp.unlink()
-                    except Exception: pass
-            thumbs = static_dir / 'thumbnails'
-            if thumbs.exists():
-                for fp in thumbs.glob('*.png'):
-                    try: fp.unlink()
-                    except Exception: pass
-        except Exception:
-            pass
+            try:
+                con = sqlite3.connect(str(tmp))
+                cur = con.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = {r[0] for r in cur.fetchall()}
+                required = {'files', 'tags', 'tag_schemas', 'changelog'}
+                missing = required - tables
+                con.close()
+                if missing:
+                    try:
+                        tmp.unlink()
+                    except Exception:
+                        pass
+                    return json_error('В файле базы нет требуемых таблиц: ' + ', '.join(sorted(missing)), 400)
+            except Exception as e:
+                if tmp and tmp.exists():
+                    tmp.unlink()
+                return json_error(f'Не удалось проверить схему базы: {e}', 500)
 
-        return jsonify({"status": "ok"})
+            try:
+                db.session.close()
+                db.session.remove()
+            except Exception:
+                pass
+            try:
+                db.engine.dispose()
+            except Exception:
+                pass
+
+            shutil.move(str(tmp), str(dst))
+            tmp = None
+            _clear_file_caches()
+            return jsonify({"status": "ok", "dialect": "sqlite"})
+
+        if active_type == "postgresql":
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            db_uri = _active_database_uri()
+            conn_args, env, dbname = _pg_cli_connection(db_uri)
+            bdir = BASE_DIR / "backups"
+            bdir.mkdir(exist_ok=True)
+            backup_before = bdir / f"catalogue_before_import_{ts}.dump"
+            backup_cmd = [
+                "pg_dump",
+                *conn_args,
+                "--no-owner",
+                "--no-privileges",
+                "--clean",
+                "--if-exists",
+                "--format=c",
+                "--file",
+                str(backup_before),
+                dbname,
+            ]
+            code, detail = _run_cli(backup_cmd, env)
+            if code != 0:
+                return json_error(f"Не удалось создать pre-import backup: {detail or 'ошибка pg_dump'}", 500)
+
+            suffix = Path(filename).suffix.lower() or ".bin"
+            tmp = BASE_DIR / f'.upload_import_tmp_{os.getpid()}_{int(time.time())}{suffix}'
+            file.save(tmp)
+
+            try:
+                db.session.close()
+                db.session.remove()
+            except Exception:
+                pass
+            try:
+                db.engine.dispose()
+            except Exception:
+                pass
+
+            reset_cmd = [
+                "psql",
+                *conn_args,
+                "-d",
+                dbname,
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;",
+            ]
+            code, detail = _run_cli(reset_cmd, env)
+            if code != 0:
+                return json_error(f"Не удалось очистить схему PostgreSQL: {detail or 'ошибка psql'}", 500)
+
+            is_sql = suffix in {".sql"}
+            if is_sql:
+                import_cmd = [
+                    "psql",
+                    *conn_args,
+                    "-d",
+                    dbname,
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-f",
+                    str(tmp),
+                ]
+            else:
+                import_cmd = [
+                    "pg_restore",
+                    *conn_args,
+                    "-d",
+                    dbname,
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
+                    "--no-privileges",
+                    str(tmp),
+                ]
+            code, detail = _run_cli(import_cmd, env)
+            if code != 0:
+                return json_error(f"Ошибка импорта PostgreSQL: {detail or 'ошибка восстановления'}", 500)
+
+            _clear_file_caches()
+            return jsonify({"status": "ok", "dialect": "postgresql"})
+
+        return json_error(f"Неподдерживаемый тип БД: {active_type}", 400)
     except Exception as e:
+        return json_error(f'Ошибка импорта базы: {e}', 500)
+    finally:
         if tmp and tmp.exists():
             try:
                 tmp.unlink()
             except Exception:
                 pass
-        return json_error(f'Ошибка импорта базы: {e}', 500)
+
+
+@app.route('/admin/db/migrate-sqlite-to-postgres', methods=['POST'])
+@require_admin
+def migrate_sqlite_to_postgres():
+    payload = request.get_json(silent=True) or {}
+    sqlite_path_raw = str(payload.get('sqlite_path') or 'catalogue.db').strip()
+    pg_url = str(payload.get('postgres_url') or '').strip()
+    pg_host = str(payload.get('postgres_host') or '').strip()
+    pg_port = int(payload.get('postgres_port') or 5432)
+    pg_db = str(payload.get('postgres_db') or '').strip()
+    pg_user = str(payload.get('postgres_user') or '').strip()
+    pg_password = str(payload.get('postgres_password') or '').strip()
+    mode_raw = str(payload.get('mode') or 'dry-run').strip().lower()
+    mode = 'run' if mode_raw == 'run' else 'dry-run'
+    if not pg_url:
+        if not (pg_host and pg_db and pg_user):
+            return json_error('Укажите postgres_url или набор полей host/db/user/password', 400)
+        auth = quote_plus(pg_user)
+        if pg_password:
+            auth = f"{auth}:{quote_plus(pg_password)}"
+        pg_url = f"postgresql://{auth}@{pg_host}:{pg_port}/{quote_plus(pg_db)}"
+
+    base_dir = BASE_DIR.resolve()
+    sqlite_path = Path(sqlite_path_raw)
+    if not sqlite_path.is_absolute():
+        sqlite_path = (base_dir / sqlite_path).resolve()
+    if not sqlite_path.exists():
+        return json_error(f'SQLite файл не найден: {sqlite_path}', 404)
+    if not sqlite_path.is_file():
+        return json_error(f'Неверный путь SQLite: {sqlite_path}', 400)
+
+    script_path = (base_dir / 'scripts' / 'migrate_sqlite_to_postgres.sh').resolve()
+    if not script_path.exists():
+        return json_error('Скрипт миграции не найден: scripts/migrate_sqlite_to_postgres.sh', 404)
+
+    cmd = [
+        str(script_path),
+        '--sqlite',
+        str(sqlite_path),
+        '--pg',
+        pg_url,
+        '--run' if mode == 'run' else '--dry-run',
+    ]
+    env = os.environ.copy()
+    env['DATABASE_URL'] = pg_url
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(base_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=30 * 60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or '') if isinstance(exc.stdout, str) else ''
+        return jsonify({
+            'ok': False,
+            'mode': mode,
+            'exit_code': 124,
+            'output': output[-12000:],
+            'error': 'Таймаут выполнения миграции (30 мин)',
+        }), 504
+    except FileNotFoundError:
+        return json_error('Не удалось запустить скрипт миграции', 500)
+    except Exception as exc:
+        return json_error(f'Ошибка запуска миграции: {exc}', 500)
+
+    output = (proc.stdout or '').strip()
+    return jsonify({
+        'ok': proc.returncode == 0,
+        'mode': mode,
+        'exit_code': int(proc.returncode or 0),
+        'output': output[-12000:],
+    }), (200 if proc.returncode == 0 else 500)
 
 
 def _task_to_dict(task: TaskRecord) -> dict:
@@ -7419,17 +9661,47 @@ def api_admin_tasks():
     except Exception:
         limit = 50
     limit = max(1, min(limit, 200))
+    status_filter = (request.args.get('status') or '').strip().lower()
+    name_filter = (request.args.get('name') or '').strip()
+    status_mode = None
+    status_values: tuple[str, ...] | None = None
+    if status_filter:
+        if status_filter in {'active'}:
+            status_mode = 'active'
+        elif status_filter in {'final', 'done', 'completed'}:
+            status_mode = 'final'
+        elif status_filter in {'all'}:
+            status_mode = 'all'
+        else:
+            tokens = [
+                token.strip().lower()
+                for token in status_filter.replace(';', ',').split(',')
+                if token.strip()
+            ]
+            if tokens:
+                status_values = tuple(tokens)
     _cleanup_old_tasks()
     cutoff = datetime.utcnow() - TASK_RETENTION_WINDOW
-    tasks = TaskRecord.query.order_by(TaskRecord.created_at.desc()) \
-        .filter(
+    query = TaskRecord.query.order_by(TaskRecord.created_at.desc())
+    if name_filter:
+        like_pattern = f"%{name_filter}%"
+        query = query.filter(TaskRecord.name.ilike(like_pattern))
+    if status_values:
+        query = query.filter(func.lower(TaskRecord.status).in_(status_values))
+    elif status_mode == 'active':
+        query = query.filter(TaskRecord.status.notin_(TASK_FINAL_STATUSES))
+    elif status_mode == 'final':
+        query = query.filter(TaskRecord.status.in_(TASK_FINAL_STATUSES))
+    if status_mode != 'all':
+        query = query.filter(
             or_(
                 TaskRecord.status.notin_(TASK_FINAL_STATUSES),
                 TaskRecord.status.is_(None),
                 TaskRecord.created_at.is_(None),
                 TaskRecord.created_at >= cutoff
             )
-        ).limit(limit).all()
+        )
+    tasks = query.limit(limit).all()
     payload = [_task_to_dict(t) for t in tasks]
     if SCAN_PROGRESS.get('running'):
         progress = 0.0
@@ -7454,6 +9726,13 @@ def api_admin_tasks():
                 'error': SCAN_PROGRESS.get('error'),
             })
     return jsonify({'ok': True, 'tasks': payload})
+
+
+@admin_bp.route('/llm-queue', methods=['GET'])
+@require_admin
+def api_admin_llm_queue():
+    stats = get_llm_pool().stats()
+    return jsonify({'ok': True, 'stats': stats})
 
 
 @admin_bp.route('/tasks/<int:task_id>', methods=['PATCH', 'DELETE'])
@@ -7658,6 +9937,8 @@ def api_admin_llm_endpoints():
                 'purpose': ep.purpose,
                 'purposes': _llm_parse_purposes(ep.purpose),
                 'provider': (ep.provider or _rt().lm_default_provider),
+                'context_length': int(ep.context_length) if getattr(ep, 'context_length', None) else None,
+                'instances': int(getattr(ep, 'instances', 1) or 1),
                 'created_at': ep.created_at.isoformat() if ep.created_at else None,
             }
             for ep in eps
@@ -7680,9 +9961,12 @@ def api_admin_llm_endpoints():
         weight=float(data.get('weight') or 1.0),
         purpose=normalized_purpose,
         provider=provider,
+        context_length=int(data.get('context_length')) if str(data.get('context_length') or '').strip().isdigit() else None,
+        instances=max(1, int(data.get('instances') or 1)),
     )
     db.session.add(ep)
     db.session.commit()
+    _sync_runtime_default_route_from_llm_endpoints()
     _invalidate_llm_cache()
     _log_user_action(_load_current_user(), 'llm_add', 'llm_endpoint', ep.id, detail=json.dumps({'name': name, 'purpose': ep.purpose}))
     return jsonify({'ok': True, 'item': {
@@ -7694,6 +9978,8 @@ def api_admin_llm_endpoints():
         'purpose': ep.purpose,
         'purposes': _llm_parse_purposes(ep.purpose),
         'provider': ep.provider,
+        'context_length': int(ep.context_length) if getattr(ep, 'context_length', None) else None,
+        'instances': int(getattr(ep, 'instances', 1) or 1),
         'created_at': ep.created_at.isoformat() if ep.created_at else None,
     }}), 201
 
@@ -7706,6 +9992,7 @@ def api_admin_llm_endpoint_detail(endpoint_id: int):
     if request.method == 'DELETE':
         db.session.delete(ep)
         db.session.commit()
+        _sync_runtime_default_route_from_llm_endpoints()
         _invalidate_llm_cache()
         _log_user_action(_load_current_user(), 'llm_delete', 'llm_endpoint', endpoint_id)
         return jsonify({'ok': True})
@@ -7742,8 +10029,26 @@ def api_admin_llm_endpoint_detail(endpoint_id: int):
             updated = True
         else:
             return jsonify({'ok': False, 'error': 'некорректный провайдер LLM'}), 400
+    if 'context_length' in data:
+        raw_ctx = data.get('context_length')
+        if raw_ctx in (None, "", 0, "0"):
+            ep.context_length = None
+            updated = True
+        else:
+            try:
+                ep.context_length = max(256, int(raw_ctx))
+                updated = True
+            except Exception:
+                return jsonify({'ok': False, 'error': 'некорректный context_length'}), 400
+    if 'instances' in data:
+        try:
+            ep.instances = max(1, int(data.get('instances') or 1))
+            updated = True
+        except Exception:
+            return jsonify({'ok': False, 'error': 'некорректный instances'}), 400
     if updated:
         db.session.commit()
+        _sync_runtime_default_route_from_llm_endpoints()
         _invalidate_llm_cache()
         _log_user_action(_load_current_user(), 'llm_update', 'llm_endpoint', ep.id)
     return jsonify({'ok': True, 'item': {
@@ -7755,8 +10060,137 @@ def api_admin_llm_endpoint_detail(endpoint_id: int):
         'purpose': ep.purpose,
         'purposes': _llm_parse_purposes(ep.purpose),
         'provider': ep.provider,
+        'context_length': int(ep.context_length) if getattr(ep, 'context_length', None) else None,
+        'instances': int(getattr(ep, 'instances', 1) or 1),
         'created_at': ep.created_at.isoformat() if ep.created_at else None,
     }})
+
+
+@admin_bp.route('/lmstudio/models', methods=['GET'])
+@require_admin
+def api_admin_lmstudio_models():
+    base_url = str(request.args.get('base_url') or '').strip()
+    if not base_url:
+        return jsonify({'ok': False, 'error': 'base_url is required'}), 400
+    endpoint_id = request.args.get('endpoint_id')
+    api_key = ''
+    if endpoint_id:
+        try:
+            ep = LlmEndpoint.query.get(int(endpoint_id))
+            if ep:
+                api_key = ep.api_key or ''
+        except Exception:
+            pass
+    if not api_key:
+        api_key = str(request.args.get('api_key') or '').strip()
+    base = _lmstudio_base_url(base_url)
+    if not base:
+        return jsonify({'ok': False, 'error': 'invalid base_url'}), 400
+    response = http_request(
+        'GET',
+        f'{base}/api/v1/models',
+        headers=_lmstudio_headers(api_key),
+        timeout=(HTTP_CONNECT_TIMEOUT, max(10, HTTP_DEFAULT_TIMEOUT)),
+        logger=app.logger,
+    )
+    if getattr(response, 'status_code', 500) >= 400:
+        detail = ''
+        try:
+            detail = (response.text or '')[:300]
+        except Exception:
+            detail = ''
+        return jsonify({'ok': False, 'error': f'LM Studio error {response.status_code}', 'detail': detail}), 502
+    payload = response.json() if hasattr(response, 'json') else {}
+    items = _lmstudio_extract_models(payload)
+    # Compatibility fallback: some setups expose models on OpenAI-compatible /v1/models
+    if not items:
+        try:
+            response_v1 = http_request(
+                'GET',
+                f'{base}/v1/models',
+                headers=_lmstudio_headers(api_key),
+                timeout=(HTTP_CONNECT_TIMEOUT, max(10, HTTP_DEFAULT_TIMEOUT)),
+                logger=app.logger,
+            )
+            if getattr(response_v1, 'status_code', 500) < 400:
+                payload_v1 = response_v1.json() if hasattr(response_v1, 'json') else {}
+                items = _lmstudio_extract_models(payload_v1)
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'items': items})
+
+
+@admin_bp.route('/lmstudio/models/load', methods=['POST'])
+@require_admin
+def api_admin_lmstudio_models_load():
+    data = request.get_json(silent=True) or {}
+    endpoint_id = data.get('endpoint_id')
+    ep = None
+    if endpoint_id is not None:
+        ep = LlmEndpoint.query.get(int(endpoint_id))
+    base_url = str(data.get('base_url') or (ep.base_url if ep else '') or '').strip()
+    model = str(data.get('model') or (ep.model if ep else '') or '').strip()
+    api_key = str(data.get('api_key') or (ep.api_key if ep else '') or '').strip()
+    if not base_url or not model:
+        return jsonify({'ok': False, 'error': 'base_url and model are required'}), 400
+    context_length = data.get('context_length')
+    payload = {'model': model}
+    if context_length not in (None, '', 0, '0'):
+        try:
+            ctx = max(256, int(context_length))
+            payload['context_length'] = ctx
+        except Exception:
+            return jsonify({'ok': False, 'error': 'invalid context_length'}), 400
+    base = _lmstudio_base_url(base_url)
+    response = http_request(
+        'POST',
+        f'{base}/api/v1/models/load',
+        headers=_lmstudio_headers(api_key),
+        json=payload,
+        timeout=(HTTP_CONNECT_TIMEOUT, max(30, HTTP_DEFAULT_TIMEOUT)),
+        logger=app.logger,
+    )
+    if getattr(response, 'status_code', 500) >= 400:
+        detail = ''
+        try:
+            detail = (response.text or '')[:300]
+        except Exception:
+            detail = ''
+        return jsonify({'ok': False, 'error': f'LM Studio load error {response.status_code}', 'detail': detail}), 502
+    _lmstudio_mark_activity()
+    return jsonify({'ok': True, 'result': response.json() if hasattr(response, 'json') else {}})
+
+
+@admin_bp.route('/lmstudio/models/unload', methods=['POST'])
+@require_admin
+def api_admin_lmstudio_models_unload():
+    data = request.get_json(silent=True) or {}
+    endpoint_id = data.get('endpoint_id')
+    ep = None
+    if endpoint_id is not None:
+        ep = LlmEndpoint.query.get(int(endpoint_id))
+    base_url = str(data.get('base_url') or (ep.base_url if ep else '') or '').strip()
+    model = str(data.get('model') or (ep.model if ep else '') or '').strip()
+    api_key = str(data.get('api_key') or (ep.api_key if ep else '') or '').strip()
+    if not base_url or not model:
+        return jsonify({'ok': False, 'error': 'base_url and model are required'}), 400
+    base = _lmstudio_base_url(base_url)
+    response = http_request(
+        'POST',
+        f'{base}/api/v1/models/unload',
+        headers=_lmstudio_headers(api_key),
+        json={'model': model},
+        timeout=(HTTP_CONNECT_TIMEOUT, max(30, HTTP_DEFAULT_TIMEOUT)),
+        logger=app.logger,
+    )
+    if getattr(response, 'status_code', 500) >= 400:
+        detail = ''
+        try:
+            detail = (response.text or '')[:300]
+        except Exception:
+            detail = ''
+        return jsonify({'ok': False, 'error': f'LM Studio unload error {response.status_code}', 'detail': detail}), 502
+    return jsonify({'ok': True, 'result': response.json() if hasattr(response, 'json') else {}})
 
 
 # ------------------- CLI helpers -------------------
@@ -8002,11 +10436,104 @@ def _isoformat_ts(value: float | int | None) -> str | None:
         return None
 
 
+_OSINT_FINAL_PROGRESS_STATUSES = {'completed', 'error', 'blocked', 'cancelled'}
+
+
+def _osint_job_summary(job: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Собирает краткую сводку по задаче OSINT для отображения в админке."""
+    if not isinstance(job, Mapping):
+        return {}
+    progress_raw = job.get('progress')
+    progress: dict[str, Any] = {}
+    if isinstance(progress_raw, Mapping):
+        for key, value in progress_raw.items():
+            entry_key = str(key)
+            if isinstance(value, Mapping):
+                progress[entry_key] = dict(value)
+            else:
+                progress[entry_key] = {'status': value}
+    sources_total_raw = job.get('sources_total')
+    sources_total: int | None
+    try:
+        sources_total = int(sources_total_raw)
+        if sources_total <= 0:
+            sources_total = None
+    except Exception:
+        sources_total = None
+    if sources_total is None:
+        sources_total = len(progress) or len(job.get('source_specs') or [])
+    sources_completed_raw = job.get('sources_completed')
+    try:
+        sources_completed = int(sources_completed_raw)
+        if sources_completed < 0:
+            sources_completed = 0
+    except Exception:
+        sources_completed = sum(
+            1
+            for value in progress.values()
+            if str(value.get('status') or '').lower() in _OSINT_FINAL_PROGRESS_STATUSES
+        )
+    percent_complete: float | None = None
+    if sources_total:
+        try:
+            percent_complete = round(
+                min(100.0, max(0.0, (float(sources_completed) / float(sources_total)) * 100.0)),
+                1,
+            )
+        except Exception:
+            percent_complete = None
+    schedule_payload = job.get('schedule')
+    schedule = dict(schedule_payload) if isinstance(schedule_payload, Mapping) else schedule_payload
+    return {
+        'id': job.get('id'),
+        'query': job.get('query'),
+        'status': job.get('status'),
+        'error': job.get('error'),
+        'created_at': job.get('created_at'),
+        'started_at': job.get('started_at'),
+        'completed_at': job.get('completed_at'),
+        'sources_total': sources_total,
+        'sources_completed': sources_completed,
+        'percent_complete': percent_complete,
+        'progress': progress,
+        'schedule': schedule,
+    }
+
+
+def _rag_job_summary(task: TaskRecord | None) -> dict[str, Any]:
+    if task is None:
+        return {}
+    try:
+        payload_raw = json.loads(task.payload or "{}")
+    except Exception:
+        payload_raw = {}
+    options = payload_raw.get('options') if isinstance(payload_raw, Mapping) else None
+    progress_value = 0.0
+    try:
+        progress_value = max(0.0, min(1.0, float(task.progress or 0.0)))
+    except Exception:
+        progress_value = 0.0
+    return {
+        'id': task.id,
+        'status': task.status,
+        'progress': progress_value,
+        'created_at': _isoformat_dt(task.created_at),
+        'started_at': _isoformat_dt(task.started_at),
+        'finished_at': _isoformat_dt(task.finished_at),
+        'error': task.error,
+        'collection_id': payload_raw.get('collection_id'),
+        'collection_name': payload_raw.get('collection_name'),
+        'total_files': payload_raw.get('total_files'),
+        'options': options if isinstance(options, Mapping) else None,
+    }
+
+
 @admin_bp.route('/status/overview', methods=['GET'])
 @require_admin
 def api_admin_status_overview():
     now = datetime.utcnow().replace(microsecond=0)
     queue_stats = get_task_queue().stats()
+    llm_pool_stats = get_llm_pool().stats()
     warnings: list[str] = []
     errors: dict[str, str] = {}
 
@@ -8050,6 +10577,17 @@ def api_admin_status_overview():
         queue_status = 'warning'
         warnings.append('Очередь фоновых задач помечена как остановленная')
     queue_info['status'] = queue_status
+    llm_queue_info = {
+        'workers': llm_pool_stats.get('workers'),
+        'per_user_limit': llm_pool_stats.get('per_user_limit'),
+        'max_queue': llm_pool_stats.get('max_queue'),
+        'queued': llm_pool_stats.get('queued'),
+        'running': llm_pool_stats.get('running'),
+        'avg_queue_wait_sec': llm_pool_stats.get('avg_queue_wait_sec'),
+        'p95_queue_wait_sec': llm_pool_stats.get('p95_queue_wait_sec'),
+    }
+    if int(llm_queue_info.get('queued') or 0) >= int(llm_queue_info.get('max_queue') or 0):
+        warnings.append('LLM очередь переполнена')
 
     # Database health
     db_status = 'ok'
@@ -8126,7 +10664,15 @@ def api_admin_status_overview():
             warnings.append('Не удалось получить статус RAG-индексации')
             db.session.rollback()
 
-    db_path = getattr(CONFIG, 'catalogue_db_path', None)
+    db_dialect = db.engine.dialect.name if getattr(db, "engine", None) is not None else None
+    db_uri = str(current_app.config.get("SQLALCHEMY_DATABASE_URI") or "")
+    db_uri_safe = db_uri
+    if db_uri:
+        try:
+            db_uri_safe = make_url(db_uri).render_as_string(hide_password=True)
+        except Exception:
+            db_uri_safe = db_uri
+    db_path = getattr(CONFIG, 'catalogue_db_path', None) if db_dialect == 'sqlite' else None
     db_size_bytes: Optional[int] = None
     if isinstance(db_path, Path):
         try:
@@ -8138,6 +10684,8 @@ def api_admin_status_overview():
 
     database_info = {
         'status': db_status,
+        'dialect': db_dialect,
+        'uri': db_uri_safe,
         'path': str(db_path) if db_path else None,
         'size_bytes': db_size_bytes,
         'size_pretty': _format_bytes_short(db_size_bytes),
@@ -8187,21 +10735,132 @@ def api_admin_status_overview():
         'recent': recent_tasks,
     }
 
+    # OSINT job snapshots
+    osint_summary: dict[str, Any] | None = None
+    osint_service: OsintSearchService | None = None
+    try:
+        osint_service = _get_osint_service()
+    except Exception as exc:  # noqa: BLE001
+        osint_service = None
+        warnings.append('Сервис OSINT-поиска недоступен')
+        errors['osint_service'] = str(exc)
+    if osint_service is not None:
+        try:
+            recent_jobs_raw = osint_service.list_jobs(limit=6) or []
+            recent_jobs = [_osint_job_summary(job) for job in recent_jobs_raw if job]
+            active_jobs = [
+                job
+                for job in recent_jobs
+                if str(job.get('status') or '').lower() not in _OSINT_FINAL_PROGRESS_STATUSES
+            ]
+            queue_snapshot = getattr(osint_service, 'queue', None)
+            queue_meta = queue_snapshot.stats() if queue_snapshot else None
+            osint_summary = {
+                'queue': queue_meta,
+                'active': active_jobs,
+                'recent': recent_jobs,
+            }
+        except Exception as exc:  # noqa: BLE001
+            warnings.append('Не удалось получить состояние OSINT-поиска')
+            errors['osint_status'] = str(exc)
+
+    # External integrations snapshot
+    browser_info = None
+    try:
+        browser_manager = get_browser_manager()
+        browser_settings = browser_manager.settings
+        browser_info = {
+            'headless': browser_settings.headless,
+            'proxy': browser_settings.proxy,
+            'viewport': list(browser_settings.default_viewport),
+            'context_timeout_ms': browser_settings.context_timeout_ms,
+            'navigation_timeout_ms': browser_settings.navigation_timeout_ms,
+        }
+    except Exception as exc:
+        errors['browser_settings'] = str(exc)
+        warnings.append('Не удалось получить параметры браузера для OSINT')
+    http_conf = get_http_settings()
+    http_info = {
+        'timeout': getattr(http_conf, 'timeout', None),
+        'connect_timeout': getattr(http_conf, 'connect_timeout', None),
+        'retries': getattr(http_conf, 'retries', None),
+        'backoff_factor': getattr(http_conf, 'backoff_factor', None),
+    }
+    osint_integration = None
+    if osint_service is not None:
+        serp_settings = getattr(osint_service.fetcher, 'settings', None)
+        if serp_settings is not None:
+            osint_integration = {
+                'cache_enabled': bool(getattr(serp_settings, 'cache_enabled', False)),
+                'cache_ttl_seconds': getattr(serp_settings, 'cache_ttl_seconds', None),
+                'retry_user_agents': len(getattr(serp_settings, 'retry_user_agents', ()) or ()),
+                'retry_proxies': len(getattr(serp_settings, 'retry_proxies', ()) or ()),
+                'wait_after_load_ms': getattr(serp_settings, 'wait_after_load_ms', None),
+                'navigation_timeout_ms': getattr(serp_settings, 'navigation_timeout_ms', None),
+                'user_agent_override': getattr(serp_settings, 'user_agent_override', None),
+            }
+            if osint_summary and osint_summary.get('queue'):
+                osint_integration['queue'] = osint_summary['queue']
+    integrations_summary = {
+        'browser': browser_info,
+        'http': http_info,
+        'osint': osint_integration,
+    }
+
+    # User activity snapshot
+    users_activity = None
+    if db_status == 'ok':
+        try:
+            total_users = User.query.count()
+            active_cutoff = datetime.utcnow() - timedelta(hours=24)
+            active_24h = (
+                db.session.query(func.count(func.distinct(UserActionLog.user_id)))
+                .filter(UserActionLog.action == 'login', UserActionLog.user_id.isnot(None))
+                .filter(UserActionLog.created_at >= active_cutoff)
+                .scalar() or 0
+            )
+            recent_logins = (
+                UserActionLog.query.filter(UserActionLog.action == 'login')
+                .order_by(UserActionLog.created_at.desc())
+                .limit(8)
+                .all()
+            )
+            users_activity = {
+                'total': total_users,
+                'active_24h': int(active_24h),
+                'recent': [
+                    {
+                        'user_id': entry.user_id,
+                        'username': getattr(entry.user, 'username', None),
+                        'full_name': getattr(entry.user, 'full_name', None),
+                        'at': _isoformat_dt(entry.created_at),
+                    }
+                    for entry in recent_logins
+                ],
+            }
+        except Exception as exc:
+            errors['user_activity'] = str(exc)
+            warnings.append('Не удалось получить статистику активности пользователей')
+            db.session.rollback()
+
     # AI metrics snapshot
     ai_metrics_info: dict[str, Any] = {
         'window_size': 0,
         'latency_avg_ms': None,
         'last_measurement': None,
     }
+    ai_metric_rows: list[AiSearchMetric] = []
     if db_status == 'ok':
         try:
-            metric_rows = AiSearchMetric.query.order_by(AiSearchMetric.created_at.desc()).limit(25).all()
-            ai_metrics_info['window_size'] = len(metric_rows)
-            if metric_rows:
-                totals = [row.total_ms for row in metric_rows if row.total_ms is not None]
+            ai_metric_rows = (
+                AiSearchMetric.query.order_by(AiSearchMetric.created_at.desc()).limit(25).all()
+            )
+            ai_metrics_info['window_size'] = len(ai_metric_rows)
+            if ai_metric_rows:
+                totals = [row.total_ms for row in ai_metric_rows if row.total_ms is not None]
                 if totals:
                     ai_metrics_info['latency_avg_ms'] = round(sum(totals) / len(totals), 1)
-                last_row = metric_rows[0]
+                last_row = ai_metric_rows[0]
                 meta_payload: Any = last_row.meta
                 if isinstance(meta_payload, str):
                     try:
@@ -8223,6 +10882,15 @@ def api_admin_status_overview():
             errors['ai_metrics'] = str(exc)
             warnings.append('Не удалось получить окна AI-метрик')
             db.session.rollback()
+
+    def _avg_metric(field: str) -> float | None:
+        values = [getattr(row, field) for row in ai_metric_rows if getattr(row, field) is not None]
+        if not values:
+            return None
+        try:
+            return round(sum(values) / len(values), 1)
+        except Exception:
+            return None
 
     # Scan snapshot
     scan_scope = None
@@ -8251,6 +10919,7 @@ def api_admin_status_overview():
         'total': total,
         'added': SCAN_PROGRESS.get('added'),
         'updated': SCAN_PROGRESS.get('updated'),
+        'duplicates': SCAN_PROGRESS.get('duplicates'),
         'removed': SCAN_PROGRESS.get('removed'),
         'current': SCAN_PROGRESS.get('current'),
         'eta_seconds': SCAN_PROGRESS.get('eta_seconds'),
@@ -8368,8 +11037,27 @@ def api_admin_status_overview():
     if not cache_info['search'].get('enabled'):
         warnings.append('Кэш поиска выключен – увеличится нагрузка на БД')
 
+    llm_latency_summary = {
+        'total_avg_ms': _avg_metric('total_ms'),
+        'answer_avg_ms': _avg_metric('llm_answer_ms'),
+        'snippet_avg_ms': _avg_metric('llm_snippet_ms'),
+    }
+    provider_counts: dict[str, int] = {}
+    for endpoint in llm_endpoints:
+        provider = str(endpoint.get('provider') or 'unknown').strip().lower()
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
+    llm_summary = {
+        'cache': cache_info.get('llm'),
+        'endpoints': {
+            'total': len(llm_endpoints),
+            'per_provider': provider_counts,
+        },
+        'latency_ms': llm_latency_summary,
+    }
+
     rag_ready = None
     rag_pending = None
+    rag_jobs: list[dict[str, Any]] = []
     if db_status == 'ok':
         try:
             rag_ready = int(
@@ -8385,9 +11073,23 @@ def api_admin_status_overview():
         except Exception as exc:
             errors['rag_overview'] = str(exc)
             db.session.rollback()
+        try:
+            rag_task_rows = (
+                TaskRecord.query.filter(TaskRecord.name == 'rag_collection')
+                .filter(TaskRecord.status.notin_(TASK_FINAL_STATUSES))
+                .order_by(TaskRecord.created_at.asc())
+                .limit(5)
+                .all()
+            )
+            rag_jobs = [_rag_job_summary(row) for row in rag_task_rows if row]
+        except Exception as exc:
+            errors['rag_jobs'] = str(exc)
+            warnings.append('Не удалось получить активные задачи построения RAG')
+            db.session.rollback()
     rag_overview = {
         'ready': rag_ready,
         'pending': rag_pending,
+        'jobs': rag_jobs,
     }
 
     status = 'ok'
@@ -8405,15 +11107,20 @@ def api_admin_status_overview():
         'app': app_info,
         'system': system_info,
         'queue': queue_info,
+        'llm_queue': llm_queue_info,
         'database': database_info,
         'tasks': tasks_info,
+        'osint': osint_summary,
         'ai_search': ai_metrics_info,
+        'llm': llm_summary,
         'scan': scan_info,
         'runtime': runtime_info,
         'services': service_flags,
         'feedback': feedback_stats,
         'cache': cache_info,
         'rag': rag_overview,
+        'users': users_activity,
+        'integrations': integrations_summary,
     }
     return jsonify(payload)
 
@@ -8711,10 +11418,22 @@ from collections import Counter, defaultdict
 def api_stats():
     # Агрегация по авторам, годам, типам материалов
     allowed_scope = _current_allowed_collections()
+    base_query = File.query.join(Collection, File.collection_id == Collection.id).filter(Collection.searchable == True)
+    if allowed_scope is not None:
+        if not allowed_scope:
+            base_query = base_query.filter(File.collection_id == -1)
+        else:
+            base_query = base_query.filter(File.collection_id.in_(allowed_scope))
     try:
-        files = File.query.join(Collection, File.collection_id == Collection.id).filter(Collection.searchable == True).all()
+        files = base_query.all()
     except Exception:
-        files = File.query.all()
+        fallback = File.query
+        if allowed_scope is not None:
+            if not allowed_scope:
+                fallback = fallback.filter(File.collection_id == -1)
+            else:
+                fallback = fallback.filter(File.collection_id.in_(allowed_scope))
+        files = fallback.all()
     authors = Counter()
     years = Counter()
     types = Counter()
@@ -8846,6 +11565,11 @@ def api_stats():
             .filter(Collection.searchable == True) \
             .group_by(Collection.id) \
             .order_by(func.count(File.id).desc())
+        if allowed_scope is not None:
+            if not allowed_scope:
+                q = q.filter(File.collection_id == -1)
+            else:
+                q = q.filter(File.collection_id.in_(allowed_scope))
         collections_counts = [(name, int(cnt)) for (name, cnt) in q.all()]
     except Exception:
         pass
@@ -8856,8 +11580,13 @@ def api_stats():
             .join(File, File.collection_id == Collection.id) \
             .filter(Collection.searchable == True) \
             .group_by(Collection.id) \
-            .order_by(func.coalesce(func.sum(File.size), 0).desc()) \
-            .all()
+            .order_by(func.coalesce(func.sum(File.size), 0).desc())
+        if allowed_scope is not None:
+            if not allowed_scope:
+                rows = rows.filter(File.collection_id == -1)
+            else:
+                rows = rows.filter(File.collection_id.in_(allowed_scope))
+        rows = rows.all()
         collections_total_size = [(name, int(total or 0)) for (name, total) in rows]
     except Exception:
         pass
@@ -8869,7 +11598,13 @@ def api_stats():
             .join(Collection, File.collection_id == Collection.id) \
             .filter(Collection.searchable == True) \
             .order_by(File.size.desc().nullslast()) \
-            .limit(15).all()
+            .limit(15)
+        if allowed_scope is not None:
+            if not allowed_scope:
+                rows = rows.filter(File.collection_id == -1)
+            else:
+                rows = rows.filter(File.collection_id.in_(allowed_scope))
+        rows = rows.all()
         largest_files = [(fn or '(без имени)', int(sz or 0)) for (fn, sz) in rows]
     except Exception:
         pass
@@ -9093,6 +11828,7 @@ def api_stats_tag_values():
     key = (request.args.get('key') or '').strip()
     if not key:
         return jsonify({"items": []})
+    allowed_scope = _current_allowed_collections()
     try:
         try:
             lim = min(max(int(request.args.get('limit', '30')), 1), 200)
@@ -9105,7 +11841,13 @@ def api_stats_tag_values():
             .filter(Tag.key == key) \
             .group_by(Tag.value) \
             .order_by(func.count(Tag.id).desc()) \
-            .limit(lim).all()
+            .limit(lim)
+        if allowed_scope is not None:
+            if not allowed_scope:
+                rows = rows.filter(File.collection_id == -1)
+            else:
+                rows = rows.filter(File.collection_id.in_(allowed_scope))
+        rows = rows.all()
         return jsonify({"items": [[v or '', int(c or 0)] for (v, c) in rows]})
     except Exception as e:
         return jsonify({"items": [], "error": str(e)}), 500
@@ -9156,6 +11898,15 @@ def _looks_like_binary_text(text: str) -> bool:
     return False
 
 
+def _limit_text_length(text: str, limit_chars: int) -> str:
+    """Trim text only when a positive limit is provided."""
+    if not text:
+        return ""
+    if limit_chars and limit_chars > 0:
+        return text[:limit_chars]
+    return text
+
+
 def _extract_text_for_rag(path: Path, *, limit_chars: int = 120_000) -> str:
     ext = path.suffix.lower().lstrip(".")
     if ext == "pdf":
@@ -9204,6 +11955,88 @@ def _resolve_candidate_paths(file_obj: File) -> List[Path]:
         seen.add(key)
         resolved.append(normalized)
     return resolved
+
+
+def _doc_chat_assess_answer_quality(
+    answer: str,
+    *,
+    question_terms: Sequence[str],
+    text_sources: Sequence[dict[str, Any]],
+    image_sources: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = (answer or "").strip()
+    if not normalized:
+        return {
+            'status': 'error',
+            'risk_score': 1.0,
+            'risk_level': 'high',
+            'messages': ['Ответ пустой или не был сгенерирован.'],
+            'missing_citations': True,
+            'unknown_citations': [],
+            'citations': [],
+        }
+    text_count = len(text_sources)
+    image_count = len(image_sources)
+    citations: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+    for match in DOC_CHAT_CITATION_RE.finditer(normalized):
+        kind_raw, index_raw = match.groups()
+        try:
+            idx = int(index_raw)
+        except Exception:
+            continue
+        kind_lower = kind_raw.lower()
+        is_text = 'текст' in kind_lower or 'text' in kind_lower
+        entry = {
+            'type': 'text' if is_text else 'image',
+            'index': idx,
+            'label': f"{'Текст' if is_text else 'Изображение'} {idx}",
+        }
+        citations.append(entry)
+        if (is_text and not (1 <= idx <= text_count)) or ((not is_text) and not (1 <= idx <= image_count)):
+            unknown.append(entry)
+    missing_citations = len(citations) == 0 and len(normalized) > 200
+    digits = re.findall(r"\d{3,}", normalized)
+    messages: list[str] = []
+    risk = 0.0
+    if missing_citations:
+        messages.append("Ответ не содержит ссылок на «Текст N» или «Изображение N» — возможны галлюцинации.")
+        risk += 0.55
+    if unknown:
+        labels = ", ".join(entry['label'] for entry in unknown)
+        messages.append(f"Ответ ссылается на несуществующие фрагменты: {labels}.")
+        risk += 0.2 * len(unknown)
+    if digits and len(citations) == 0:
+        messages.append("В ответе есть числовые данные без ссылок на источники.")
+        risk += 0.15
+    lower_answer = normalized.lower()
+    informative_terms = [term for term in question_terms if len(term) >= 5][:4]
+    if informative_terms:
+        missing_terms = [term for term in informative_terms if term not in lower_answer]
+        if len(missing_terms) == len(informative_terms):
+            messages.append("Ключевые термины вопроса не упомянуты в ответе.")
+            risk += 0.15
+    risk = min(1.0, risk)
+    if risk <= 0.2:
+        status = 'ok'
+        risk_level = 'low'
+    elif risk <= 0.6:
+        status = 'warning'
+        risk_level = 'medium'
+    else:
+        status = 'error' if missing_citations or unknown else 'warning'
+        risk_level = 'high'
+    if not messages and status == 'ok':
+        messages.append("Ссылки найдены, явные риски не обнаружены.")
+    return {
+        'status': status,
+        'risk_score': round(risk, 3),
+        'risk_level': risk_level,
+        'messages': messages,
+        'missing_citations': missing_citations,
+        'unknown_citations': unknown,
+        'citations': citations,
+    }
 
 
 def _collect_text_for_rag(file_obj: File, *, limit_chars: int = 120_000) -> tuple[str, Optional[Path]]:
@@ -9562,6 +12395,228 @@ def _run_rag_collection_job(task_id: int, collection_id: int, options: dict[str,
     )
 
 
+def _run_rag_file_job(task_id: int, file_id: int, options: dict[str, object]) -> None:
+    try:
+        db.session.rollback()
+    except Exception:
+        db.session.remove()
+    task = TaskRecord.query.get(task_id)
+    if not task:
+        return
+
+    def _save(status: str, progress: float, payload: dict[str, Any], error: Optional[str] = None) -> None:
+        try:
+            row = TaskRecord.query.get(task_id)
+            if not row:
+                return
+            row.status = status
+            row.progress = max(0.0, min(1.0, float(progress)))
+            row.payload = json.dumps(payload, ensure_ascii=False)
+            if status == 'running' and row.started_at is None:
+                row.started_at = datetime.utcnow()
+            if status in TASK_FINAL_STATUSES:
+                row.finished_at = datetime.utcnow()
+            if error:
+                row.error = error
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    file_obj = File.query.get(file_id)
+    if not file_obj:
+        _save('error', 0.0, {"ok": False, "error": "file_not_found", "file_id": file_id}, "file_not_found")
+        return
+
+    runtime = runtime_settings_store.current
+    backend_name = str(options.get("embedding_backend") or runtime.rag_embedding_backend or "auto").strip().lower() or "auto"
+    model_name = str(options.get("embedding_model_name") or runtime.rag_embedding_model or "intfloat/multilingual-e5-large").strip()
+    emb_dim = max(8, int(options.get("embedding_dim") or runtime.rag_embedding_dim or 384))
+    emb_batch = max(1, int(options.get("embedding_batch_size") or runtime.rag_embedding_batch_size or 32))
+    emb_device = options.get("embedding_device") or runtime.rag_embedding_device
+    emb_endpoint = str(options.get("embedding_endpoint") or runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or "").strip()
+    emb_api_key = str(options.get("embedding_api_key") or runtime.rag_embedding_api_key or runtime.lmstudio_api_key or "")
+    skip_if_unchanged = bool(options.get("skip_if_unchanged", True))
+    limit_chars = max(1000, int(options.get("limit_chars") or 120_000))
+    chunk_max_tokens = max(16, int(options.get("chunk_max_tokens") or 700))
+    chunk_overlap = max(0, int(options.get("chunk_overlap") or 120))
+    chunk_min_tokens = max(1, int(options.get("chunk_min_tokens") or 80))
+
+    payload: dict[str, Any] = {
+        "ok": False,
+        "file_id": file_id,
+        "status": "running",
+    }
+    _save('running', 0.05, payload)
+    try:
+        text, source_path = _collect_text_for_rag(file_obj, limit_chars=limit_chars)
+        if not (text or "").strip():
+            raise RuntimeError("Пустой текст после извлечения")
+        indexer = RagIndexer(
+            chunk_config=ChunkConfig(
+                max_tokens=chunk_max_tokens,
+                overlap=chunk_overlap,
+                min_tokens=chunk_min_tokens,
+            ),
+            normalizer_version=str(options.get("normalizer_version") or "v1"),
+        )
+        metadata = {
+            "source": "api.file_rag_reindex",
+            "source_path": str(source_path) if source_path else None,
+            "file_sha1": file_obj.sha1,
+            "file_id": file_obj.id,
+            "collection_id": file_obj.collection_id,
+        }
+        ingest_result = indexer.ingest_document(
+            file_obj,
+            text,
+            metadata=metadata,
+            skip_if_unchanged=skip_if_unchanged,
+            commit=True,
+        )
+        _save('running', 0.65, {"ok": True, "stage": "ingested", "ingest": ingest_result, "file_id": file_id})
+        backend = load_embedding_backend(
+            backend_name,
+            model_name=model_name,
+            dim=emb_dim,
+            batch_size=emb_batch,
+            device=emb_device,
+            base_url=emb_endpoint or None,
+            api_key=emb_api_key or None,
+        )
+        try:
+            embedded = _embed_missing_chunks_for_document(
+                int(ingest_result.get("document_id") or 0),
+                backend,
+                batch_size=emb_batch,
+                commit=True,
+            )
+        finally:
+            try:
+                backend.close()
+            except Exception:
+                pass
+        final_payload = {
+            "ok": True,
+            "file_id": file_id,
+            "status": "completed",
+            "ingest": ingest_result,
+            "embedded": int(embedded or 0),
+            "backend": backend_name,
+            "model": model_name,
+        }
+        _save('completed', 1.0, final_payload)
+    except Exception as exc:
+        db.session.rollback()
+        _save('error', 1.0, {"ok": False, "file_id": file_id, "error": str(exc)}, str(exc))
+
+
+def _run_metadata_normalization_job(task_id: int, options: dict[str, object]) -> None:
+    try:
+        db.session.rollback()
+    except Exception:
+        db.session.remove()
+    task = TaskRecord.query.get(task_id)
+    if not task:
+        return
+
+    def _save(status: str, progress: float, payload: dict[str, Any], error: Optional[str] = None) -> None:
+        try:
+            row = TaskRecord.query.get(task_id)
+            if not row:
+                return
+            row.status = status
+            row.progress = max(0.0, min(1.0, float(progress)))
+            row.payload = json.dumps(payload, ensure_ascii=False)
+            if status == 'running' and row.started_at is None:
+                row.started_at = datetime.utcnow()
+            if status in TASK_FINAL_STATUSES:
+                row.finished_at = datetime.utcnow()
+            if error:
+                row.error = error
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    only_low = bool(options.get("only_low", True))
+    limit = max(1, int(options.get("limit") or 2000))
+    collection_id = options.get("collection_id")
+    query = File.query.order_by(File.id.asc())
+    if collection_id is not None:
+        try:
+            query = query.filter(File.collection_id == int(collection_id))
+        except Exception:
+            pass
+    files = query.limit(limit).all()
+    total = len(files) or 1
+    changed = 0
+    low_before = 0
+    low_after = 0
+    _save('running', 0.02, {"status": "running", "total": len(files), "changed": 0})
+    try:
+        for idx, row in enumerate(files, start=1):
+            quality_before = _metadata_quality(row)
+            if quality_before.get("bucket") == "low":
+                low_before += 1
+            if only_low and quality_before.get("bucket") != "low":
+                continue
+            result = _apply_metadata_quality_rules(
+                row,
+                ext=row.ext or "",
+                text_excerpt=row.text_excerpt or "",
+                filename=row.filename or "",
+            )
+            if result.get("changed"):
+                changed += 1
+                try:
+                    _sync_file_to_fts(row)
+                except Exception:
+                    pass
+            quality_after = _metadata_quality(row)
+            if quality_after.get("bucket") == "low":
+                low_after += 1
+            if idx == 1 or idx % 50 == 0:
+                _save(
+                    'running',
+                    idx / total,
+                    {
+                        "status": "running",
+                        "total": len(files),
+                        "processed": idx,
+                        "changed": changed,
+                        "low_before": low_before,
+                        "low_after": low_after,
+                    },
+                )
+        db.session.commit()
+        _invalidate_facets_cache('metadata_normalize')
+        _save(
+            'completed',
+            1.0,
+            {
+                "status": "completed",
+                "total": len(files),
+                "changed": changed,
+                "low_before": low_before,
+                "low_after": low_after,
+            },
+        )
+    except Exception as exc:
+        db.session.rollback()
+        _save(
+            'error',
+            1.0,
+            {
+                "status": "error",
+                "total": len(files),
+                "changed": changed,
+                "low_before": low_before,
+                "low_after": low_after,
+                "error": str(exc),
+            },
+            str(exc),
+        )
+
+
 def _build_translation_hint(query_lang: Optional[str], section_lang: Optional[str]) -> str:
     q = (query_lang or "").lower()
     s = (section_lang or "").lower()
@@ -9620,6 +12675,41 @@ def _serialize_context_section(section: ContextSection) -> Dict[str, Any]:
         "url": section.url,
         "extra": section.extra,
     }
+
+
+def _group_context_sections_by_document(sections: Sequence[ContextSection]) -> List[Dict[str, Any]]:
+    groups: Dict[int, Dict[str, Any]] = {}
+    for section in sections:
+        doc_id = section.doc_id
+        group = groups.get(doc_id)
+        if group is None:
+            group = {
+                "doc_id": doc_id,
+                "title": section.title,
+                "url": section.url,
+                "language": section.language,
+                "combined_score": section.combined_score,
+                "chunks": [],
+            }
+            groups[doc_id] = group
+        chunk_payload = {
+            "chunk_id": section.chunk_id,
+            "section_path": section.extra.get("Раздел") or section.extra.get("section_path"),
+            "preview": section.preview,
+            "content": section.content,
+            "score_dense": section.score_dense,
+            "score_sparse": section.score_sparse,
+            "combined_score": section.combined_score,
+            "reasoning_hint": section.reasoning_hint,
+            "translation_hint": section.translation_hint,
+            "extra": copy.deepcopy(section.extra) if section.extra else {},
+        }
+        group["chunks"].append(chunk_payload)
+        if section.combined_score is not None:
+            group["combined_score"] = max(group.get("combined_score", 0.0), section.combined_score)
+    for group in groups.values():
+        group["chunks"].sort(key=lambda chunk: chunk.get("combined_score") or 0.0, reverse=True)
+    return list(groups.values())
 
 
 def _assess_rag_risk(
@@ -11135,22 +14225,126 @@ app.config['facet_cache'] = FACET_CACHE
 app.config['facet_service'] = facet_service
 app.config['search_service'] = search_service
 
+
+def _run_refresh_task(task_id: int, file_id: int, params: dict[str, str]) -> None:
+    with app.app_context():
+        task = TaskRecord.query.get(task_id)
+        if not task:
+            return
+        try:
+            task.status = 'running'
+            task.started_at = datetime.utcnow()
+            task.progress = 0.1
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        try:
+            query = "&".join(
+                f"{k}={quote_plus(str(v))}"
+                for k, v in params.items()
+                if v is not None and str(v) != ""
+            )
+            suffix = f"?{query}" if query else ""
+            with app.test_request_context(
+                f"/api/files/{int(file_id)}/refresh{suffix}",
+                method="POST",
+            ):
+                response = api_file_refresh(int(file_id))
+            status_code = 200
+            payload: dict[str, Any] = {}
+            if isinstance(response, tuple):
+                flask_resp = response[0]
+                status_code = int(response[1])
+                payload = flask_resp.get_json(silent=True) if hasattr(flask_resp, "get_json") else {}
+            else:
+                flask_resp = response
+                status_code = int(getattr(flask_resp, "status_code", 200) or 200)
+                payload = flask_resp.get_json(silent=True) if hasattr(flask_resp, "get_json") else {}
+            task = TaskRecord.query.get(task_id)
+            if not task:
+                return
+            task.progress = 1.0
+            task.payload = json.dumps(payload or {}, ensure_ascii=False)
+            if status_code >= 400 or not (payload or {}).get("ok", False):
+                task.status = 'error'
+                task.error = str((payload or {}).get("error") or f"refresh_failed:{status_code}")
+            else:
+                task.status = 'completed'
+            task.finished_at = datetime.utcnow()
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            task = TaskRecord.query.get(task_id)
+            if task:
+                task.status = 'error'
+                task.error = str(exc)
+                task.finished_at = datetime.utcnow()
+                try:
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+
+
 # ------------------- Single-file Refresh API -------------------
 @app.route("/api/files/<int:file_id>/refresh", methods=["POST"])
 def api_file_refresh(file_id):
     """Re-extract text, refresh tags, and optionally re-run LLM for a single file.
     Respects runtime settings for LLM, audio summary and keywords. Always re-extracts text.
     """
+    internal_call = str(request.args.get('internal') or '').strip().lower() in ('1', 'true', 'yes', 'on')
+    async_requested = str(request.args.get('async') or '').strip().lower() in ('1', 'true', 'yes', 'on')
     user = _load_current_user()
+    if async_requested and not internal_call:
+        payload = {
+            'file_id': int(file_id),
+            'params': {
+                'use_llm': request.args.get('use_llm'),
+                'kws_audio': request.args.get('kws_audio'),
+                'summarize': request.args.get('summarize'),
+                'internal': '1',
+            },
+            'trigger_user_id': getattr(user, 'id', None),
+        }
+        task = TaskRecord(
+            name='refresh',
+            status='queued',
+            progress=0.0,
+            payload=json.dumps(payload, ensure_ascii=False),
+            user_id=getattr(user, 'id', None),
+            collection_id=getattr(File.query.get(file_id), 'collection_id', None),
+        )
+        try:
+            db.session.add(task)
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            return jsonify({'ok': False, 'error': f'Не удалось создать задачу refresh: {exc}'}), 500
+        params = {
+            'use_llm': request.args.get('use_llm') or '1',
+            'kws_audio': request.args.get('kws_audio') or '1',
+            'summarize': request.args.get('summarize') or '1',
+            'internal': '1',
+        }
+        get_task_queue().submit(
+            _run_refresh_task,
+            int(task.id),
+            int(file_id),
+            params,
+            description=f"refresh-{file_id}",
+            owner_id=getattr(user, 'id', None),
+        )
+        return jsonify({'ok': True, 'async': True, 'task_id': int(task.id)})
     f = File.query.get_or_404(file_id)
     refresh_task: TaskRecord | None = None
-    if user:
+    if user and not internal_call:
         try:
             refresh_task = TaskRecord(
                 name='refresh',
                 status='running',
                 progress=0.0,
-                payload=json.dumps({'file_id': file_id, 'user_id': user.id})
+                payload=json.dumps({'file_id': file_id, 'user_id': user.id}),
+                user_id=user.id,
+                collection_id=getattr(f, 'collection_id', None),
             )
             refresh_task.started_at = datetime.utcnow()
             db.session.add(refresh_task)
@@ -11345,8 +14539,14 @@ def api_file_refresh(file_id):
                     f.material_type = 'audio'
                 elif ext in IMAGE_EXTS:
                     f.material_type = 'image'
-                elif mt_meta:
-                    f.material_type = mt_meta or f.material_type
+                else:
+                    merged_type = _merge_llm_material_type(
+                        f.material_type,
+                        mt_meta,
+                        allow_override=True,
+                    )
+                    if merged_type:
+                        f.material_type = merged_type
                 _t = (meta.get("title") or "").strip()
                 if _t:
                     f.title = _t
@@ -11416,6 +14616,15 @@ def api_file_refresh(file_id):
                 except Exception:
                     _log("llm: summarize error")
 
+        try:
+            _apply_metadata_quality_rules(
+                f,
+                ext=ext,
+                text_excerpt=text_excerpt or (f.text_excerpt or ""),
+                filename=filename,
+            )
+        except Exception:
+            pass
         db.session.flush()
         # Базовые теги из полей
         if f.material_type:
@@ -11822,6 +15031,8 @@ def api_collection_rag_reindex(collection_id: int):
         status='queued',
         payload=json.dumps(payload, ensure_ascii=False),
         progress=0.0,
+        user_id=getattr(user, 'id', None),
+        collection_id=collection_id,
     )
     try:
         db.session.add(task)
@@ -11840,9 +15051,78 @@ def api_collection_rag_reindex(collection_id: int):
     def _runner():
         _run_rag_collection_job(task.id, collection_id, options)
 
-    get_task_queue().submit(_runner, description=f"rag-collection-{collection_id}")
+    get_task_queue().submit(
+        _runner,
+        description=f"rag-collection-{collection_id}",
+        owner_id=getattr(user, 'id', None),
+    )
 
     return jsonify({'ok': True, 'task_id': task.id, 'files': int(file_count)})
+
+
+@app.route('/api/files/<int:file_id>/rag/reindex', methods=['POST'])
+@require_admin
+def api_file_rag_reindex(file_id: int):
+    file_obj = File.query.get_or_404(file_id)
+    data = request.get_json(silent=True) or {}
+    runtime = runtime_settings_store.current
+    payload = {
+        "file_id": int(file_id),
+        "collection_id": file_obj.collection_id,
+        "status": "queued",
+        "options": {
+            "skip_if_unchanged": bool(data.get("skip_if_unchanged", True)),
+            "chunk_max_tokens": int(data.get("chunk_max_tokens") or 700),
+            "chunk_overlap": int(data.get("chunk_overlap") or 120),
+            "chunk_min_tokens": int(data.get("chunk_min_tokens") or 80),
+            "embedding_backend": str(data.get("embedding_backend") or runtime.rag_embedding_backend or "auto"),
+            "embedding_model_name": str(data.get("embedding_model_name") or runtime.rag_embedding_model or "intfloat/multilingual-e5-large"),
+        },
+    }
+    task = TaskRecord(
+        name='rag_file',
+        status='queued',
+        progress=0.0,
+        payload=json.dumps(payload, ensure_ascii=False),
+        user_id=getattr(_load_current_user(), 'id', None),
+        collection_id=getattr(file_obj, 'collection_id', None),
+    )
+    try:
+        db.session.add(task)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'ok': False, 'error': f'Не удалось создать задачу: {exc}'}), 500
+
+    options = {
+        "skip_if_unchanged": bool(data.get("skip_if_unchanged", True)),
+        "limit_chars": int(data.get("limit_chars") or 120_000),
+        "chunk_max_tokens": int(data.get("chunk_max_tokens") or 700),
+        "chunk_overlap": int(data.get("chunk_overlap") or 120),
+        "chunk_min_tokens": int(data.get("chunk_min_tokens") or 80),
+        "normalizer_version": str(data.get("normalizer_version") or "v1"),
+        "embedding_backend": str(data.get("embedding_backend") or runtime.rag_embedding_backend or "auto"),
+        "embedding_model_name": str(data.get("embedding_model_name") or runtime.rag_embedding_model or "intfloat/multilingual-e5-large"),
+        "embedding_dim": int(data.get("embedding_dim") or runtime.rag_embedding_dim or 384),
+        "embedding_batch_size": int(data.get("embedding_batch_size") or runtime.rag_embedding_batch_size or 32),
+        "embedding_device": data.get("embedding_device") or runtime.rag_embedding_device,
+        "embedding_endpoint": str(data.get("embedding_endpoint") or runtime.rag_embedding_endpoint or runtime.lmstudio_api_base or ""),
+        "embedding_api_key": str(data.get("embedding_api_key") or runtime.rag_embedding_api_key or runtime.lmstudio_api_key or ""),
+    }
+    get_task_queue().submit(
+        _run_rag_file_job,
+        int(task.id),
+        int(file_id),
+        options,
+        description=f"rag-file-{file_id}",
+        owner_id=getattr(_load_current_user(), 'id', None),
+    )
+    try:
+        actor = _load_current_user()
+        _log_user_action(actor, 'file_rag_reindex_enqueued', 'file', file_id, detail=json.dumps({"task_id": int(task.id)}))
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'task_id': int(task.id), 'file_id': int(file_id)})
 
 
 def _delete_collection_files(col_id: int, remove_fs: bool = True) -> tuple[int, list[str]]:
@@ -11930,6 +15210,7 @@ SCAN_PROGRESS = {
     "processed": 0,
     "added": 0,
     "updated": 0,
+    "duplicates": 0,
     "removed": 0,
     "current": "",
     "use_llm": False,
@@ -11942,6 +15223,7 @@ SCAN_PROGRESS = {
 }
 SCAN_CANCEL = False
 SCAN_TASK_ID: int | None = None
+SCAN_STATE_LOCK = threading.RLock()
 
 def _resolve_deleted_dir(root: Path) -> Path | None:
     deleted_cfg = app.config.get('DELETED_FOLDER')
@@ -12016,12 +15298,13 @@ def _purge_cached_artifacts(records: list[tuple[File, Path]]):
 MAX_LOG_LINES = 200
 
 def _scan_log(msg: str, level: str = "info"):
-    SCAN_PROGRESS.setdefault("history", [])
-    entry = {"t": time.time(), "level": level, "msg": str(msg)}
-    SCAN_PROGRESS["history"].append(entry)
-    if len(SCAN_PROGRESS["history"]) > MAX_LOG_LINES:
-        SCAN_PROGRESS["history"] = SCAN_PROGRESS["history"][-MAX_LOG_LINES:]
-    SCAN_PROGRESS["updated_at"] = time.time()
+    with SCAN_STATE_LOCK:
+        SCAN_PROGRESS.setdefault("history", [])
+        entry = {"t": time.time(), "level": level, "msg": str(msg)}
+        SCAN_PROGRESS["history"].append(entry)
+        if len(SCAN_PROGRESS["history"]) > MAX_LOG_LINES:
+            SCAN_PROGRESS["history"] = SCAN_PROGRESS["history"][-MAX_LOG_LINES:]
+        SCAN_PROGRESS["updated_at"] = time.time()
     log_line = f"[scan] {msg}"
     try:
         if level == 'error':
@@ -12035,21 +15318,62 @@ def _scan_log(msg: str, level: str = "info"):
 
 def _update_eta():
     try:
-        st = SCAN_PROGRESS
-        total = int(st.get("total") or 0)
-        processed = int(st.get("processed") or 0)
-        started = st.get("started_at") or time.time()
+        with SCAN_STATE_LOCK:
+            st = SCAN_PROGRESS
+            total = int(st.get("total") or 0)
+            processed = int(st.get("processed") or 0)
+            started = st.get("started_at") or time.time()
         if processed <= 0 or total <= 0:
-            st["eta_seconds"] = None
+            with SCAN_STATE_LOCK:
+                st["eta_seconds"] = None
             return
         elapsed = max(0.001, time.time() - float(started))
         rate = processed / elapsed
         remain = max(0, total - processed)
         eta = remain / rate if rate > 0 else None
-        st["eta_seconds"] = int(eta) if eta is not None else None
+        with SCAN_STATE_LOCK:
+            st["eta_seconds"] = int(eta) if eta is not None else None
     except Exception:
-        st = SCAN_PROGRESS
-        st["eta_seconds"] = None
+        with SCAN_STATE_LOCK:
+            st = SCAN_PROGRESS
+            st["eta_seconds"] = None
+
+def _find_duplicate_file_by_sha1(sha1: str, current_file_id: int | None = None) -> File | None:
+    key = (sha1 or "").strip()
+    if not key:
+        return None
+    try:
+        q = File.query.filter(File.sha1 == key)
+        if current_file_id:
+            q = q.filter(File.id != current_file_id)
+        return q.order_by(File.id.asc()).first()
+    except Exception:
+        return None
+
+
+def _hydrate_from_duplicate(target: File, source: File) -> None:
+    if not target or not source:
+        return
+    for field in ("title", "author", "year", "advisor", "keywords", "abstract"):
+        if not getattr(target, field, None) and getattr(source, field, None):
+            setattr(target, field, getattr(source, field))
+    if not getattr(target, "material_type", None):
+        src_type = getattr(source, "material_type", None)
+        if src_type:
+            target.material_type = src_type
+    elif (target.material_type or "").strip().lower() == "document":
+        src_type = (getattr(source, "material_type", None) or "").strip().lower()
+        if src_type and src_type != "document":
+            target.material_type = src_type
+    if not getattr(target, "text_excerpt", None):
+        src_excerpt = getattr(source, "text_excerpt", None)
+        if src_excerpt:
+            target.text_excerpt = src_excerpt
+    try:
+        for tag in Tag.query.filter_by(file_id=source.id).all():
+            upsert_tag(target, tag.key, tag.value)
+    except Exception:
+        pass
 
 def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip: int = 0, targets: list | None = None):
     global SCAN_PROGRESS, SCAN_CANCEL, SCAN_TASK_ID
@@ -12071,20 +15395,22 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 except Exception:
                     db.session.rollback()
                     task = None
-            SCAN_PROGRESS.update({
-                "running": True,
-                "stage": "counting",
-                "processed": 0,
-                "added": 0,
-                "updated": 0,
-                "removed": 0,
-                "error": None,
-                "use_llm": bool(use_llm),
-                "started_at": time.time(),
-                "updated_at": time.time(),
-                "eta_seconds": None,
-                "history": [],
-            })
+            with SCAN_STATE_LOCK:
+                SCAN_PROGRESS.update({
+                    "running": True,
+                    "stage": "counting",
+                    "processed": 0,
+                    "added": 0,
+                    "updated": 0,
+                    "duplicates": 0,
+                    "removed": 0,
+                    "error": None,
+                    "use_llm": bool(use_llm),
+                    "started_at": time.time(),
+                    "updated_at": time.time(),
+                    "eta_seconds": None,
+                    "history": [],
+                })
             _scan_log("Начало сканирования")
             root = _scan_root_path()
             # определяем набор для сканирования: явные цели или полный корневой обход
@@ -12099,7 +15425,8 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
             else:
                 file_list = list(_iter_files_for_scan(root))
             total = len(file_list)
-            SCAN_PROGRESS["total"] = total
+            with SCAN_STATE_LOCK:
+                SCAN_PROGRESS["total"] = total
             if task:
                 try:
                     task.progress = 0.0
@@ -12117,22 +15444,26 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
             if skip:
                 _scan_log(f"Продолжение: пропуск первых {skip} из {total}")
                 file_list = file_list[skip:]
-                SCAN_PROGRESS["processed"] = skip
+                with SCAN_STATE_LOCK:
+                    SCAN_PROGRESS["processed"] = skip
             _scan_log(f"Найдено файлов: {len(file_list)}")
 
-            added = updated = 0
+            added = updated = duplicates = 0
             cancelled = False
             for idx, path in enumerate(file_list, start=1):
-                if SCAN_CANCEL:
+                with SCAN_STATE_LOCK:
+                    cancelled_requested = bool(SCAN_CANCEL)
+                if cancelled_requested:
                     _scan_log("Отмена пользователем", level="warn")
                     cancelled = True
                     break
-                SCAN_PROGRESS.update({
-                    "stage": "processing",
-                    "processed": (skip + idx),
-                    "current": str(path.name),
-                    "updated_at": time.time()
-                })
+                with SCAN_STATE_LOCK:
+                    SCAN_PROGRESS.update({
+                        "stage": "processing",
+                        "processed": (skip + idx),
+                        "current": str(path.name),
+                        "updated_at": time.time()
+                    })
                 _update_eta()
                 if task and total:
                     try:
@@ -12162,7 +15493,8 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                                     ext=ext, size=size, mtime=mtime, sha1=sha1)
                     db.session.add(file_obj)
                     added += 1
-                    SCAN_PROGRESS["added"] = added
+                    with SCAN_STATE_LOCK:
+                        SCAN_PROGRESS["added"] = added
                 else:
                     if (file_obj.size != size) or (file_obj.mtime != mtime):
                         sha1 = sha1_of_file(path)
@@ -12171,11 +15503,25 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                         file_obj.mtime = mtime
                         file_obj.filename = filename
                     updated += 1
-                    SCAN_PROGRESS["updated"] = updated
+                    with SCAN_STATE_LOCK:
+                        SCAN_PROGRESS["updated"] = updated
+
+                duplicate_source: File | None = _find_duplicate_file_by_sha1(file_obj.sha1 or "", file_obj.id)
+                skip_expensive_processing = duplicate_source is not None
+                if duplicate_source:
+                    _hydrate_from_duplicate(file_obj, duplicate_source)
+                    duplicates += 1
+                    with SCAN_STATE_LOCK:
+                        SCAN_PROGRESS["duplicates"] = duplicates
+                    if idx == 1 or idx % 10 == 0:
+                        _scan_log(
+                            f"Дубликат по хешу: {path.name} -> id={duplicate_source.id}; пропуск OCR/LLM",
+                            level="info",
+                        )
 
                 # Извлечение текста (на основе текущей логики)
                 text_excerpt = ""
-                if extract_text:
+                if extract_text and not skip_expensive_processing:
                     if ext == ".pdf":
                         text_excerpt = extract_text_pdf(path, limit_chars=40000)
                     elif ext == ".docx":
@@ -12238,6 +15584,8 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                                     file_obj.keywords = ", ".join(kws)
                         except Exception as _e:
                             _scan_log(f"audio keywords llm failed: {_e}", level="warn")
+                if skip_expensive_processing:
+                    text_excerpt = file_obj.text_excerpt or ""
 
                 # Встроенные ключевые слова в тексте для диссертаций/статей
                 try:
@@ -12308,9 +15656,10 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                     _scan_log(f"richer tags error: {e}", level="warn")
 
                 # Обогащение через LLM (может быть медленным)
-                if use_llm and (text_excerpt or ext in {'.txt', '.md'} or ext in IMAGE_EXTS or ext in {'.pdf','.docx','.rtf','.epub','.djvu'}):
-                    SCAN_PROGRESS["stage"] = "llm"
-                    SCAN_PROGRESS["updated_at"] = time.time()
+                if (not skip_expensive_processing) and use_llm and (text_excerpt or ext in {'.txt', '.md'} or ext in IMAGE_EXTS or ext in {'.pdf','.docx','.rtf','.epub','.djvu'}):
+                    with SCAN_STATE_LOCK:
+                        SCAN_PROGRESS["stage"] = "llm"
+                        SCAN_PROGRESS["updated_at"] = time.time()
                     _scan_log(f"LLM-анализ: {path.name}")
                     llm_text = text_excerpt or ""
                     if not llm_text and ext in {".txt", ".md"}:
@@ -12348,8 +15697,14 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                             file_obj.material_type = 'audio'
                         elif ext in IMAGE_EXTS:
                             file_obj.material_type = 'image'
-                        elif TYPE_LLM_OVERRIDE and mt_meta:
-                            file_obj.material_type = mt_meta
+                        else:
+                            merged_type = _merge_llm_material_type(
+                                file_obj.material_type,
+                                mt_meta,
+                                allow_override=bool(TYPE_LLM_OVERRIDE),
+                            )
+                            if merged_type:
+                                file_obj.material_type = merged_type
                         _t = (meta.get("title") or "").strip()
                         if _t:
                             file_obj.title = _t
@@ -12421,6 +15776,15 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                     except Exception as e:
                         _scan_log(f"richer tags error(2): {e}", level="warn")
 
+                try:
+                    _apply_metadata_quality_rules(
+                        file_obj,
+                        ext=ext,
+                        text_excerpt=text_excerpt or (file_obj.text_excerpt or ""),
+                        filename=filename,
+                    )
+                except Exception:
+                    pass
                 db.session.flush()
                 # Базовые теги
                 if file_obj.material_type:
@@ -12437,9 +15801,12 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 db.session.commit()
 
             removed = 0
-            if prune and not SCAN_CANCEL:
-                SCAN_PROGRESS["stage"] = "prune"
-                SCAN_PROGRESS["updated_at"] = time.time()
+            with SCAN_STATE_LOCK:
+                should_prune = bool(prune and not SCAN_CANCEL)
+            if should_prune:
+                with SCAN_STATE_LOCK:
+                    SCAN_PROGRESS["stage"] = "prune"
+                    SCAN_PROGRESS["updated_at"] = time.time()
                 _scan_log("Удаление отсутствующих файлов")
                 removed = prune_missing_files()
                 try:
@@ -12448,7 +15815,8 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 except Exception as rebuild_exc:
                     _scan_log(f"fts rebuild failed: {rebuild_exc}", level='warn')
                 db.session.commit()
-            SCAN_PROGRESS.update({"removed": removed, "stage": "done", "running": False, "updated_at": time.time()})
+            with SCAN_STATE_LOCK:
+                SCAN_PROGRESS.update({"removed": removed, "stage": "done", "running": False, "updated_at": time.time()})
             _scan_log("Сканирование завершено")
             if task:
                 try:
@@ -12459,7 +15827,8 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 except Exception:
                     db.session.rollback()
         except Exception as e:
-            SCAN_PROGRESS.update({"error": str(e), "running": False, "stage": "error", "updated_at": time.time()})
+            with SCAN_STATE_LOCK:
+                SCAN_PROGRESS.update({"error": str(e), "running": False, "stage": "error", "updated_at": time.time()})
             _scan_log(f"Ошибка: {e}", level="error")
             if task:
                 try:
@@ -12470,10 +15839,11 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
                 except Exception:
                     db.session.rollback()
         finally:
-            SCAN_CANCEL = False
-            SCAN_TASK_ID = None
-            SCAN_PROGRESS["task_id"] = None
-            SCAN_PROGRESS["scope"] = None
+            with SCAN_STATE_LOCK:
+                SCAN_CANCEL = False
+                SCAN_TASK_ID = None
+                SCAN_PROGRESS["task_id"] = None
+                SCAN_PROGRESS["scope"] = None
             try:
                 db.session.remove()
             except Exception:
@@ -12483,19 +15853,22 @@ def _run_scan_with_progress(extract_text: bool, use_llm: bool, prune: bool, skip
 @require_admin
 def scan_start():
     global SCAN_CANCEL, SCAN_TASK_ID
-    if SCAN_PROGRESS.get("running"):
+    with SCAN_STATE_LOCK:
+        running = bool(SCAN_PROGRESS.get("running"))
+    if running:
         return jsonify({"status": "busy"}), 409
     extract_text = _bool_from_form(request.form, "extract_text", EXTRACT_TEXT)
     use_llm = _bool_from_form(request.form, "use_llm", DEFAULT_USE_LLM)
     prune = _bool_from_form(request.form, "prune", DEFAULT_PRUNE)
-    SCAN_PROGRESS["scope"] = {
-        "type": "library",
-        "label": "Вся библиотека",
-        "extract_text": bool(extract_text),
-        "use_llm": bool(use_llm),
-        "prune": bool(prune),
-    }
-    SCAN_CANCEL = False
+    with SCAN_STATE_LOCK:
+        SCAN_PROGRESS["scope"] = {
+            "type": "library",
+            "label": "Вся библиотека",
+            "extract_text": bool(extract_text),
+            "use_llm": bool(use_llm),
+            "prune": bool(prune),
+        }
+        SCAN_CANCEL = False
     skip = 0
     try:
         skip = int(request.form.get('skip', '0') or 0)
@@ -12523,15 +15896,24 @@ def scan_start():
         "skip": skip,
     }
     try:
-        task = TaskRecord(name='scan', status='queued', payload=json.dumps(payload), progress=0.0)
+        task = TaskRecord(
+            name='scan',
+            status='queued',
+            payload=json.dumps(payload),
+            progress=0.0,
+            user_id=getattr(_load_current_user(), 'id', None),
+            collection_id=None,
+        )
         db.session.add(task)
         db.session.commit()
-        SCAN_TASK_ID = task.id
-        SCAN_PROGRESS["task_id"] = task.id
+        with SCAN_STATE_LOCK:
+            SCAN_TASK_ID = task.id
+            SCAN_PROGRESS["task_id"] = task.id
     except Exception:
         db.session.rollback()
-        SCAN_TASK_ID = None
-        SCAN_PROGRESS["task_id"] = None
+        with SCAN_STATE_LOCK:
+            SCAN_TASK_ID = None
+            SCAN_PROGRESS["task_id"] = None
     _log_user_action(_load_current_user(), 'scan_start', 'scan', SCAN_TASK_ID, detail=json.dumps(payload))
     get_task_queue().submit(
         _run_scan_with_progress,
@@ -12540,6 +15922,7 @@ def scan_start():
         prune,
         skip,
         description="scan-full",
+        owner_id=getattr(_load_current_user(), 'id', None),
     )
     return jsonify({"status": "started"})
 
@@ -12548,7 +15931,9 @@ def scan_start():
 @require_admin
 def scan_collection(collection_id: int):
     global SCAN_CANCEL, SCAN_TASK_ID
-    if SCAN_PROGRESS.get("running"):
+    with SCAN_STATE_LOCK:
+        running = bool(SCAN_PROGRESS.get("running"))
+    if running:
         return jsonify({"status": "busy"}), 409
     collection = Collection.query.get(collection_id)
     if not collection:
@@ -12592,16 +15977,17 @@ def scan_collection(collection_id: int):
         return jsonify({"status": "empty", "collection_id": collection_id, "files": 0, "missing": missing})
 
     _purge_cached_artifacts(records)
-    SCAN_CANCEL = False
-    SCAN_PROGRESS["scope"] = {
-        "type": "collection",
-        "collection_id": collection.id,
-        "label": f"Коллекция «{collection.name}»",
-        "count": len(targets),
-        "extract_text": bool(extract_text),
-        "use_llm": bool(use_llm),
-        "prune": bool(prune),
-    }
+    with SCAN_STATE_LOCK:
+        SCAN_CANCEL = False
+        SCAN_PROGRESS["scope"] = {
+            "type": "collection",
+            "collection_id": collection.id,
+            "label": f"Коллекция «{collection.name}»",
+            "count": len(targets),
+            "extract_text": bool(extract_text),
+            "use_llm": bool(use_llm),
+            "prune": bool(prune),
+        }
 
     payload = {
         "extract_text": extract_text,
@@ -12613,15 +15999,24 @@ def scan_collection(collection_id: int):
         "missing": missing,
     }
     try:
-        task = TaskRecord(name='scan', status='queued', payload=json.dumps(payload), progress=0.0)
+        task = TaskRecord(
+            name='scan',
+            status='queued',
+            payload=json.dumps(payload),
+            progress=0.0,
+            user_id=getattr(_load_current_user(), 'id', None),
+            collection_id=collection.id,
+        )
         db.session.add(task)
         db.session.commit()
-        SCAN_TASK_ID = task.id
-        SCAN_PROGRESS["task_id"] = task.id
+        with SCAN_STATE_LOCK:
+            SCAN_TASK_ID = task.id
+            SCAN_PROGRESS["task_id"] = task.id
     except Exception:
         db.session.rollback()
-        SCAN_TASK_ID = None
-        SCAN_PROGRESS["task_id"] = None
+        with SCAN_STATE_LOCK:
+            SCAN_TASK_ID = None
+            SCAN_PROGRESS["task_id"] = None
 
     try:
         _log_user_action(_load_current_user(), 'scan_collection_start', 'collection', collection.id, detail=json.dumps(payload))
@@ -12636,18 +16031,23 @@ def scan_collection(collection_id: int):
         0,
         targets,
         description=f"scan-collection-{collection.id}",
+        owner_id=getattr(_load_current_user(), 'id', None),
     )
     return jsonify({"status": "started", "files": len(targets), "missing": missing})
 
 @app.route("/scan/status")
+@require_admin
 def scan_status():
-    return jsonify(SCAN_PROGRESS)
+    with SCAN_STATE_LOCK:
+        snapshot = copy.deepcopy(SCAN_PROGRESS)
+    return jsonify(snapshot)
 
 @app.route("/scan/cancel", methods=["POST"])
 @require_admin
 def scan_cancel():
     global SCAN_CANCEL
-    SCAN_CANCEL = True
+    with SCAN_STATE_LOCK:
+        SCAN_CANCEL = True
     try:
         if SCAN_TASK_ID:
             task = TaskRecord.query.get(SCAN_TASK_ID)
@@ -13534,6 +16934,7 @@ def _enqueue_feedback_training(
         status='queued',
         progress=0.0,
         payload=json.dumps(payload, ensure_ascii=False),
+        user_id=int(submitted_by) if submitted_by else None,
     )
     db.session.add(task)
     db.session.commit()
@@ -13543,8 +16944,36 @@ def _enqueue_feedback_training(
         task_id,
         cutoff_days,
         description='feedback_model_train',
+        owner_id=int(submitted_by) if submitted_by else None,
     )
     return task_id, True
+
+
+def _maybe_enqueue_feedback_training_online(*, trigger: str, submitted_by: Optional[int]) -> tuple[Optional[int], bool]:
+    global FEEDBACK_ONLINE_TRAIN_LAST_AT
+    now_ts = time.time()
+    min_interval = max(30.0, float(FEEDBACK_ONLINE_TRAIN_MIN_INTERVAL_SEC or 0.0))
+    if FEEDBACK_ONLINE_TRAIN_LAST_AT > 0 and (now_ts - FEEDBACK_ONLINE_TRAIN_LAST_AT) < min_interval:
+        return None, False
+    try:
+        events = int(
+            db.session.query(func.count(AiSearchKeywordFeedback.id))
+            .scalar() or 0
+        )
+    except Exception:
+        return None, False
+    threshold = max(1, int(FEEDBACK_ONLINE_TRAIN_EVERY_EVENTS or 1))
+    if events <= 0 or (events % threshold) != 0:
+        return None, False
+    task_id, queued = _enqueue_feedback_training(
+        cutoff_days=FEEDBACK_TRAIN_CUTOFF_DAYS,
+        trigger=trigger,
+        submitted_by=submitted_by,
+        allow_duplicate=False,
+    )
+    if queued:
+        FEEDBACK_ONLINE_TRAIN_LAST_AT = now_ts
+    return task_id, queued
 
 
 def _feedback_training_job(task_id: int, cutoff_days: Optional[int]) -> None:
@@ -14947,6 +18376,7 @@ def _ai_search_core(data: dict | None, progress_cb=None) -> dict:
         "items": results,
         "progress": progress.lines,
         "rag_context": rag_context_payload,
+        "rag_context_groups": _group_context_sections_by_document(rag_context_sections),
         "rag_validation": rag_validation.as_dict() if rag_validation else None,
         "rag_risk": rag_risk_info,
         "rag_sources": rag_sources_payload,
@@ -15310,23 +18740,13 @@ def _build_dataset_from_problems(
     return dataset, meta
 
 
+# CORS helpers now delegate to agregator.middleware.errors
 def _add_pipeline_cors_headers(response: Response) -> Response:
-    origin = request.headers.get('Origin')
-    if origin:
-        response.headers['Access-Control-Allow-Origin'] = origin
-        vary = response.headers.get('Vary')
-        response.headers['Vary'] = f"{vary}, Origin" if vary else 'Origin'
-        response.headers['Access-Control-Allow-Credentials'] = 'true'
-    else:
-        response.headers.setdefault('Access-Control-Allow-Origin', '*')
-    response.headers.setdefault('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-    response.headers.setdefault('Access-Control-Allow-Methods', 'POST, OPTIONS')
-    return response
+    return _add_pipeline_cors_headers_impl(response)
 
 
 def _pipeline_cors_preflight() -> Response:
-    response = make_response('', 204)
-    return _add_pipeline_cors_headers(response)
+    return _pipeline_cors_preflight_impl()
 
 
 def _ai_search_stream_response(data: dict) -> Response:
@@ -15553,6 +18973,8 @@ def api_doc_chat_prepare_collection(collection_id: int):
         status='queued',
         payload=json.dumps(payload, ensure_ascii=False),
         progress=0.0,
+        user_id=getattr(user, 'id', None),
+        collection_id=collection_id,
     )
     try:
         db.session.add(task)
@@ -15569,7 +18991,11 @@ def api_doc_chat_prepare_collection(collection_id: int):
     def _runner():
         _doc_chat_collection_job(task.id, pending_ids, user_id, allowed_ids)
 
-    get_task_queue().submit(_runner, description=f"doc-chat-collection-{collection_id}")
+    get_task_queue().submit(
+        _runner,
+        description=f"doc-chat-collection-{collection_id}",
+        owner_id=getattr(user, 'id', None),
+    )
     return jsonify({'ok': True, 'task_id': task.id, 'pending': len(pending_ids)})
 
 
@@ -15825,6 +19251,24 @@ def api_doc_chat_ask():
     if session_internal.get('status') != 'ready':
         return jsonify({'ok': False, 'error': 'Документ ещё обрабатывается'}), 409
     doc_data = session_internal.get('data') or {}
+    history = session_internal.get('history') or []
+    requested_mode_raw = str(payload.get('mode') or '').strip().lower()
+    mode_key, mode_config = _doc_chat_resolve_mode(requested_mode_raw)
+    max_chunks = max(1, int(mode_config.get('max_chunks', 4)))
+    fallback_chunks = max(1, int(mode_config.get('fallback_chunks', min(2, max_chunks))))
+    prefer_math_chunks = bool(mode_config.get('prefer_math_chunks'))
+    require_terms = bool(mode_config.get('require_terms'))
+    prefer_technical_images = bool(mode_config.get('prefer_technical_images'))
+    image_limit = max(1, int(mode_config.get('image_limit', 3)))
+    user_prefs = _doc_chat_get_user_preferences(user)
+    tone_pref = DOC_CHAT_TONE_OPTIONS.get(user_prefs.get('tone', ''), DOC_CHAT_TONE_OPTIONS['neutral'])
+    detail_pref = DOC_CHAT_DETAIL_OPTIONS.get(user_prefs.get('detail', ''), DOC_CHAT_DETAIL_OPTIONS['balanced'])
+    language_pref = DOC_CHAT_LANGUAGE_OPTIONS.get(user_prefs.get('language', ''), DOC_CHAT_LANGUAGE_OPTIONS['ru'])
+    history_context = _doc_chat_history_context(history, max_pairs=3, max_chars=1200)
+    question_for_vector = question
+    if history_context:
+        question_for_vector = f"{history_context}\n\nТекущий вопрос: {question}"
+    recent_chunk_ids = _doc_chat_recent_chunk_ids(history, limit=4)
     document_id = doc_data.get('document_id')
     embedding_info = doc_data.get('embedding') or {}
     if not document_id or not embedding_info:
@@ -15852,15 +19296,26 @@ def api_doc_chat_ask():
             base_url=endpoint or None,
             api_key=api_key or None,
         )
-        texts_to_embed = [question]
+        texts_to_embed = [question_for_vector]
         for idx, image in enumerate(images):
             description = str(image.get('description') or '').strip()
             keywords = image.get('keywords') or []
             kw_text = ", ".join(str(k) for k in keywords if k)
-            combined = description
+            before_ctx = str(image.get('context_before') or '').strip()
+            after_ctx = str(image.get('context_after') or '').strip()
+            ocr_snippet = str(image.get('ocr_text') or '')[:800].strip()
+            parts: list[str] = []
+            if description:
+                parts.append(description)
             if kw_text:
-                combined = f"{description}\nКлючевые слова: {kw_text}" if description else f"Ключевые слова: {kw_text}"
-            combined = combined.strip()
+                parts.append(f"Ключевые слова: {kw_text}")
+            if before_ctx:
+                parts.append(f"Предыдущий абзац: {before_ctx}")
+            if after_ctx:
+                parts.append(f"Следующий абзац: {after_ctx}")
+            if ocr_snippet:
+                parts.append(f"OCR: {ocr_snippet}")
+            combined = "\n".join(parts).strip()
             if combined:
                 image_vector_indexes[idx] = len(texts_to_embed)
                 texts_to_embed.append(combined)
@@ -15887,19 +19342,28 @@ def api_doc_chat_ask():
     )
     retrieved = retriever.search_by_vector(
         question_vector,
-        top_k=6,
+        top_k=max(6, max_chunks + 2),
         allowed_document_ids=[document_id],
     )
 
-    question_terms = [term for term in re.findall(r"\w+", question.lower()) if len(term) >= 3]
+    question_terms = [term for term in re.findall(r"\w+", question_for_vector.lower()) if len(term) >= 3]
     max_score = max((float(item.score or 0.0) for item in retrieved), default=0.0)
+    threshold_factor = float(mode_config.get('score_threshold_factor', 0.45))
+    low_score_factor = float(mode_config.get('low_score_threshold_factor', max(threshold_factor, 0.6)))
+    score_switch_point = float(mode_config.get('score_switch_point', 0.2))
+    min_threshold = float(mode_config.get('min_threshold', 0.05))
     score_threshold = 0.0
     if max_score > 0.0:
-        score_threshold = max(0.05, max_score * 0.45 if max_score >= 0.2 else max_score * 0.6)
+        factor = threshold_factor if max_score >= score_switch_point else low_score_factor
+        score_threshold = max(min_threshold, max_score * factor)
 
     filtered_chunks: list[tuple[Any, str, list[str], float]] = []
+    deferred_terms: list[tuple[Any, str, list[str], float]] = []
+    deferred_math: list[tuple[Any, str, list[str], float]] = []
     seen_snippets: set[str] = set()
     for item in retrieved:
+        if len(filtered_chunks) >= max_chunks:
+            break
         chunk = item.chunk
         snippet_full = (chunk.content or '').strip()
         if not snippet_full:
@@ -15913,16 +19377,68 @@ def api_doc_chat_ask():
         passes_score = score >= score_threshold or not filtered_chunks
         if not has_terms and not passes_score:
             continue
-        if len(snippet_full) < 60 and score < max_score * 0.8:
+        if len(snippet_full) < 60 and max_score > 0.0 and score < max_score * 0.8:
             continue
+        chunk_has_math = _doc_chat_snippet_has_math(snippet_full)
         highlights = _doc_chat_extract_highlights(snippet_full, question_terms, limit=3)
-        filtered_chunks.append((item, snippet, highlights, score))
+        entry = (item, snippet, highlights, score)
         seen_snippets.add(snippet_norm)
-        if len(filtered_chunks) >= 4:
-            break
+        if require_terms and not has_terms:
+            deferred_terms.append(entry)
+            continue
+        if prefer_math_chunks and not chunk_has_math:
+            deferred_math.append(entry)
+            continue
+        filtered_chunks.append(entry)
+
+    if len(filtered_chunks) < max_chunks:
+        for pool in (deferred_terms, deferred_math):
+            if len(filtered_chunks) >= max_chunks:
+                break
+            for entry in pool:
+                filtered_chunks.append(entry)
+                if len(filtered_chunks) >= max_chunks:
+                    break
+
+    if recent_chunk_ids:
+        chunk_map: dict[int, Any] = {}
+        for item in retrieved:
+            chunk_obj = getattr(item, 'chunk', None)
+            chunk_id = getattr(chunk_obj, 'id', None)
+            try:
+                chunk_id_int = int(chunk_id)
+            except Exception:
+                continue
+            chunk_map[chunk_id_int] = item
+        existing_ids: set[int] = set()
+        for entry in filtered_chunks:
+            chunk_obj = getattr(entry[0], 'chunk', None)
+            chunk_id = getattr(chunk_obj, 'id', None)
+            try:
+                chunk_id_int = int(chunk_id)
+            except Exception:
+                continue
+            existing_ids.add(chunk_id_int)
+        for chunk_id in recent_chunk_ids:
+            if chunk_id in existing_ids:
+                continue
+            candidate = chunk_map.get(chunk_id)
+            if not candidate:
+                continue
+            chunk_obj = candidate.chunk
+            snippet_full = (chunk_obj.content or '').strip()
+            if not snippet_full:
+                continue
+            snippet = snippet_full[:800]
+            highlights = _doc_chat_extract_highlights(snippet_full, question_terms, limit=2)
+            entry = (candidate, snippet, highlights, float(candidate.score or 0.0))
+            filtered_chunks.insert(0, entry)
+            existing_ids.add(chunk_id)
+            if len(filtered_chunks) >= max_chunks:
+                break
 
     if not filtered_chunks:
-        for item in retrieved[:2]:
+        for item in retrieved[:fallback_chunks]:
             chunk = item.chunk
             snippet_full = (chunk.content or '').strip()
             if not snippet_full:
@@ -15930,8 +19446,11 @@ def api_doc_chat_ask():
             snippet = snippet_full[:800]
             highlights = _doc_chat_extract_highlights(snippet_full, question_terms, limit=2)
             filtered_chunks.append((item, snippet, highlights, float(item.score or 0.0)))
-            if len(filtered_chunks) >= 2:
+            if len(filtered_chunks) >= fallback_chunks:
                 break
+
+    if len(filtered_chunks) > max_chunks:
+        filtered_chunks = filtered_chunks[:max_chunks]
 
     context_sections: list[dict[str, Any]] = []
     text_sources: list[dict[str, Any]] = []
@@ -15956,8 +19475,14 @@ def api_doc_chat_ask():
             'score': round(float(score), 4),
             'highlights': highlights,
         })
+        chunk_id_val = getattr(chunk, 'id', None)
+        try:
+            chunk_id_int = int(chunk_id_val)
+        except Exception:
+            chunk_id_int = None
         text_sources.append({
             'label': label,
+            'chunk_id': chunk_id_int,
             'section_path': section_path,
             'page': page,
             'score': round(float(score), 4),
@@ -15980,6 +19505,7 @@ def api_doc_chat_ask():
             })
             text_sources.append({
                 'label': label,
+                'chunk_id': None,
                 'section_path': preview.get('section_path'),
                 'page': None,
                 'score': 0.0,
@@ -16000,11 +19526,22 @@ def api_doc_chat_ask():
                 'description': image.get('description'),
                 'keywords': image.get('keywords') or [],
                 'url': image.get('url'),
+                'context_before': image.get('context_before'),
+                'context_after': image.get('context_after'),
+                'ocr_preview': image.get('ocr_preview') or (str(image.get('ocr_text') or '').strip()[:400] or None),
                 'score': round(float(score), 4),
             })
         scored_images.sort(key=lambda item: item['score'], reverse=True)
+        technical_images = [img for img in scored_images if _doc_chat_image_is_technical(img)] if prefer_technical_images else []
         relevant_images = [img for img in scored_images if img['score'] >= 0.05]
-        image_sources = (relevant_images[:3] if relevant_images else scored_images[:1]) if scored_images else []
+        candidates: list[dict[str, Any]] = []
+        if prefer_technical_images and technical_images:
+            candidates = technical_images
+        elif relevant_images:
+            candidates = relevant_images
+        else:
+            candidates = scored_images
+        image_sources = candidates[:image_limit] if candidates else []
 
     doc_meta = session_internal.get('file_meta') or {}
     doc_title = doc_meta.get('title') or f"Документ {doc_meta.get('id')}"
@@ -16037,8 +19574,25 @@ def api_doc_chat_ask():
                 meta_line.append(f"стр. {image['page']}")
             meta_suffix = f" ({', '.join(meta_line)})" if meta_line else ""
             keywords = image.get('keywords') or []
-            kw_text = f" Ключевые слова: {', '.join(keywords)}." if keywords else ""
-            context_parts.append(f"[{image['label']}{meta_suffix}]\n{image.get('description') or ''}{kw_text}".strip())
+            desc_parts: list[str] = []
+            description = str(image.get('description') or '').strip()
+            if description:
+                desc_parts.append(description)
+            if keywords:
+                desc_parts.append(f"Ключевые слова: {', '.join(keywords)}.")
+            before_ctx = image.get('context_before')
+            if before_ctx:
+                desc_parts.append(f"Предыдущий абзац: {before_ctx}")
+            after_ctx = image.get('context_after')
+            if after_ctx:
+                desc_parts.append(f"Следующий абзац: {after_ctx}")
+            ocr_preview = str(image.get('ocr_preview') or '').strip()
+            if not ocr_preview:
+                ocr_preview = str(image.get('ocr_text') or '')[:400].strip()
+            if ocr_preview:
+                desc_parts.append(f"OCR: {ocr_preview}")
+            block_text = "\n".join(desc_parts).strip() or "Описание изображения недоступно."
+            context_parts.append(f"[{image['label']}{meta_suffix}]\n{block_text}")
     if not context_parts:
         context_parts.append("Контекст: подходящие фрагменты не найдены, ответ может быть неполным.")
     context_blob = "\n\n".join(context_parts)
@@ -16046,16 +19600,27 @@ def api_doc_chat_ask():
     if len(context_blob) > max_chars:
         context_blob = context_blob[:max_chars]
 
-    system_prompt = (
+    base_instruction = (
         "Ты виртуальный эксперт по документам. Используй приведённые фрагменты текста и описания изображений, "
         "чтобы ответить на вопрос. Указывай ссылки на использованные части форматом «Текст N» или «Изображение N». "
-        "Если данных недостаточно, прямо сообщи об этом. Отвечай на русском языке.\n\n"
-        f"{doc_info_line}\n\nКонтекст:\n{context_blob}"
+        "Если данных недостаточно, прямо сообщи об этом."
     )
+    persona_instruction_parts = [
+        tone_pref.get('instruction'),
+        detail_pref.get('instruction'),
+        language_pref.get('instruction'),
+    ]
+    persona_instruction = "\n".join(part for part in persona_instruction_parts if part)
+    if persona_instruction:
+        base_instruction = f"{base_instruction}\n\n{persona_instruction}"
+    mode_instruction = str(mode_config.get('instruction') or '').strip()
+    if mode_instruction:
+        base_instruction = f"{base_instruction}\n\n{mode_instruction}"
+    history_section = f"История диалога:\n{history_context}\n\n" if history_context else ""
+    system_prompt = f"{base_instruction}\n\n{history_section}{doc_info_line}\n\nКонтекст:\n{context_blob}"
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
     ]
-    history = session_internal.get('history') or []
     for turn in history[-6:]:
         role = turn.get('role')
         content = turn.get('content')
@@ -16063,21 +19628,36 @@ def api_doc_chat_ask():
             messages.append({'role': role, 'content': str(content)})
     messages.append({'role': 'user', 'content': question})
 
+    llm_max_tokens = int(detail_pref.get('max_tokens', 900) or 900)
     try:
-        answer = call_doc_chat_llm(messages, temperature=0.2, max_tokens=900)
+        answer = call_doc_chat_llm(messages, temperature=0.2, max_tokens=llm_max_tokens)
     except Exception as exc:
         app.logger.warning("doc-chat LLM failed: %s", exc)
         return jsonify({'ok': False, 'error': 'Не удалось получить ответ'}), 500
     answer = (answer or '').strip()
 
-    _doc_chat_append_history(session_id, {'role': 'user', 'content': question})
-    _doc_chat_append_history(session_id, {'role': 'assistant', 'content': answer, 'sources': {'texts': text_sources, 'images': image_sources}})
+    validation_info = _doc_chat_assess_answer_quality(
+        answer,
+        question_terms=question_terms,
+        text_sources=text_sources,
+        image_sources=image_sources,
+    )
+
+    _doc_chat_append_history(session_id, {'role': 'user', 'content': question, 'mode': mode_key})
+    _doc_chat_append_history(session_id, {
+        'role': 'assistant',
+        'content': answer,
+        'mode': mode_key,
+        'sources': {'texts': text_sources, 'images': image_sources},
+        'validation': validation_info,
+    })
 
     try:
         detail = json.dumps({
             'session_id': session_id,
             'file_id': session_internal.get('file_id'),
             'question': question[:200],
+            'mode': mode_key,
         }, ensure_ascii=False)
         _log_user_action(user, 'doc_chat_ask', 'file', session_internal.get('file_id'), detail=detail[:2000])
     except Exception:
@@ -16091,7 +19671,9 @@ def api_doc_chat_ask():
             'texts': text_sources,
             'images': image_sources,
         },
+        'validation': validation_info,
         'session': snapshot,
+        'mode': mode_key,
     })
 
 
@@ -16118,6 +19700,37 @@ def api_doc_chat_clear():
         session['updated_at'] = now
     snapshot = _doc_chat_public_session(session_id)
     return jsonify({'ok': True, 'session': snapshot})
+
+
+@app.route('/api/doc-chat/preferences', methods=['GET', 'POST'])
+def api_doc_chat_preferences():
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    if request.method == 'GET':
+        prefs = _doc_chat_get_user_preferences(user)
+        return jsonify({
+            'ok': True,
+            'preferences': prefs,
+            'options': _doc_chat_pref_options_payload(),
+        })
+    data = request.get_json(silent=True) or {}
+    updates: dict[str, Any] = {}
+    for key in DOC_CHAT_PREFERENCE_OPTIONS:
+        if key in data:
+            updates[key] = data[key]
+    if not updates:
+        return jsonify({'ok': False, 'error': 'Нет параметров для обновления'}), 400
+    try:
+        prefs = _doc_chat_set_user_preferences(user, updates)
+    except Exception as exc:
+        app.logger.warning("[doc-chat] failed to update preferences for user %s: %s", getattr(user, 'id', None), exc)
+        return jsonify({'ok': False, 'error': 'Не удалось сохранить настройки'}), 500
+    return jsonify({
+        'ok': True,
+        'preferences': prefs,
+        'options': _doc_chat_pref_options_payload(),
+    })
 
 
 @app.route('/api/ai-search', methods=['POST'])
@@ -16199,12 +19812,80 @@ def api_ai_search_feedback():
         db.session.rollback()
         app.logger.warning(f"[ai-feedback] failed to store feedback: {exc}")
         return jsonify({'ok': False, 'error': 'Не удалось сохранить отклик'}), 500
-    return jsonify({'ok': True})
+    train_task_id = None
+    if action in {'click', 'relevant', 'irrelevant'}:
+        try:
+            train_task_id, _ = _maybe_enqueue_feedback_training_online(
+                trigger='online',
+                submitted_by=getattr(user, 'id', None),
+            )
+        except Exception:
+            train_task_id = None
+    return jsonify({'ok': True, 'train_task_id': train_task_id})
+
+
+@app.route('/api/search/feedback', methods=['POST'])
+def api_search_feedback():
+    user = _load_current_user()
+    if not user:
+        return jsonify({'ok': False, 'error': 'Не авторизовано'}), 401
+    data = request.get_json(silent=True) or {}
+    action = str(data.get('action') or '').strip().lower()
+    if action not in {'click', 'relevant', 'irrelevant', 'ignored'}:
+        return jsonify({'ok': False, 'error': 'Некорректные параметры'}), 400
+    query_hash = str(data.get('query_hash') or '').strip()
+    query_text = str(data.get('query') or '').strip()
+    if not query_hash:
+        query_hash = _sha256(query_text or '')
+    if not query_hash:
+        return jsonify({'ok': False, 'error': 'Не указан query_hash/query'}), 400
+    try:
+        file_id = int(data.get('file_id'))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Не указан file_id'}), 400
+    if not File.query.filter_by(id=file_id).first():
+        return jsonify({'ok': False, 'error': 'Файл не найден'}), 404
+    detail_payload = {
+        'source': 'catalogue_search',
+        'query': query_text[:500] if query_text else None,
+        'meta': data.get('meta') if isinstance(data.get('meta'), (dict, list)) else None,
+    }
+    entry = AiSearchKeywordFeedback(
+        user_id=user.id,
+        file_id=file_id,
+        query_hash=query_hash,
+        keyword=None,
+        action=action,
+        score=None,
+        detail=json.dumps(detail_payload, ensure_ascii=False),
+    )
+    try:
+        db.session.add(entry)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.warning("[search-feedback] store failed: %s", exc)
+        return jsonify({'ok': False, 'error': 'Не удалось сохранить отклик'}), 500
+    train_task_id = None
+    if action in {'click', 'relevant', 'irrelevant'}:
+        try:
+            train_task_id, _ = _maybe_enqueue_feedback_training_online(
+                trigger='online-search',
+                submitted_by=getattr(user, 'id', None),
+            )
+        except Exception:
+            train_task_id = None
+    return jsonify({'ok': True, 'train_task_id': train_task_id})
 
 
 def _initialize_background_jobs():
     _start_cache_cleanup_scheduler()
     _start_feedback_training_scheduler()
+    _start_lmstudio_idle_unload_scheduler()
+    try:
+        _get_osint_service().ensure_schedule_worker()
+    except Exception:
+        app.logger.exception("Failed to start OSINT schedule worker")
 
 
 if hasattr(app, "before_serving"):
@@ -16213,7 +19894,7 @@ if hasattr(app, "before_serving"):
 
 @app.before_request
 def _ensure_background_jobs_started():
-    if (not _CLEANUP_THREAD_STARTED) or (not _FEEDBACK_THREAD_STARTED):
+    if (not _CLEANUP_THREAD_STARTED) or (not _FEEDBACK_THREAD_STARTED) or (not LMSTUDIO_IDLE_UNLOAD_THREAD_STARTED):
         _initialize_background_jobs()
 
 

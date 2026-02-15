@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import DOMPurify from 'dompurify'
 import ProgressPanel from '../ui/ProgressPanel'
 import { useToasts } from '../ui/Toasts'
+import { EmptyChat } from '../ui/EmptyState'
 
 type DocumentInfo = {
   id: number
@@ -17,6 +18,7 @@ type DocumentInfo = {
 
 type DocTextSource = {
   label: string
+  chunk_id?: number | null
   preview?: string
   page?: number | null
   section_path?: string | null
@@ -32,15 +34,31 @@ type DocImageSource = {
   keywords?: string[]
   url?: string | null
   score?: number
+  context_before?: string | null
+  context_after?: string | null
+  ocr_preview?: string | null
+  ocr_text?: string | null
+}
+
+type DocChatValidation = {
+  status: 'ok' | 'warning' | 'error'
+  risk_level?: 'low' | 'medium' | 'high'
+  risk_score?: number
+  messages?: string[]
+  missing_citations?: boolean
+  unknown_citations?: { type: string; index: number; label?: string }[]
+  citations?: { type: string; index: number; label?: string }[]
 }
 
 type DocChatMessage = {
   role: 'user' | 'assistant'
   content: string
+  mode?: string | null
   sources?: {
     texts?: DocTextSource[]
     images?: DocImageSource[]
   }
+  validation?: DocChatValidation | null
 }
 
 type DocChatSession = {
@@ -68,6 +86,48 @@ type DocChatSession = {
 }
 
 const POLL_INTERVAL_MS = 2000
+
+type QuestionModeOption = {
+  id: string
+  label: string
+  description: string
+}
+
+const QUESTION_MODES: QuestionModeOption[] = [
+  { id: 'default', label: 'Стандартный', description: 'Балансирует цитаты и общее пояснение.' },
+  { id: 'quote', label: 'Цитата', description: 'Ищет точные формулировки и страницы.' },
+  { id: 'overview', label: 'Структурный обзор', description: 'Собирает широкий контекст по разделам.' },
+  { id: 'formulas', label: 'Формулы и графики', description: 'Выделяет формулы, графики и численные детали.' },
+]
+
+const QUESTION_MODE_META = QUESTION_MODES.reduce<Record<string, QuestionModeOption>>((acc, mode) => {
+  acc[mode.id] = mode
+  return acc
+}, {})
+
+const DOC_CHAT_PREFERENCE_DEFAULTS: DocChatPreferences = {
+  tone: 'neutral',
+  detail: 'balanced',
+  language: 'ru',
+}
+
+type PreferenceOption = {
+  id: string
+  label: string
+  description?: string
+}
+
+type DocChatPreferences = {
+  tone: string
+  detail: string
+  language: string
+}
+
+type DocChatPreferenceOptions = {
+  tone: PreferenceOption[]
+  detail: PreferenceOption[]
+  language: PreferenceOption[]
+}
 
 const escapeHtml = (value: string) =>
   value
@@ -141,6 +201,41 @@ const markdownToHtml = (text: string): string => {
   return html
 }
 
+const normalizeSnippet = (value?: string, limit = 160): string => {
+  if (!value) return ''
+  let cleaned = value
+    .replace(/`+/g, '')
+    .replace(/\[(.+?)\]\(.+?\)/g, '$1')
+    .replace(/[>*_#]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return ''
+  if (cleaned.length > limit) {
+    const slice = cleaned.slice(0, limit)
+    const lastSpace = slice.lastIndexOf(' ')
+    cleaned = (lastSpace > 60 ? slice.slice(0, lastSpace) : slice).trim() + '…'
+  }
+  return cleaned
+}
+
+const pickTextDigestSnippet = (source?: DocTextSource | null): string => {
+  if (!source) return ''
+  const candidate = source.highlights?.find(Boolean) || source.preview || ''
+  return normalizeSnippet(candidate, 180)
+}
+
+const pickImageDigestSnippet = (source?: DocImageSource | null): string => {
+  if (!source) return ''
+  const candidate =
+    source.ocr_preview ||
+    source.ocr_text ||
+    source.description ||
+    source.context_before ||
+    source.context_after ||
+    (source.keywords && source.keywords.length ? `Ключевые слова: ${source.keywords.join(', ')}` : '')
+  return normalizeSnippet(candidate, 180)
+}
+
 const DocumentChatPage: React.FC = () => {
   const toasts = useToasts()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -153,17 +248,40 @@ const DocumentChatPage: React.FC = () => {
   const [session, setSession] = useState<DocChatSession | null>(null)
   const [preparing, setPreparing] = useState<boolean>(false)
   const [question, setQuestion] = useState<string>('')
+  const [questionMode, setQuestionMode] = useState<string>('default')
+  const [preferences, setPreferences] = useState<DocChatPreferences | null>(null)
+  const [preferencesDraft, setPreferencesDraft] = useState<DocChatPreferences | null>(null)
+  const [preferenceOptions, setPreferenceOptions] = useState<DocChatPreferenceOptions | null>(null)
+  const [prefsLoading, setPrefsLoading] = useState<boolean>(false)
+  const [prefsSaving, setPrefsSaving] = useState<boolean>(false)
   const [sending, setSending] = useState<boolean>(false)
   const [assistantThinking, setAssistantThinking] = useState<boolean>(false)
   const [clearing, setClearing] = useState<boolean>(false)
   const [sourcePanels, setSourcePanels] = useState<Record<number, boolean>>({})
+  const [preferencesCollapsed, setPreferencesCollapsed] = useState<boolean>(true)
+  const [imagesCollapsed, setImagesCollapsed] = useState<boolean>(true)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const chatEndRef = useRef<HTMLDivElement | null>(null)
   const prevStatusRef = useRef<string | null>(null)
   const questionInputRef = useRef<HTMLTextAreaElement | null>(null)
   const autoPrepareRef = useRef<Record<number, boolean>>({})
+  const longRunTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const longRunNotifiedRef = useRef(false)
 
   const selectedDoc = useMemo(() => (selectedId ? documents.find(doc => doc.id === selectedId) || null : null), [documents, selectedId])
+  const questionModeMeta = QUESTION_MODE_META[questionMode] || QUESTION_MODES[0]
+  const preferenceLabels = useMemo(() => {
+    const map: Record<string, Record<string, PreferenceOption>> = {}
+    if (preferenceOptions) {
+      Object.entries(preferenceOptions).forEach(([key, options]) => {
+        map[key] = options.reduce<Record<string, PreferenceOption>>((acc, option) => {
+          acc[option.id] = option
+          return acc
+        }, {})
+      })
+    }
+    return map
+  }, [preferenceOptions])
 
   useEffect(() => {
     void fetchDocuments()
@@ -174,6 +292,73 @@ const DocumentChatPage: React.FC = () => {
       }
     }
   }, [])
+
+  const loadPreferences = useCallback(async () => {
+    setPrefsLoading(true)
+    try {
+      const resp = await fetch('/api/doc-chat/preferences')
+      const data = await resp.json()
+      if (!resp.ok || !data?.ok) {
+        throw new Error()
+      }
+      const prefs: DocChatPreferences = {
+        ...DOC_CHAT_PREFERENCE_DEFAULTS,
+        ...(data.preferences || {}),
+      }
+      setPreferences(prefs)
+      setPreferencesDraft(prefs)
+      setPreferenceOptions(data.options || null)
+    } catch (error) {
+      toasts.push('Не удалось загрузить персональные настройки', 'error')
+    } finally {
+      setPrefsLoading(false)
+    }
+  }, [toasts])
+
+  useEffect(() => {
+    void loadPreferences()
+  }, [loadPreferences])
+
+  const handlePreferenceChange = useCallback((key: keyof DocChatPreferences, value: string) => {
+    setPreferencesDraft(prev => (prev ? { ...prev, [key]: value } : prev))
+  }, [])
+
+  const preferencesDirty = useMemo(() => {
+    if (!preferences || !preferencesDraft) return false
+    return (['tone', 'detail', 'language'] as (keyof DocChatPreferences)[]).some(
+      prefKey => preferencesDraft[prefKey] !== preferences[prefKey],
+    )
+  }, [preferences, preferencesDraft])
+
+  const handleSavePreferences = useCallback(async () => {
+    if (!preferencesDraft) return
+    setPrefsSaving(true)
+    try {
+      const resp = await fetch('/api/doc-chat/preferences', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(preferencesDraft),
+      })
+      const data = await resp.json()
+      if (!resp.ok || !data?.ok) {
+        throw new Error(data?.error || 'Не удалось сохранить настройки')
+      }
+      const prefs: DocChatPreferences = {
+        ...DOC_CHAT_PREFERENCE_DEFAULTS,
+        ...(data.preferences || preferencesDraft),
+      }
+      setPreferences(prefs)
+      setPreferencesDraft(prefs)
+      if (data.options) {
+        setPreferenceOptions(data.options)
+      }
+      toasts.push('Персональные настройки сохранены', 'success')
+    } catch (error: any) {
+      toasts.push(error?.message || 'Не удалось сохранить настройки', 'error')
+    } finally {
+      setPrefsSaving(false)
+    }
+  }, [preferencesDraft, toasts])
 
   useEffect(() => {
     if (!fileParam) return
@@ -221,10 +406,41 @@ const DocumentChatPage: React.FC = () => {
     }
   }, [selectedDoc?.id, session?.file_meta?.id])
 
+  const historyLengthRef = useRef(0)
   useEffect(() => {
-    if (!session?.history) return
+    const historyLength = session?.history?.length || 0
+    if (!session || historyLength <= historyLengthRef.current) {
+      if (!session) {
+        historyLengthRef.current = 0
+      }
+      return
+    }
+    historyLengthRef.current = historyLength
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [session?.history])
+  }, [session?.history?.length, session])
+
+  useEffect(() => {
+    if (longRunTimerRef.current) {
+      clearTimeout(longRunTimerRef.current)
+      longRunTimerRef.current = null
+    }
+    if (!session || session.status === 'ready' || session.status === 'error') {
+      longRunNotifiedRef.current = false
+      return
+    }
+    longRunTimerRef.current = setTimeout(() => {
+      if (!longRunNotifiedRef.current) {
+        toasts.push('Подготовка идет уже более двух минут: выполняется OCR/эмбеддинг.', 'info')
+        longRunNotifiedRef.current = true
+      }
+    }, 120000)
+    return () => {
+      if (longRunTimerRef.current) {
+        clearTimeout(longRunTimerRef.current)
+        longRunTimerRef.current = null
+      }
+    }
+  }, [session?.id, session?.status, toasts])
 
   useEffect(() => {
     if (session?.status === 'ready') {
@@ -420,7 +636,7 @@ const DocumentChatPage: React.FC = () => {
       const resp = await fetch('/api/doc-chat/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: session.id, question: trimmed }),
+        body: JSON.stringify({ session_id: session.id, question: trimmed, mode: questionMode }),
       })
       const data = await resp.json()
       if (!resp.ok || !data?.ok) {
@@ -452,6 +668,8 @@ const DocumentChatPage: React.FC = () => {
   const previewHref = session?.file_meta?.rel_path
     ? `/preview/${encodeURIComponent(session.file_meta.rel_path)}?embedded=1`
     : null
+  const modeDisabled = sending || !session || session.status !== 'ready'
+  const preferenceControlsDisabled = prefsLoading || prefsSaving || !preferencesDraft
 
   const handleClearChat = useCallback(async () => {
     if (!session) {
@@ -478,7 +696,7 @@ const DocumentChatPage: React.FC = () => {
   }, [session, toasts])
 
   return (
-    <div className="container-fluid d-grid gap-3 px-4">
+    <div className="container-fluid d-grid gap-3 px-4 doc-chat-page">
       <div className="d-flex flex-wrap justify-content-between align-items-center gap-2">
         <h1 className="h4 mb-0">Документ-чат</h1>
         <div className="text-muted small">
@@ -579,7 +797,30 @@ const DocumentChatPage: React.FC = () => {
               title={session.status === 'queued' ? 'В очереди на обработку…' : 'Анализ документа…'}
               caption="Статус подготовки включает извлечение текста, генерацию эмбеддингов и анализ изображений."
               progress={typeof session.percent === 'number' ? { percent: Math.round(session.percent), label: `${Math.round(session.percent)}%` } : undefined}
-              bullets={(session.progress || []).map((line, idx) => ({ id: `${idx}-${line}`, text: line }))}
+              bullets={
+                session.progress && session.progress.length
+                  ? [{ id: 'progress-latest', text: session.progress[session.progress.length - 1] }]
+                  : []
+              }
+              footer={
+                <> 
+                  {session.phase_history && session.phase_history.length > 0 && (
+                    <div className="d-flex flex-column gap-1 small">
+                      {session.phase_history.map((entry, idx) => (
+                        <div key={`${idx}-${entry.label}`}>
+                          <span className="fw-semibold text-dark">{entry.label}</span>
+                          {entry.details && ` — ${entry.details}`}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {session.data?.image_filter_summary && (
+                    <div className="text-muted small mt-1">
+                      Изображений найдено {session.data.image_filter_summary.candidates ?? 0}, обработано {session.data.image_filter_summary.processed ?? 0}, пропущено {session.data.image_filter_summary.skipped_size ?? 0} ({session.data.image_filter_summary.min_width ?? 0}×{session.data.image_filter_summary.min_height ?? 0}).
+                    </div>
+                  )}
+                </>
+              }
             />
           )}
           {session?.status === 'error' && (
@@ -607,11 +848,11 @@ const DocumentChatPage: React.FC = () => {
                 ) : 'Очистить чат'}
               </button>
             </div>
-            <div className="card-body d-flex flex-column gap-3" style={{ maxHeight: '75vh' }}>
+              <div className="card-body d-flex flex-column gap-3" style={{ maxHeight: '85vh', minHeight: '60vh' }}>
               <div className="flex-grow-1 overflow-auto d-grid gap-3 pe-1 doc-chat-message-stack">
                 {(!session || history.length === 0) && !assistantThinking && (
                   <div className="doc-chat-empty text-muted">
-                    Выберите документ слева, дождитесь подготовки и задайте первый вопрос.
+                    <EmptyChat />
                   </div>
                 )}
                 {history.map((msg, idx) => {
@@ -619,6 +860,12 @@ const DocumentChatPage: React.FC = () => {
                   const sources = msg.sources
                   const open = sourcePanels[idx] ?? false
                   const hasSources = Boolean(sources?.texts?.length || sources?.images?.length)
+                  const digestTexts = (sources?.texts || []).slice(0, 2)
+                  const digestImages = (sources?.images || []).slice(0, 1)
+                  const showDigest = isAssistant && (digestTexts.length > 0 || digestImages.length > 0)
+                  const messageModeLabel = msg.mode ? QUESTION_MODE_META[msg.mode]?.label : null
+                  const validation = msg.validation
+                  const showValidationBlock = isAssistant && validation && (validation.status !== 'ok' || (validation.messages && validation.messages.length > 0))
                   const bodyHtml = renderMarkdown(msg.content || '')
                   return (
                     <div
@@ -629,6 +876,20 @@ const DocumentChatPage: React.FC = () => {
                         <span className="doc-chat-message__author">
                           {isAssistant ? 'Помощник' : 'Вы'}
                         </span>
+                        {messageModeLabel && (
+                          <span className={`doc-chat-mode-badge ${isAssistant ? 'doc-chat-mode-badge--assistant' : 'doc-chat-mode-badge--user'}`}>
+                            {messageModeLabel}
+                          </span>
+                        )}
+                        {validation && (
+                          <span className={`doc-chat-risk-badge doc-chat-risk-badge--${validation.risk_level || 'low'}`}>
+                            {validation.risk_level === 'high'
+                              ? 'Высокий риск'
+                              : validation.risk_level === 'medium'
+                                ? 'Средний риск'
+                                : 'Низкий риск'}
+                          </span>
+                        )}
                         {isAssistant && hasSources && (
                           <button
                             type="button"
@@ -640,6 +901,57 @@ const DocumentChatPage: React.FC = () => {
                         )}
                       </div>
                       <div className="doc-chat-message__body" dangerouslySetInnerHTML={{ __html: bodyHtml }} />
+                      {showValidationBlock && (
+                        <div className={`doc-chat-validation doc-chat-validation--${validation?.risk_level || 'low'}`}>
+                          <div className="doc-chat-validation__title">
+                            Проверка ответа
+                          </div>
+                          <ul>
+                            {(validation?.messages || ['Проблемы не обнаружены.']).map((line, lineIdx) => (
+                              <li key={`validation-${idx}-${lineIdx}`}>{line}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {showDigest && (
+                        <div className="doc-chat-source-digest" aria-label="Основные источники ответа">
+                          {digestTexts.map((src, digestIdx) => {
+                            if (!src) return null
+                            const snippet = pickTextDigestSnippet(src)
+                            const metaParts: string[] = []
+                            if (typeof src.page === 'number') metaParts.push(`стр. ${src.page}`)
+                            if (src.section_path) metaParts.push(src.section_path)
+                            return (
+                              <div key={`digest-text-${idx}-${digestIdx}`} className="doc-chat-source-pill" role="note">
+                                <span className="doc-chat-source-pill__label">{src.label}</span>
+                                {snippet && <span className="doc-chat-source-pill__quote">«{snippet}»</span>}
+                                {metaParts.length > 0 && (
+                                  <span className="doc-chat-source-pill__meta">{metaParts.join(' · ')}</span>
+                                )}
+                              </div>
+                            )
+                          })}
+                          {digestImages.map((img, digestIdx) => {
+                            if (!img) return null
+                            const snippet = pickImageDigestSnippet(img)
+                            const metaParts: string[] = []
+                            if (typeof img.page === 'number') metaParts.push(`стр. ${img.page}`)
+                            return (
+                              <div
+                                key={`digest-img-${idx}-${digestIdx}`}
+                                className="doc-chat-source-pill doc-chat-source-pill--image"
+                                role="note"
+                              >
+                                <span className="doc-chat-source-pill__label">{img.label}</span>
+                                {snippet && <span className="doc-chat-source-pill__quote">{snippet}</span>}
+                                {metaParts.length > 0 && (
+                                  <span className="doc-chat-source-pill__meta">{metaParts.join(' · ')}</span>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
                       {isAssistant && hasSources && open && (
                         <div className="doc-chat-source-list">
                           {sources?.texts?.map((src, srcIdx) => {
@@ -688,6 +1000,11 @@ const DocumentChatPage: React.FC = () => {
                                   {img.description}
                                 </div>
                               )}
+                              {img.ocr_preview && (
+                                <div className="doc-chat-source-card__ocr">
+                                  OCR: {img.ocr_preview}
+                                </div>
+                              )}
                               {img.url && (
                                 <a
                                   href={img.url}
@@ -718,21 +1035,159 @@ const DocumentChatPage: React.FC = () => {
                 )}
                 <div ref={chatEndRef} />
               </div>
-              <div className="doc-chat-suggestions">
-                {quickPrompts.map(item => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    className="btn btn-outline-secondary btn-sm"
-                    disabled={sending || session?.status !== 'ready'}
-                    onClick={() => {
-                      setQuestion(item.prompt)
-                      questionInputRef.current?.focus()
-                    }}
-                  >
-                    {item.label}
-                  </button>
-                ))}
+              <div className="doc-chat-mode-suggestions">
+                <div className="doc-chat-mode-group" aria-label="Режим ответа">
+                  <div className="doc-chat-mode-group__label">Режим ответа</div>
+                  <div className="doc-chat-mode-group__buttons" role="group">
+                    {QUESTION_MODES.map(mode => {
+                      const active = mode.id === questionMode
+                      return (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          className={`doc-chat-mode-button${active ? ' is-active' : ''}`}
+                          onClick={() => setQuestionMode(mode.id)}
+                          disabled={modeDisabled}
+                          aria-pressed={active}
+                        >
+                          {mode.label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div className="doc-chat-mode-group__hint">
+                    {questionModeMeta?.description}
+                  </div>
+                </div>
+                <div className="doc-chat-suggestions doc-chat-suggestions--inline">
+                  <span className="doc-chat-suggestions__title">Быстрые вопросы</span>
+                  <div className="doc-chat-suggestions__buttons">
+                    {quickPrompts.map(item => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className="btn btn-outline-secondary btn-sm"
+                        disabled={sending || session?.status !== 'ready'}
+                        onClick={() => {
+                          setQuestion(item.prompt)
+                          questionInputRef.current?.focus()
+                        }}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="doc-chat-preferences" aria-label="Персональные настройки">
+                <div className="doc-chat-preferences__header">
+                  <div className="doc-chat-preferences__title">Персональные настройки</div>
+                  <div className="d-flex align-items-center gap-2">
+                    {prefsLoading && (
+                      <span className="text-muted small d-flex align-items-center gap-1">
+                        <span className="spinner-border spinner-border-sm" role="status" aria-hidden="true" />
+                        Обновляем…
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-outline-secondary btn-sm doc-chat-pref-toggle"
+                      onClick={() => setPreferencesCollapsed(value => !value)}
+                    >
+                      {preferencesCollapsed ? 'Показать' : 'Скрыть'}
+                    </button>
+                  </div>
+                </div>
+                {!preferencesCollapsed && preferencesDraft && preferenceOptions ? (
+                  <>
+                    <div className="doc-chat-preferences__grid">
+                      <div className="doc-chat-pref-row">
+                        <label className="form-label">Тон</label>
+                        <select
+                          className="form-select"
+                          value={preferencesDraft.tone}
+                          onChange={event => handlePreferenceChange('tone', event.target.value)}
+                          disabled={preferenceControlsDisabled}
+                        >
+                          {(preferenceOptions.tone || []).map(option => (
+                            <option key={option.id} value={option.id}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        {preferenceLabels.tone?.[preferencesDraft.tone]?.description && (
+                          <div className="doc-chat-pref-hint">
+                            {preferenceLabels.tone[preferencesDraft.tone].description}
+                          </div>
+                        )}
+                      </div>
+                      <div className="doc-chat-pref-row">
+                        <label className="form-label">Детализация</label>
+                        <select
+                          className="form-select"
+                          value={preferencesDraft.detail}
+                          onChange={event => handlePreferenceChange('detail', event.target.value)}
+                          disabled={preferenceControlsDisabled}
+                        >
+                          {(preferenceOptions.detail || []).map(option => (
+                            <option key={option.id} value={option.id}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        {preferenceLabels.detail?.[preferencesDraft.detail]?.description && (
+                          <div className="doc-chat-pref-hint">
+                            {preferenceLabels.detail[preferencesDraft.detail].description}
+                          </div>
+                        )}
+                      </div>
+                      <div className="doc-chat-pref-row">
+                        <label className="form-label">Язык ответа</label>
+                        <select
+                          className="form-select"
+                          value={preferencesDraft.language}
+                          onChange={event => handlePreferenceChange('language', event.target.value)}
+                          disabled={preferenceControlsDisabled}
+                        >
+                          {(preferenceOptions.language || []).map(option => (
+                            <option key={option.id} value={option.id}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        {preferenceLabels.language?.[preferencesDraft.language]?.description && (
+                          <div className="doc-chat-pref-hint">
+                            {preferenceLabels.language[preferencesDraft.language].description}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="doc-chat-preferences__actions">
+                      <button
+                        type="button"
+                        className="btn btn-outline-primary btn-sm"
+                        onClick={handleSavePreferences}
+                        disabled={!preferencesDirty || preferenceControlsDisabled}
+                      >
+                        {prefsSaving ? (
+                          <>
+                            <span className="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true" />
+                            Сохраняю…
+                          </>
+                        ) : 'Сохранить'}
+                      </button>
+                      {!preferencesDirty && !prefsSaving && (
+                        <span className="text-muted small">Настройки применяются ко всем ответам</span>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-muted small">
+                    {prefsLoading
+                      ? 'Загружаем настройки…'
+                      : `Текущие параметры: ${preferenceLabels.tone?.[preferencesDraft?.tone || '']?.label || '—'}, ${preferenceLabels.detail?.[preferencesDraft?.detail || '']?.label || '—'}, ${preferenceLabels.language?.[preferencesDraft?.language || '']?.label || '—'}.`}
+                  </div>
+                )}
               </div>
               <form className="d-grid gap-2 doc-chat-input-form" onSubmit={handleAsk}>
                 <textarea
@@ -740,7 +1195,7 @@ const DocumentChatPage: React.FC = () => {
                   className="form-control doc-chat-input"
                   placeholder="Задайте вопрос по документу…"
                   value={question}
-                  rows={3}
+                  rows={6}
                   onChange={event => setQuestion(event.target.value)}
                   onKeyDown={event => {
                     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
@@ -785,7 +1240,7 @@ const DocumentChatPage: React.FC = () => {
                   Открыть документ в просмотре
                 </a>
               )}
-              <div className="card">
+              <div className="card doc-chat-meta-card">
                 <div className="card-header">
                   Информация о документе
                 </div>
@@ -806,45 +1261,57 @@ const DocumentChatPage: React.FC = () => {
                   </dl>
                 </div>
               </div>
-              <div className="card">
-                <div className="card-header">
-                  Изображения ({currentImages.length})
+              <div className="card doc-chat-media-card">
+                <div className="card-header d-flex justify-content-between align-items-center">
+                  <div>Изображения ({currentImages.length})</div>
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary btn-sm"
+                    onClick={() => setImagesCollapsed(value => !value)}
+                  >
+                    {imagesCollapsed ? 'Показать' : 'Скрыть'}
+                  </button>
                 </div>
-                <div className="card-body d-grid gap-3">
-                  {currentImages.length === 0 && (
-                    <div className="text-muted">
-                      Изображения не были обнаружены или анализ отключён.
-                    </div>
-                  )}
-                  {currentImages.map((img, idx) => (
-                    <div key={idx} className="border rounded-3 p-3">
-                      <div className="d-flex justify-content-between align-items-center mb-2">
-                        <div className="fw-semibold">{img.label || `Изображение ${idx + 1}`}</div>
-                        {typeof img.score === 'number' && (
-                          <span className="badge bg-light text-dark">score {img.score.toFixed(3)}</span>
+                {!imagesCollapsed && (
+                  <div className="card-body d-grid gap-3">
+                    {currentImages.length === 0 && (
+                      <div className="text-muted">
+                        Изображения не были обнаружены или анализ отключён.
+                      </div>
+                    )}
+                    {currentImages.map((img, idx) => (
+                      <div key={idx} className="border rounded-3 p-3">
+                        <div className="d-flex justify-content-between align-items-center mb-2">
+                          <div className="fw-semibold">{img.label || `Изображение ${idx + 1}`}</div>
+                          {typeof img.score === 'number' && (
+                            <span className="badge bg-light text-dark">score {img.score.toFixed(3)}</span>
+                          )}
+                        </div>
+                        {img.url && (
+                          <a href={img.url} target="_blank" rel="noopener noreferrer" className="d-block mb-2">
+                            <img src={img.url} alt={img.description || img.label || 'Изображение'} className="img-fluid rounded" />
+                          </a>
+                        )}
+                        {typeof img.page === 'number' && (
+                          <div className="small text-muted">Страница: {img.page}</div>
+                        )}
+                        {img.description && (
+                          <div className="mt-2">{img.description}</div>
+                        )}
+                        {img.ocr_preview && (
+                          <div className="mt-2 small text-muted">OCR: {img.ocr_preview}</div>
+                        )}
+                        {img.keywords && img.keywords.length > 0 && (
+                          <div className="mt-2 small text-muted">Ключевые слова: {img.keywords.join(', ')}</div>
                         )}
                       </div>
-                      {img.url && (
-                        <a href={img.url} target="_blank" rel="noopener noreferrer" className="d-block mb-2">
-                          <img src={img.url} alt={img.description || img.label || 'Изображение'} className="img-fluid rounded" />
-                        </a>
-                      )}
-                      {typeof img.page === 'number' && (
-                        <div className="small text-muted">Страница: {img.page}</div>
-                      )}
-                      {img.description && (
-                        <div className="mt-2">{img.description}</div>
-                      )}
-                      {img.keywords && img.keywords.length > 0 && (
-                        <div className="mt-2 small text-muted">Ключевые слова: {img.keywords.join(', ')}</div>
-                      )}
-                    </div>
-                  ))}
-                </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </>
           ) : (
-            <div className="card h-100">
+            <div className="card h-100 doc-chat-meta-card">
               <div className="card-body d-flex align-items-center justify-content-center text-muted">
                 Выберите документ слева, чтобы увидеть его данные.
               </div>

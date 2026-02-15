@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import and_, exists, or_, text
 
@@ -40,6 +41,15 @@ class SearchService:
         if reason:
             self.logger.debug("Search cache invalidated: %s", reason)
 
+    def _dialect_name(self) -> str:
+        try:
+            bind = self.db.session.get_bind()
+            if bind is not None and bind.dialect and getattr(bind.dialect, "name", None):
+                return str(bind.dialect.name).lower()
+        except Exception:
+            pass
+        return ""
+
     # ------------------------------------------------------------------
     # Обслуживание FTS
     # ------------------------------------------------------------------
@@ -47,8 +57,25 @@ class SearchService:
         """Ensure indexes, virtual tables and triggers exist for SQLite search."""
         from sqlalchemy import text as sql_text
 
+        dialect = self._dialect_name()
         try:
             with self.db.engine.begin() as conn:
+                if dialect == "postgresql":
+                    pg_statements = [
+                        "CREATE INDEX IF NOT EXISTS idx_files_title_lower ON files (lower(title))",
+                        "CREATE INDEX IF NOT EXISTS idx_files_author_lower ON files (lower(author))",
+                        "CREATE INDEX IF NOT EXISTS idx_files_keywords_lower ON files (lower(keywords))",
+                        "CREATE INDEX IF NOT EXISTS idx_files_filename_lower ON files (lower(filename))",
+                        "CREATE INDEX IF NOT EXISTS idx_tags_key_lower ON tags (lower(key))",
+                        "CREATE INDEX IF NOT EXISTS idx_tags_value_lower ON tags (lower(value))",
+                    ]
+                    for stmt in pg_statements:
+                        try:
+                            conn.execute(sql_text(stmt))
+                        except Exception as exc:  # pragma: no cover
+                            self.logger.debug("PG index creation failed (%s): %s", stmt, exc)
+                    self.invalidate_cache("ensure_support_pg")
+                    return
                 statements = [
                     "CREATE INDEX IF NOT EXISTS idx_files_title_nocase ON files(title COLLATE NOCASE)",
                     "CREATE INDEX IF NOT EXISTS idx_files_author_nocase ON files(author COLLATE NOCASE)",
@@ -253,6 +280,56 @@ class SearchService:
                 return list(cached)
 
         ids: set[int] = set()
+        dialect = self._dialect_name()
+        if dialect == "postgresql":
+            plain_query = " ".join(self._FTS_TOKEN_PATTERN.findall((query or "").lower())[:8]).strip()
+            if not plain_query:
+                return []
+            try:
+                rows = self.db.session.execute(
+                    text(
+                        """
+                        SELECT f.id
+                        FROM files AS f
+                        WHERE to_tsvector('simple',
+                            coalesce(f.title,'') || ' ' ||
+                            coalesce(f.author,'') || ' ' ||
+                            coalesce(f.keywords,'') || ' ' ||
+                            coalesce(f.abstract,'') || ' ' ||
+                            coalesce(f.text_excerpt,'')
+                        ) @@ plainto_tsquery('simple', :query)
+                        LIMIT :limit
+                        """
+                    ),
+                    {"query": plain_query, "limit": limit},
+                ).fetchall()
+                ids.update(int(row[0]) for row in rows)
+            except Exception as exc:
+                self.logger.debug("postgres files tsquery failed: %s", exc)
+            try:
+                rows = self.db.session.execute(
+                    text(
+                        """
+                        SELECT t.file_id
+                        FROM tags AS t
+                        WHERE to_tsvector('simple',
+                            coalesce(t.key,'') || ' ' || coalesce(t.value,'')
+                        ) @@ plainto_tsquery('simple', :query)
+                        LIMIT :limit
+                        """
+                    ),
+                    {"query": plain_query, "limit": limit},
+                ).fetchall()
+                ids.update(int(row[0]) for row in rows)
+            except Exception as exc:
+                self.logger.debug("postgres tags tsquery failed: %s", exc)
+            result = list(ids)
+            if self._cache_set is not None:
+                try:
+                    self._cache_set(cache_key, result)
+                except Exception:  # pragma: no cover
+                    pass
+            return result
         try:
             rows = self.db.session.execute(
                 text("SELECT rowid FROM files_fts WHERE files_fts MATCH :match LIMIT :limit"),
@@ -277,6 +354,225 @@ class SearchService:
             except Exception:  # pragma: no cover
                 pass
         return result
+
+    @staticmethod
+    def _rank_profile_weights(profile: str | None) -> Dict[str, float]:
+        resolved = (profile or "balanced").strip().lower()
+        if resolved in {"exact", "precision"}:
+            return {
+                "files_fts": 0.8,
+                "tags_fts": 0.6,
+                "title": 2.2,
+                "author": 1.8,
+                "keywords": 1.6,
+                "filename": 1.1,
+                "abstract": 1.0,
+                "excerpt": 0.5,
+            }
+        if resolved in {"recall", "broad"}:
+            return {
+                "files_fts": 1.0,
+                "tags_fts": 0.9,
+                "title": 1.4,
+                "author": 1.1,
+                "keywords": 1.2,
+                "filename": 1.0,
+                "abstract": 1.1,
+                "excerpt": 1.0,
+            }
+        return {
+            "files_fts": 1.0,
+            "tags_fts": 0.75,
+            "title": 1.9,
+            "author": 1.4,
+            "keywords": 1.5,
+            "filename": 1.0,
+            "abstract": 1.0,
+            "excerpt": 0.8,
+        }
+
+    @staticmethod
+    def _fts_score_from_bm25(raw_bm25: float | None) -> float:
+        if raw_bm25 is None:
+            return 0.0
+        # bm25 в FTS5: меньше = лучше; переводим в диапазон (0..1]
+        value = max(0.0, float(raw_bm25))
+        return 1.0 / (1.0 + math.sqrt(value))
+
+    def ranked_candidates(
+        self,
+        query: str,
+        *,
+        limit: int = 4000,
+        profile: str | None = None,
+    ) -> List[Tuple[int, float]]:
+        match_expr = self._fts_match_query(query)
+        if match_expr is None:
+            return []
+        dialect = self._dialect_name()
+        weights = self._rank_profile_weights(profile)
+        cache_key = f"ranked::{self._cache_version}::{limit}::{profile or 'balanced'}::{match_expr}"
+        if self._cache_get is not None:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                out: List[Tuple[int, float]] = []
+                for item in cached:
+                    try:
+                        fid, score = item  # type: ignore[misc]
+                        out.append((int(fid), float(score)))
+                    except Exception:
+                        continue
+                if out:
+                    return out
+
+        # 1) FTS ранжирование
+        scores: Dict[int, float] = {}
+        if dialect == "postgresql":
+            plain_query = " ".join(self._FTS_TOKEN_PATTERN.findall((query or "").lower())[:8]).strip()
+            if plain_query:
+                try:
+                    rows = self.db.session.execute(
+                        text(
+                            """
+                            SELECT f.id,
+                                   ts_rank(
+                                     to_tsvector('simple',
+                                       coalesce(f.title,'') || ' ' ||
+                                       coalesce(f.author,'') || ' ' ||
+                                       coalesce(f.keywords,'') || ' ' ||
+                                       coalesce(f.abstract,'') || ' ' ||
+                                       coalesce(f.text_excerpt,'')
+                                     ),
+                                     plainto_tsquery('simple', :query)
+                                   ) AS score
+                            FROM files AS f
+                            WHERE to_tsvector('simple',
+                                  coalesce(f.title,'') || ' ' ||
+                                  coalesce(f.author,'') || ' ' ||
+                                  coalesce(f.keywords,'') || ' ' ||
+                                  coalesce(f.abstract,'') || ' ' ||
+                                  coalesce(f.text_excerpt,'')
+                            ) @@ plainto_tsquery('simple', :query)
+                            LIMIT :limit
+                            """
+                        ),
+                        {"query": plain_query, "limit": limit},
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            fid = int(row[0])
+                        except Exception:
+                            continue
+                        score = max(0.0, float(row[1] or 0.0)) * weights["files_fts"]
+                        scores[fid] = max(scores.get(fid, 0.0), score)
+                except Exception as exc:
+                    self.logger.debug("postgres ranked files tsquery failed: %s", exc)
+                try:
+                    rows = self.db.session.execute(
+                        text(
+                            """
+                            SELECT t.file_id,
+                                   ts_rank(
+                                     to_tsvector('simple', coalesce(t.key,'') || ' ' || coalesce(t.value,'')),
+                                     plainto_tsquery('simple', :query)
+                                   ) AS score
+                            FROM tags AS t
+                            WHERE to_tsvector('simple',
+                                  coalesce(t.key,'') || ' ' || coalesce(t.value,'')
+                            ) @@ plainto_tsquery('simple', :query)
+                            LIMIT :limit
+                            """
+                        ),
+                        {"query": plain_query, "limit": limit},
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            fid = int(row[0])
+                        except Exception:
+                            continue
+                        score = max(0.0, float(row[1] or 0.0)) * weights["tags_fts"]
+                        scores[fid] = max(scores.get(fid, 0.0), score)
+                except Exception as exc:
+                    self.logger.debug("postgres ranked tags tsquery failed: %s", exc)
+        if dialect != "postgresql":
+            try:
+                rows = self.db.session.execute(
+                    text(
+                        "SELECT rowid, bm25(files_fts) AS score "
+                        "FROM files_fts WHERE files_fts MATCH :match LIMIT :limit"
+                    ),
+                    {"match": match_expr, "limit": limit},
+                ).fetchall()
+                for row in rows:
+                    try:
+                        fid = int(row[0])
+                    except Exception:
+                        continue
+                    score = self._fts_score_from_bm25(row[1]) * weights["files_fts"]
+                    scores[fid] = max(scores.get(fid, 0.0), score)
+            except Exception as exc:
+                self.logger.debug("files_fts ranked MATCH failed: %s", exc)
+            try:
+                rows = self.db.session.execute(
+                    text(
+                        "SELECT file_id, bm25(tags_fts) AS score "
+                        "FROM tags_fts WHERE tags_fts MATCH :match LIMIT :limit"
+                    ),
+                    {"match": match_expr, "limit": limit},
+                ).fetchall()
+                for row in rows:
+                    try:
+                        fid = int(row[0])
+                    except Exception:
+                        continue
+                    score = self._fts_score_from_bm25(row[1]) * weights["tags_fts"]
+                    scores[fid] = max(scores.get(fid, 0.0), score)
+            except Exception as exc:
+                self.logger.debug("tags_fts ranked MATCH failed: %s", exc)
+
+        if not scores:
+            ids = self.candidate_ids(query, limit=limit) or []
+            if not ids:
+                return []
+            scores = {int(fid): 0.05 for fid in ids}
+
+        # 2) Field boosting (точные совпадения по ключевым полям)
+        tokens = self._FTS_TOKEN_PATTERN.findall((query or "").lower())[:8]
+        if tokens:
+            candidate_ids = list(scores.keys())
+            for token in tokens:
+                like = f"%{token}%"
+                try:
+                    rows = self.db.session.query(
+                        self.File.id,
+                        self.File.title.ilike(like),
+                        self.File.author.ilike(like),
+                        self.File.keywords.ilike(like),
+                        self.File.filename.ilike(like),
+                        getattr(self.File, "abstract").ilike(like) if hasattr(self.File, "abstract") else text("0"),
+                        self.File.text_excerpt.ilike(like),
+                    ).filter(self.File.id.in_(candidate_ids)).all()
+                except Exception:
+                    continue
+                for row in rows:
+                    fid = int(row[0])
+                    boost = 0.0
+                    boost += weights["title"] if bool(row[1]) else 0.0
+                    boost += weights["author"] if bool(row[2]) else 0.0
+                    boost += weights["keywords"] if bool(row[3]) else 0.0
+                    boost += weights["filename"] if bool(row[4]) else 0.0
+                    boost += weights["abstract"] if bool(row[5]) else 0.0
+                    boost += weights["excerpt"] if bool(row[6]) else 0.0
+                    if boost:
+                        scores[fid] = scores.get(fid, 0.0) + (boost / (10.0 * max(1, len(tokens))))
+
+        ranked = sorted(scores.items(), key=lambda item: (item[1], item[0]), reverse=True)[:limit]
+        if self._cache_set is not None:
+            try:
+                self._cache_set(cache_key, ranked)
+            except Exception:  # pragma: no cover
+                pass
+        return ranked
 
     def apply_like_filter(self, base_query, query: str):
         like = f"%{query}%"

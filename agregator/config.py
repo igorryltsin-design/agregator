@@ -71,6 +71,13 @@ class AppConfig:
     transcribe_language: str
     images_vision_enabled: bool
     keywords_to_tags_enabled: bool
+    doc_chat_chunk_max_tokens: int
+    doc_chat_chunk_overlap: int
+    doc_chat_chunk_min_tokens: int
+    doc_chat_max_chunks: int
+    doc_chat_fallback_chunks: int
+    doc_chat_image_min_width: int
+    doc_chat_image_min_height: int
     type_detect_flow: str
     type_llm_override: bool
     rename_patterns: Dict[str, str]
@@ -104,6 +111,14 @@ class AppConfig:
     search_cache_enabled: bool
     search_cache_ttl_seconds: int
     search_cache_max_items: int
+    llm_pool_global_concurrency: int
+    llm_pool_per_user_concurrency: int
+    llm_queue_max_size: int
+    llm_queue_per_user_max: int
+    llm_request_timeout_sec: int
+    llm_retry_count: int
+    llm_retry_backoff_ms: int
+    lmstudio_idle_unload_minutes: int
     lm_max_input_chars: int
     lm_max_output_tokens: int
     azure_openai_api_version: str
@@ -113,6 +128,7 @@ class AppConfig:
     default_admin_user: str
     default_admin_password: str
     legacy_access_code: str
+    database_url: str
     catalogue_db_path: Path = field(init=False)
     logs_dir: Path = field(init=False)
     log_file_path: Path = field(init=False)
@@ -353,14 +369,22 @@ class AppConfig:
             lmstudio_api_base=os.getenv("LMSTUDIO_API_BASE", "http://localhost:1234/v1"),
             lmstudio_model=os.getenv("LMSTUDIO_MODEL", "google/gemma-3n-e4b"),
             lmstudio_api_key=os.getenv("LMSTUDIO_API_KEY", ""),
-            lm_default_provider=(os.getenv("LM_PROVIDER") or "openai").strip().lower() or "openai",
+            lm_default_provider=(
+                os.getenv("LM_DEFAULT_PROVIDER")
+                or os.getenv("LM_PROVIDER")
+                or "openai"
+            ).strip().lower() or "openai",
             ai_query_variants_max=int(os.getenv("AI_QUERY_VARIANTS_MAX", "1") or 1),
             ai_rag_retry_enabled=_getenv_bool("AI_RAG_RETRY_ENABLED", True),
             ai_rag_retry_threshold=float(os.getenv("AI_RAG_RETRY_THRESHOLD", "0.6") or 0.6),
             rag_embedding_backend=(os.getenv("RAG_EMBEDDING_BACKEND") or "lm-studio").strip().lower() or "lm-studio",
             rag_embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5-GGUF"),
             rag_embedding_dim=int(os.getenv("RAG_EMBEDDING_DIM", "768") or 768),
-            rag_embedding_batch_size=int(os.getenv("RAG_EMBEDDING_BATCH", "32") or 32),
+            rag_embedding_batch_size=int(
+                os.getenv("RAG_EMBEDDING_BATCH_SIZE")
+                or os.getenv("RAG_EMBEDDING_BATCH")
+                or "32"
+            ),
             rag_embedding_device=(os.getenv("RAG_EMBEDDING_DEVICE") or "").strip() or None,
             rag_embedding_endpoint=os.getenv("RAG_EMBEDDING_ENDPOINT")
             or os.getenv("LMSTUDIO_API_BASE", "http://localhost:1234/v1"),
@@ -377,6 +401,13 @@ class AppConfig:
             transcribe_language=os.getenv("TRANSCRIBE_LANGUAGE", "ru"),
             images_vision_enabled=_getenv_bool("IMAGES_VISION_ENABLED", False),
             keywords_to_tags_enabled=_getenv_bool("KEYWORDS_TO_TAGS_ENABLED", True),
+            doc_chat_chunk_max_tokens=int(os.getenv("DOC_CHAT_CHUNK_MAX_TOKENS") or "700"),
+            doc_chat_chunk_overlap=int(os.getenv("DOC_CHAT_CHUNK_OVERLAP") or "120"),
+            doc_chat_chunk_min_tokens=int(os.getenv("DOC_CHAT_CHUNK_MIN_TOKENS") or "80"),
+            doc_chat_max_chunks=int(os.getenv("DOC_CHAT_MAX_CHUNKS") or "0"),
+            doc_chat_fallback_chunks=int(os.getenv("DOC_CHAT_FALLBACK_CHUNKS") or "0"),
+            doc_chat_image_min_width=int(os.getenv("DOC_CHAT_IMAGE_MIN_WIDTH") or "32"),
+            doc_chat_image_min_height=int(os.getenv("DOC_CHAT_IMAGE_MIN_HEIGHT") or "32"),
             type_detect_flow=os.getenv("TYPE_DETECT_FLOW", "extension,filename,heuristics,llm"),
             type_llm_override=_getenv_bool("TYPE_LLM_OVERRIDE", True),
             rename_patterns=rename_patterns,
@@ -410,6 +441,14 @@ class AppConfig:
             search_cache_enabled=_getenv_bool("SEARCH_CACHE_ENABLED", True),
             search_cache_ttl_seconds=int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "90") or 90),
             search_cache_max_items=int(os.getenv("SEARCH_CACHE_MAX_ITEMS", "64") or 64),
+            llm_pool_global_concurrency=int(os.getenv("LLM_POOL_GLOBAL_CONCURRENCY", "4") or 4),
+            llm_pool_per_user_concurrency=int(os.getenv("LLM_POOL_PER_USER_CONCURRENCY", "1") or 1),
+            llm_queue_max_size=int(os.getenv("LLM_QUEUE_MAX_SIZE", "100") or 100),
+            llm_queue_per_user_max=int(os.getenv("LLM_QUEUE_PER_USER_MAX", "10") or 10),
+            llm_request_timeout_sec=int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "90") or 90),
+            llm_retry_count=int(os.getenv("LLM_RETRY_COUNT", "1") or 1),
+            llm_retry_backoff_ms=int(os.getenv("LLM_RETRY_BACKOFF_MS", "500") or 500),
+            lmstudio_idle_unload_minutes=max(0, int(os.getenv("LMSTUDIO_IDLE_UNLOAD_MINUTES", "0") or 0)),
             lm_max_input_chars=max(500, int(os.getenv("LM_MAX_INPUT_CHARS", "4000") or 4000)),
             lm_max_output_tokens=max(16, int(os.getenv("LM_MAX_OUTPUT_TOKENS", "256") or 256)),
             azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
@@ -419,12 +458,18 @@ class AppConfig:
             default_admin_user=(os.getenv("DEFAULT_ADMIN_USER") or "admin").strip() or "admin",
             default_admin_password=(os.getenv("DEFAULT_ADMIN_PASSWORD") or "").strip(),
             legacy_access_code=(os.getenv("ACCESS_CODE") or "").strip(),
+            database_url=(os.getenv("SQLALCHEMY_DATABASE_URI") or os.getenv("DATABASE_URL") or "").strip(),
         )
 
     def to_flask_config(self) -> Dict[str, object]:
         """Return a dict with settings that should live inside `Flask.config`."""
+        db_uri = (self.database_url or "").strip()
+        if db_uri.startswith("postgres://"):
+            db_uri = "postgresql://" + db_uri[len("postgres://"):]
+        if not db_uri:
+            db_uri = f"sqlite:///{self.catalogue_db_path}"
         return {
-            "SQLALCHEMY_DATABASE_URI": f"sqlite:///{self.catalogue_db_path}",
+            "SQLALCHEMY_DATABASE_URI": db_uri,
             "SQLALCHEMY_TRACK_MODIFICATIONS": False,
             "JSON_AS_ASCII": False,
             "UPLOAD_FOLDER": str(self.scan_root),
@@ -448,6 +493,14 @@ class AppConfig:
             "SEARCH_CACHE_ENABLED": self.search_cache_enabled,
             "SEARCH_CACHE_TTL_SECONDS": self.search_cache_ttl_seconds,
             "SEARCH_CACHE_MAX_ITEMS": self.search_cache_max_items,
+            "LLM_POOL_GLOBAL_CONCURRENCY": self.llm_pool_global_concurrency,
+            "LLM_POOL_PER_USER_CONCURRENCY": self.llm_pool_per_user_concurrency,
+            "LLM_QUEUE_MAX_SIZE": self.llm_queue_max_size,
+            "LLM_QUEUE_PER_USER_MAX": self.llm_queue_per_user_max,
+            "LLM_REQUEST_TIMEOUT_SEC": self.llm_request_timeout_sec,
+            "LLM_RETRY_COUNT": self.llm_retry_count,
+            "LLM_RETRY_BACKOFF_MS": self.llm_retry_backoff_ms,
+            "LMSTUDIO_IDLE_UNLOAD_MINUTES": self.lmstudio_idle_unload_minutes,
             "LOG_LEVEL": self.log_level,
             "SENTRY_DSN": self.sentry_dsn,
             "SENTRY_ENVIRONMENT": self.sentry_environment,

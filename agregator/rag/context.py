@@ -55,6 +55,8 @@ class ContextSelector:
         token_multiplier: float = 1.6,
         section_overhead: int = 80,
         feedback_scale: float = 0.5,
+        lexical_rerank_enabled: bool = True,
+        lexical_rerank_weight: float = 0.18,
     ) -> None:
         self.vector_retriever = vector_retriever
         self.keyword_retriever = keyword_retriever
@@ -73,6 +75,8 @@ class ContextSelector:
         self.token_multiplier = max(1.0, float(token_multiplier))
         self.section_overhead = max(0, int(section_overhead))
         self.feedback_scale = float(feedback_scale)
+        self.lexical_rerank_enabled = bool(lexical_rerank_enabled)
+        self.lexical_rerank_weight = max(0.0, float(lexical_rerank_weight))
 
     def select(
         self,
@@ -252,8 +256,34 @@ class ContextSelector:
                 pass
 
         if not did_rerank:
+            if self.lexical_rerank_enabled:
+                selected = self._lexical_rerank(query, selected)
             selected.sort(key=lambda item: (item.adjusted_score, item.combined_score), reverse=True)
         return selected
+
+    def _lexical_rerank(self, query: str, items: List[ContextCandidate]) -> List[ContextCandidate]:
+        terms = self._query_terms(query)
+        if not terms or not items or self.lexical_rerank_weight <= 0:
+            return items
+        for cand in items:
+            text = " ".join(
+                part for part in (
+                    cand.chunk.content or "",
+                    cand.chunk.preview or "",
+                    cand.section_path or "",
+                    " ".join(cand.metadata_hits or []),
+                ) if part
+            ).lower()
+            if not text:
+                continue
+            matched = sum(1 for term in terms if term and term in text)
+            coverage = matched / max(1, len(terms))
+            lexical_bonus = coverage * self.lexical_rerank_weight
+            cand.adjusted_score = (cand.adjusted_score or cand.combined_score) + lexical_bonus
+            if lexical_bonus > 0:
+                suffix = f"lex=+{lexical_bonus:.3f}"
+                cand.reasoning_hint = f"{cand.reasoning_hint}; {suffix}" if cand.reasoning_hint else suffix
+        return items
 
     @staticmethod
     def _build_reasoning_hint(cand: ContextCandidate) -> str:

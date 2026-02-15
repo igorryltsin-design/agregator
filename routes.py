@@ -1,12 +1,15 @@
-from flask import Blueprint, jsonify, request, Response, g, abort
+from flask import Blueprint, jsonify, request, Response, g, abort, send_file, after_this_request
 from io import StringIO, BytesIO
 import csv
 from pathlib import Path
 from datetime import datetime, date
 import json
+import tempfile
+import shutil
+import threading
 
 from models import (File, Tag, db, upsert_tag, file_to_dict, ChangeLog,
-                    Collection, CollectionMember, User, UserActionLog,
+                    Collection, CollectionMember, User, UserActionLog, TaskRecord,
                     AiSearchSnippetCache, AiSearchKeywordFeedback)
 from flask import current_app
 from sqlalchemy import func
@@ -90,6 +93,15 @@ def _expand_synonyms(lemmas: list[str]) -> set[str]:
         for s in _RU_SYNONYMS.get(l, []):
             out.add(_lemma(s))
     return out
+
+
+def _task_payload_json(task: TaskRecord) -> dict:
+    if not task.payload:
+        return {}
+    try:
+        return json.loads(task.payload)
+    except Exception:
+        return {}
 
 
 def _normalize_tag_value(value: str) -> str:
@@ -420,7 +432,14 @@ def api_graph_build():
     Это помогает заполнить связи, используемые в графе.
     """
     _require_admin()
-    files = File.query.all()
+    files = File.query
+    allowed = _allowed_collection_ids()
+    if allowed is not None:
+        if not allowed:
+            files = files.filter(File.collection_id == -1)
+        else:
+            files = files.filter(File.collection_id.in_(allowed))
+    files = files.all()
     created = 0
     for f in files:
         # автор
@@ -657,6 +676,24 @@ def api_file_delete(file_id):
     rel_path_raw = (f.rel_path or '').strip()
     sha1 = (f.sha1 or '').strip()
 
+    try:
+        from app import SETTINGS_STORE_PATH
+    except Exception:
+        SETTINGS_STORE_PATH = None
+    if file_path and SETTINGS_STORE_PATH:
+        def _resolve_safe(p: Path | None) -> Path | None:
+            if p is None:
+                return None
+            try:
+                return p.resolve()
+            except Exception:
+                try:
+                    return p.absolute()
+                except Exception:
+                    return p
+        if _resolve_safe(file_path) == _resolve_safe(SETTINGS_STORE_PATH):
+            return jsonify({'ok': False, 'error': 'runtime_settings.json нельзя удалять'}), 403
+
     # Чистим связанные записи вручную, чтобы избежать ошибок каскадного удаления в SQLite
     try:
         Tag.query.filter_by(file_id=f.id).delete(synchronize_session=False)
@@ -861,7 +898,14 @@ def export_csv():
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(['ID', 'Name', 'Tags'])
-    files = File.query.all()
+    files_query = File.query
+    allowed = _allowed_collection_ids()
+    if allowed is not None:
+        if not allowed:
+            files_query = files_query.filter(File.collection_id == -1)
+        else:
+            files_query = files_query.filter(File.collection_id.in_(allowed))
+    files = files_query.all()
     for file in files:
         writer.writerow([file.id, file.filename, ', '.join(f"{t.key}={t.value}" for t in file.tags)])
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=export.csv"})
@@ -869,10 +913,504 @@ def export_csv():
 @routes.route("/export/bibtex")
 def export_bibtex():
     output = StringIO()
-    files = File.query.all()
+    files_query = File.query
+    allowed = _allowed_collection_ids()
+    if allowed is not None:
+        if not allowed:
+            files_query = files_query.filter(File.collection_id == -1)
+        else:
+            files_query = files_query.filter(File.collection_id.in_(allowed))
+    files = files_query.all()
     for file in files:
         output.write(f"@misc{{{file.id},\n  title={{ {file.filename} }},\n  tags={{ {', '.join(f'{t.key}={t.value}' for t in file.tags)} }}\n}}\n")
     return Response(output.getvalue(), mimetype="text/x-bibtex", headers={"Content-Disposition": "attachment;filename=export.bib"})
+
+def _export_parse_keywords(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    except Exception:
+        pass
+    return [item.strip() for item in re.split(r"[;,]", text) if item.strip()]
+
+
+def _export_safe_rel_path(rel_path, filename):
+    candidate = rel_path or filename or ""
+    if not candidate:
+        return ""
+    try:
+        path_obj = Path(candidate)
+        if path_obj.is_absolute():
+            return path_obj.name
+        parts = [part for part in path_obj.parts if part not in ("", ".", "..")]
+        return "/".join(parts) if parts else path_obj.name
+    except Exception:
+        return filename or ""
+
+
+def _export_summary(text, limit=420):
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "…"
+
+
+@routes.route("/export/html")
+def export_html():
+    allowed = _allowed_collection_ids()
+    collection_id_raw = request.args.get("collection_id")
+    include_files = str(request.args.get("include_files", "1")).strip().lower() in ("1", "true", "yes", "on")
+
+    query = File.query
+    if collection_id_raw:
+        try:
+            collection_id = int(collection_id_raw)
+        except ValueError:
+            return jsonify({"ok": False, "error": "Некорректный collection_id"}), 400
+        if allowed is not None and collection_id not in allowed:
+            abort(403)
+        query = query.filter(File.collection_id == collection_id)
+    elif allowed is not None:
+        if not allowed:
+            return jsonify({"ok": False, "error": "Нет доступных коллекций"}), 403
+        query = query.filter(File.collection_id.in_(allowed))
+
+    files = query.order_by(File.id.asc()).all()
+
+    export_root = Path(tempfile.mkdtemp(prefix="agregator-export-"))
+    html_root = export_root / "agregator-export"
+    data_dir = html_root / "data"
+    data_files_dir = data_dir / "files"
+    html_root.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if include_files:
+        data_files_dir.mkdir(parents=True, exist_ok=True)
+
+    template_path = Path(__file__).resolve().parent / "agregator" / "export_templates" / "library_export.html"
+    if not template_path.exists():
+        shutil.rmtree(export_root, ignore_errors=True)
+        return jsonify({"ok": False, "error": "Шаблон экспорта не найден"}), 500
+
+    template_raw = template_path.read_text(encoding="utf-8")
+
+    items = []
+    for file in files:
+        rel_path = _export_safe_rel_path(file.rel_path, file.filename)
+        if include_files and rel_path:
+            try:
+                src_path = Path(file.path)
+                if src_path.exists():
+                    target = data_files_dir / rel_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_path, target)
+            except Exception as exc:
+                current_app.logger.warning("Export copy failed for %s: %s", file.path, exc)
+
+        keywords = _export_parse_keywords(file.keywords)
+        summary_source = file.text_excerpt or file.abstract or ""
+        description = re.sub(r"\s+", " ", str(file.abstract or "")).strip()
+        if not description:
+            description = re.sub(r"\s+", " ", str(file.text_excerpt or "")).strip()
+        created_at = None
+        if file.mtime:
+            try:
+                created_at = datetime.utcfromtimestamp(float(file.mtime)).isoformat() + "Z"
+            except Exception:
+                created_at = None
+
+        items.append({
+            "id": file.id,
+            "title": file.title or file.filename or "Без названия",
+            "author": file.author or "",
+            "type": file.material_type or "",
+            "year": file.year or "",
+            "summary": _export_summary(summary_source),
+            "description": description or "",
+            "keywords": keywords,
+            "path": f"data/files/{rel_path}" if include_files and rel_path else (rel_path or ""),
+            "createdAt": created_at,
+        })
+
+    meta = {
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "count": len(items),
+        "include_files": include_files,
+    }
+    items_json = json.dumps(items, ensure_ascii=False)
+    meta_json = json.dumps(meta, ensure_ascii=False)
+    inline_json = items_json.replace("</script", "<\\/script")
+    inline_meta = meta_json.replace("</script", "<\\/script")
+
+    html_path = html_root / "index.html"
+    html_path.write_text(
+        template_raw
+        .replace("__EXPORT_DATA_JS__", inline_json)
+        .replace("__EXPORT_META_JS__", inline_meta),
+        encoding="utf-8",
+    )
+
+    items_json_path = data_dir / "items.json"
+    items_js_path = data_dir / "items.js"
+    items_json_path.write_text(items_json, encoding="utf-8")
+    items_js_path.write_text(
+        f"window.__AGREGATOR_EXPORT__ = {items_json};\n"
+        f"window.__AGREGATOR_EXPORT_META__ = {meta_json};\n",
+        encoding="utf-8",
+    )
+    (html_root / "items.json").write_text(items_json, encoding="utf-8")
+    (html_root / "items.js").write_text(
+        f"window.__AGREGATOR_EXPORT__ = {items_json};\n"
+        f"window.__AGREGATOR_EXPORT_META__ = {meta_json};\n",
+        encoding="utf-8",
+    )
+
+    zip_base = export_root / "agregator-export"
+    zip_path = Path(shutil.make_archive(str(zip_base), "zip", root_dir=html_root))
+
+    @after_this_request
+    def _cleanup(response):
+        try:
+            shutil.rmtree(export_root, ignore_errors=True)
+        except Exception:
+            pass
+        return response
+
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"agregator-export-{stamp}.zip"
+    return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name=filename)
+
+
+def _export_stage_label(stage: str) -> str:
+    mapping = {
+        "collecting": "Сбор метаданных",
+        "copying": "Копирование файлов",
+        "writing": "Запись данных",
+        "zipping": "Упаковка архива",
+        "completed": "Готово",
+    }
+    return mapping.get(stage, stage or "")
+
+
+def _run_export_job(task_id: int, file_ids: list[int], include_files: bool) -> None:
+    try:
+        db.session.rollback()
+    except Exception:
+        db.session.remove()
+
+    task = TaskRecord.query.get(task_id)
+    if not task:
+        return
+
+    task.status = "running"
+    task.started_at = datetime.utcnow()
+    task.progress = 0.0
+    task.error = None
+
+    payload = {
+        "stage": "collecting",
+        "stage_label": _export_stage_label("collecting"),
+        "total": len(file_ids),
+        "processed": 0,
+        "include_files": include_files,
+    }
+    task.payload = json.dumps(payload, ensure_ascii=False)
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    export_root = None
+    try:
+        export_root = Path(tempfile.mkdtemp(prefix="agregator-export-job-"))
+        html_root = export_root / "agregator-export"
+        data_dir = html_root / "data"
+        data_files_dir = data_dir / "files"
+        html_root.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        if include_files:
+            data_files_dir.mkdir(parents=True, exist_ok=True)
+
+        template_path = Path(__file__).resolve().parent / "agregator" / "export_templates" / "library_export.html"
+        if not template_path.exists():
+            raise RuntimeError("template_missing")
+
+        template_raw = template_path.read_text(encoding="utf-8")
+
+        total = len(file_ids) or 1
+        items = []
+        processed = 0
+
+        if include_files:
+            payload["stage"] = "copying"
+            payload["stage_label"] = _export_stage_label("copying")
+            task.payload = json.dumps(payload, ensure_ascii=False)
+            try:
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+
+        for index, file_id in enumerate(file_ids, start=1):
+            file = File.query.get(file_id)
+            if not file:
+                processed += 1
+                continue
+
+            rel_path = _export_safe_rel_path(file.rel_path, file.filename)
+            if include_files and rel_path:
+                try:
+                    src_path = Path(file.path)
+                    if src_path.exists():
+                        target = data_files_dir / rel_path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_path, target)
+                except Exception as exc:
+                    current_app.logger.warning("Export copy failed for %s: %s", file.path, exc)
+
+            keywords = _export_parse_keywords(file.keywords)
+            summary_source = file.text_excerpt or file.abstract or ""
+            description = re.sub(r"\s+", " ", str(file.abstract or "")).strip()
+            if not description:
+                description = re.sub(r"\s+", " ", str(file.text_excerpt or "")).strip()
+            created_at = None
+            if file.mtime:
+                try:
+                    created_at = datetime.utcfromtimestamp(float(file.mtime)).isoformat() + "Z"
+                except Exception:
+                    created_at = None
+
+            items.append({
+                "id": file.id,
+                "title": file.title or file.filename or "Без названия",
+                "author": file.author or "",
+                "type": file.material_type or "",
+                "year": file.year or "",
+                "summary": _export_summary(summary_source),
+                "description": description or "",
+                "keywords": keywords,
+                "path": f"data/files/{rel_path}" if include_files and rel_path else (rel_path or ""),
+                "createdAt": created_at,
+            })
+
+            processed += 1
+            payload["processed"] = processed
+            task.progress = min(0.99, processed / total)
+            if index % 20 == 0 or index == total:
+                task.payload = json.dumps(payload, ensure_ascii=False)
+                try:
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+
+        payload["stage"] = "writing"
+        payload["stage_label"] = _export_stage_label("writing")
+        task.payload = json.dumps(payload, ensure_ascii=False)
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        meta = {
+            "exported_at": datetime.utcnow().isoformat() + "Z",
+            "count": len(items),
+            "include_files": include_files,
+        }
+        items_json = json.dumps(items, ensure_ascii=False)
+        meta_json = json.dumps(meta, ensure_ascii=False)
+        inline_json = items_json.replace("</script", "<\\/script")
+        inline_meta = meta_json.replace("</script", "<\\/script")
+
+        html_path = html_root / "index.html"
+        html_path.write_text(
+            template_raw
+            .replace("__EXPORT_DATA_JS__", inline_json)
+            .replace("__EXPORT_META_JS__", inline_meta),
+            encoding="utf-8",
+        )
+
+        (data_dir / "items.json").write_text(items_json, encoding="utf-8")
+        (data_dir / "items.js").write_text(
+            f"window.__AGREGATOR_EXPORT__ = {items_json};\n"
+            f"window.__AGREGATOR_EXPORT_META__ = {meta_json};\n",
+            encoding="utf-8",
+        )
+        (html_root / "items.json").write_text(items_json, encoding="utf-8")
+        (html_root / "items.js").write_text(
+            f"window.__AGREGATOR_EXPORT__ = {items_json};\n"
+            f"window.__AGREGATOR_EXPORT_META__ = {meta_json};\n",
+            encoding="utf-8",
+        )
+
+        payload["stage"] = "zipping"
+        payload["stage_label"] = _export_stage_label("zipping")
+        task.payload = json.dumps(payload, ensure_ascii=False)
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        zip_base = export_root / "agregator-export"
+        zip_path = Path(shutil.make_archive(str(zip_base), "zip", root_dir=html_root))
+
+        payload["stage"] = "completed"
+        payload["stage_label"] = _export_stage_label("completed")
+        payload["export_path"] = str(zip_path)
+        task.payload = json.dumps(payload, ensure_ascii=False)
+        task.status = "completed"
+        task.progress = 1.0
+        task.finished_at = datetime.utcnow()
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+    except Exception as exc:
+        task.status = "error"
+        task.error = str(exc)
+        task.finished_at = datetime.utcnow()
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        if export_root:
+            shutil.rmtree(export_root, ignore_errors=True)
+
+
+def _start_export_job(task_id: int, file_ids: list[int], include_files: bool) -> None:
+    app = current_app._get_current_object()
+
+    def _runner():
+        with app.app_context():
+            _run_export_job(task_id, file_ids, include_files)
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
+@routes.route("/export/html/jobs", methods=["POST"])
+@routes.route("/api/export/html/jobs", methods=["POST"])
+def export_html_job_create():
+    user = _current_user()
+    if not user:
+        abort(401)
+
+    data = request.get_json(silent=True) or {}
+    include_files = bool(data.get("include_files", True))
+    collection_id = data.get("collection_id")
+    allowed = _allowed_collection_ids()
+
+    query = File.query
+    if collection_id is not None:
+        try:
+            collection_id = int(collection_id)
+        except Exception:
+            return jsonify({"ok": False, "error": "Некорректный collection_id"}), 400
+        if allowed is not None and collection_id not in allowed:
+            abort(403)
+        query = query.filter(File.collection_id == collection_id)
+    elif allowed is not None:
+        if not allowed:
+            return jsonify({"ok": False, "error": "Нет доступных коллекций"}), 403
+        query = query.filter(File.collection_id.in_(allowed))
+
+    file_ids = [row.id for row in query.order_by(File.id.asc()).all()]
+
+    payload = {
+        "submitted_by": user.id,
+        "collection_id": collection_id,
+        "include_files": include_files,
+        "total": len(file_ids),
+        "processed": 0,
+        "stage": "queued",
+        "stage_label": _export_stage_label("collecting"),
+    }
+    try:
+        task = TaskRecord(
+            name="export_html",
+            status="queued",
+            payload=json.dumps(payload, ensure_ascii=False),
+            progress=0.0,
+            user_id=getattr(user, 'id', None),
+            collection_id=int(collection_id) if collection_id is not None else None,
+        )
+        db.session.add(task)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": f"Не удалось создать задачу экспорта: {exc}"}), 500
+
+    _start_export_job(task.id, file_ids, include_files)
+    return jsonify({"ok": True, "task_id": task.id})
+
+
+@routes.route("/export/html/jobs/<int:task_id>", methods=["GET"])
+@routes.route("/api/export/html/jobs/<int:task_id>", methods=["GET"])
+def export_html_job_status(task_id: int):
+    user = _current_user()
+    if not user:
+        abort(401)
+    task = TaskRecord.query.get_or_404(task_id)
+    payload = _task_payload_json(task)
+    if getattr(user, 'role', '') != 'admin' and payload.get('submitted_by') != user.id:
+        abort(403)
+
+    collection_id = payload.get("collection_id")
+    allowed = _allowed_collection_ids()
+    if allowed is not None and collection_id is not None and collection_id not in allowed:
+        abort(403)
+
+    info = {
+        "id": task.id,
+        "name": task.name,
+        "status": task.status,
+        "progress": float(task.progress or 0.0),
+        "payload_json": payload,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+        "error": task.error,
+    }
+    return jsonify({"ok": True, "task": info})
+
+
+@routes.route("/export/html/jobs/<int:task_id>/download", methods=["GET"])
+@routes.route("/api/export/html/jobs/<int:task_id>/download", methods=["GET"])
+def export_html_job_download(task_id: int):
+    user = _current_user()
+    if not user:
+        abort(401)
+    task = TaskRecord.query.get_or_404(task_id)
+    payload = _task_payload_json(task)
+    if getattr(user, 'role', '') != 'admin' and payload.get('submitted_by') != user.id:
+        abort(403)
+    if task.status != "completed":
+        return jsonify({"ok": False, "error": "Экспорт еще не завершен"}), 400
+
+    export_path = payload.get("export_path")
+    if not export_path:
+        return jsonify({"ok": False, "error": "Файл экспорта не найден"}), 404
+    export_file = Path(export_path)
+    if not export_file.exists():
+        return jsonify({"ok": False, "error": "Файл экспорта не найден"}), 404
+
+    @after_this_request
+    def _cleanup(response):
+        try:
+            shutil.rmtree(export_file.parent, ignore_errors=True)
+        except Exception:
+            pass
+        return response
+
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"agregator-export-{stamp}.zip"
+    return send_file(export_file, mimetype="application/zip", as_attachment=True, download_name=filename)
 
 
 @routes.route("/api/collections/<int:collection_id>/export/excel")

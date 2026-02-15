@@ -1,5 +1,10 @@
 .DS_Store
+.env
+.env.local
+.env.*.local
 /__pycache__
+__pycache__/
+*.pyc
 /library
 /sample_library
 /static/cache
@@ -19,3 +24,8 @@ catalogue.db
 *.db
 *.db
 agregator-amd64.tar
+/models/faster-whisper
+*.bin
+models/faster-whisper/Systran__faster-whisper-small/model.bin
+models/faster-whisper/Systran__faster-whisper-small/model.bin
+instance/

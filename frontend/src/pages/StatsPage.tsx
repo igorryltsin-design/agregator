@@ -2,8 +2,11 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { materialTypeRu, tagKeyRu } from '../utils/locale'
 import LoadingState from '../ui/LoadingState'
+import { EmptyState } from '../ui/EmptyState'
 import { Chart, BarController, BarElement, CategoryScale, LinearScale, LogarithmicScale, LineController, LineElement, PointElement, ArcElement, Tooltip, Legend, DoughnutController } from 'chart.js'
 Chart.register(BarController, BarElement, CategoryScale, LinearScale, LogarithmicScale, LineController, LineElement, PointElement, ArcElement, DoughnutController, Tooltip, Legend)
+
+const formatScore = (value?: number) => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(3) : '—')
 
 type StatKV = [string, number]
 type StatsResponse = {
@@ -376,7 +379,7 @@ export default function StatsPage(){
   }
 
   return (
-    <div className="card p-3" aria-busy={loading}>
+    <div className="card p-3 stats-page-glass" aria-busy={loading}>
       <div className="d-flex align-items-center justify-content-between mb-2">
         <div className="fw-semibold">Статистика</div>
         <div className="d-flex align-items-center gap-3">
@@ -695,8 +698,8 @@ export default function StatsPage(){
         </>
       )}
       {!loading && data && data.total_files === 0 && (
-        <div className="mt-3 text-center text-secondary">
-          Нет данных для отображения. Добавьте файлы в каталог, чтобы увидеть статистику.
+        <div className="mt-3">
+          <EmptyState title="Нет данных для статистики" description="Добавьте файлы в каталог, чтобы увидеть метрики." />
         </div>
       )}
     </div>

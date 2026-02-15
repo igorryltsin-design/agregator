@@ -1,0 +1,1570 @@
+===== README.md =====
+# Сканер многомодальной информации
+
+Модуль выполняет обход данных, вычисляет сигнатуры, классифицирует документы и строит граф близости между найденными объектами для последующей передачи в другие компоненты СППР.
+
+## Возможности
+- сканирование заданных корневых каталогов с контролем глубины и фильтрацией по шаблонам;
+- вычисление хешей и блочных сигнатур, оценка энтропии, классификация по типу носителя;
+- построение графа сходства по пересечению сигнатур для выявления дубликатов и наборов;
+- сбор статистики по модальностям и ведение журнала запусков;
+- REST/CLI для запуска, получения последних артефактов, статистики и логов.
+
+## Запуск
+```bash
+python -m program_modules.multimodal_scanner.cli runserver --host 0.0.0.0 --port 8351
+```
+
+CLI-команды: `scan`, `classify`, `graph`, `stats`, `logs`, `report`, `search`, `watchdog`, `runserver`.
+
+
+===== __init__.py =====
+"""Multimodal scanner SPPR module."""
+
+from .bootstrap import build_context
+from .app import create_app
+
+__all__ = ["build_context", "create_app"]
+
+
+===== app.py =====
+"""Flask application entry point for multimodal scanner."""
+
+from __future__ import annotations
+
+import atexit
+
+from flask import Flask
+
+from .api.routes import create_blueprint
+from .bootstrap import build_context
+
+
+def create_app() -> Flask:
+    ctx = build_context()
+    app = Flask(__name__)
+    app.config["SCANNER_CONFIG"] = ctx.config
+    app.register_blueprint(create_blueprint(ctx.engine), url_prefix="/scanner")
+    atexit.register(ctx.engine.shutdown)
+    return app
+
+
+if __name__ == "__main__":
+    app = create_app()
+    app.run(host="0.0.0.0", port=8351)
+
+
+===== bootstrap.py =====
+"""Bootstrapper for the scanner module."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .config import AppConfig, load_config
+from .database import Database
+from .engine import ScannerEngine
+from .logging_setup import setup_logging
+
+
+@dataclass
+class ScannerContext:
+    config: AppConfig
+    database: Database
+    engine: ScannerEngine
+
+
+def build_context(base_dir=None) -> ScannerContext:
+    setup_logging()
+    config = load_config(base_dir)
+    database = Database(config.storage.database_url)
+    database.create_all()
+    engine = ScannerEngine(config, database)
+    return ScannerContext(config=config, database=database, engine=engine)
+
+
+===== cli.py =====
+"""CLI for the multimodal scanner."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from .bootstrap import build_context
+
+
+def _print(data):
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Multimodal Scanner CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    scan = sub.add_parser("scan", help="Run filesystem scan")
+    scan.add_argument("--memo")
+    scan.add_argument("--base-dir")
+    scan.set_defaults(cmd="scan")
+
+    classify = sub.add_parser("classify", help="Classify artifact")
+    classify.add_argument("--artifact-id", type=int, required=True)
+    classify.add_argument("--base-dir")
+    classify.set_defaults(cmd="classify")
+
+    graph = sub.add_parser("graph", help="Build similarity graph")
+    graph.add_argument("--artifact-ids", nargs="+", type=int, required=True)
+    graph.add_argument("--base-dir")
+    graph.set_defaults(cmd="graph")
+
+    stats = sub.add_parser("stats", help="Show modality stats")
+    stats.add_argument("--base-dir")
+    stats.set_defaults(cmd="stats")
+
+    logs = sub.add_parser("logs", help="Show recent logs")
+    logs.add_argument("--base-dir")
+    logs.add_argument("--limit", type=int, default=20)
+    logs.set_defaults(cmd="logs")
+
+    watchdog = sub.add_parser("watchdog", help="Run anomaly checks")
+    watchdog.add_argument("--base-dir")
+    watchdog.set_defaults(cmd="watchdog")
+
+    report = sub.add_parser("report", help="Generate text report")
+    report.add_argument("--base-dir")
+    report.set_defaults(cmd="report")
+
+    search = sub.add_parser("search", help="Search artifacts by keyword")
+    search.add_argument("--query", required=True)
+    search.add_argument("--base-dir")
+    search.set_defaults(cmd="search")
+
+    serve = sub.add_parser("runserver", help="Start HTTP server")
+    serve.add_argument("--host", default="0.0.0.0")
+    serve.add_argument("--port", type=int, default=8351)
+    serve.add_argument("--base-dir")
+    serve.set_defaults(cmd="runserver")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    ctx = build_context(Path(args.base_dir) if getattr(args, "base_dir", None) else None)
+
+    if args.command == "scan":
+        result = ctx.engine.scan(memo=args.memo)
+        _print(result.payload if result.ok else {"error": result.error})
+    elif args.command == "classify":
+        result = ctx.engine.classify(args.artifact_id)
+        _print(result.payload if result.ok else {"error": result.error})
+    elif args.command == "graph":
+        result = ctx.engine.build_graph(args.artifact_ids)
+        _print(result.payload)
+    elif args.command == "stats":
+        result = ctx.engine.stats_snapshot()
+        _print(result.payload)
+    elif args.command == "logs":
+        result = ctx.engine.logs(limit=args.limit)
+        _print(result.payload)
+    elif args.command == "watchdog":
+        result = ctx.engine.watchdog()
+        _print(result.payload)
+    elif args.command == "report":
+        result = ctx.engine.report()
+        _print(result.payload)
+    elif args.command == "search":
+        result = ctx.engine.search(args.query)
+        _print(result.payload)
+    elif args.command == "runserver":
+        from .app import create_app
+
+        app = create_app()
+        app.run(host=args.host, port=args.port)
+        ctx.engine.shutdown()
+        return
+
+    ctx.engine.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== config.py =====
+"""Configuration for the multimodal scanner module."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from datetime import timedelta
+from pathlib import Path
+from typing import Dict, Any
+
+
+def _env(key: str, default: str) -> str:
+    value = os.getenv(key)
+    return value if value is not None else default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = _env(key, str(default)).lower()
+    if value in {"1", "true", "yes", "y"}:
+        return True
+    if value in {"0", "false", "no", "n"}:
+        return False
+    return default
+
+
+@dataclass(slots=True)
+class SourceConfig:
+    root_paths: list[str]
+    max_depth: int = 4
+    follow_symlinks: bool = False
+    include_patterns: list[str] = field(default_factory=lambda: ["*.pdf", "*.docx", "*.wav", "*.png", "*.mp3"])
+
+
+@dataclass(slots=True)
+class FingerprintConfig:
+    block_size: int = 8192
+    rolling_window: int = 256
+    hash_alg: str = "sha256"
+
+
+@dataclass(slots=True)
+class ClassifierConfig:
+    text_threshold: float = 0.6
+    audio_threshold: float = 0.5
+    image_threshold: float = 0.55
+
+
+@dataclass(slots=True)
+class StorageConfig:
+    database_url: str
+    data_dir: Path
+
+
+@dataclass(slots=True)
+class AppConfig:
+    base_dir: Path
+    storage: StorageConfig
+    source: SourceConfig
+    fingerprint: FingerprintConfig = field(default_factory=FingerprintConfig)
+    classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
+    graph_threshold: float = 0.65
+    stats_window: timedelta = timedelta(hours=6)
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
+def load_config(base_dir: Path | None = None) -> AppConfig:
+    base = base_dir or Path(os.getenv("SCANNER_HOME", Path.cwd()))
+    data_dir = base / "scanner-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "scanner.db"
+
+    root_paths = _env("SCANNER_ROOTS", str(base / "library")).split(os.pathsep)
+    source = SourceConfig(
+        root_paths=[path for path in root_paths if path],
+        max_depth=_env_int("SCANNER_MAX_DEPTH", 4),
+        follow_symlinks=_env_bool("SCANNER_FOLLOW_SYMLINKS", False),
+        include_patterns=_env("SCANNER_PATTERNS", "*.pdf;*.docx;*.png;*.wav").split(";"),
+    )
+    fingerprint = FingerprintConfig(
+        block_size=_env_int("SCANNER_BLOCK_SIZE", 8192),
+        rolling_window=_env_int("SCANNER_ROLLING_WINDOW", 256),
+        hash_alg=_env("SCANNER_HASH", "sha256"),
+    )
+    classifier = ClassifierConfig(
+        text_threshold=_env_float("SCANNER_TEXT_THRESHOLD", 0.6),
+        audio_threshold=_env_float("SCANNER_AUDIO_THRESHOLD", 0.5),
+        image_threshold=_env_float("SCANNER_IMAGE_THRESHOLD", 0.55),
+    )
+    storage = StorageConfig(database_url=f"sqlite:///{db_path}", data_dir=data_dir)
+    extras = {
+        "instance_id": _env("SCANNER_INSTANCE_ID", "scanner-local"),
+        "profile": _env("SCANNER_PROFILE", "default"),
+    }
+    return AppConfig(
+        base_dir=base,
+        storage=storage,
+        source=source,
+        fingerprint=fingerprint,
+        classifier=classifier,
+        graph_threshold=_env_float("SCANNER_GRAPH_THRESHOLD", 0.65),
+        stats_window=timedelta(hours=_env_int("SCANNER_STATS_WINDOW_H", 6)),
+        extras=extras,
+    )
+
+
+===== database.py =====
+"""Database helper for scanner module."""
+
+from __future__ import annotations
+
+import contextlib
+from typing import Iterator
+
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+
+class Base(DeclarativeBase):
+    """Declarative base."""
+
+
+class Database:
+    def __init__(self, url: str, echo: bool = False) -> None:
+        self._engine: Engine = create_engine(url, echo=echo, future=True)
+        self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False)
+
+    def create_all(self) -> None:
+        from . import models  # noqa: F401
+
+        Base.metadata.create_all(self._engine)
+
+    @contextlib.contextmanager
+    def session(self) -> Iterator[Session]:
+        session = self._session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+
+===== engine.py =====
+"""High-level orchestrator for the multimodal scanner."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+from sqlalchemy import select
+
+from . import models
+from .config import AppConfig
+from .database import Database
+from .repositories import ArtifactRepository, LogRepository, RunRepository
+from .services.classifier import ModalityClassifier
+from .services.graph import SimilarityGraph
+from .services.statistics import StatisticsService
+from .services.walker import ScanWalker
+from .services.indexer import KeywordIndex
+from .services.scheduler import Scheduler
+from .services.reporting import ReportingService
+from .services.watchdog import WatchdogService
+from .telemetry import Telemetry
+
+
+@dataclass
+class EngineResult:
+    ok: bool
+    payload: Dict[str, Any]
+    error: str | None = None
+
+
+class ScannerEngine:
+    def __init__(self, config: AppConfig, database: Database):
+        self.config = config
+        self.database = database
+        self.walker = ScanWalker(config)
+        self.graph = SimilarityGraph(config)
+        self.classifier = ModalityClassifier(config)
+        self.stats = StatisticsService(config)
+        self.reporting = ReportingService(config)
+        self.index = KeywordIndex()
+        self.watchdog_service = WatchdogService(config)
+        self.telemetry = Telemetry()
+        self.scheduler = Scheduler()
+        self._last_telemetry: Dict[str, Dict[str, float]] = {}
+        self.telemetry.configure_export(
+            interval=config.stats_window.total_seconds(),
+            callback=self._capture_telemetry,
+        )
+        self.telemetry.start()
+        self.scheduler.add_task("stats", config.stats_window.total_seconds(), self._scheduled_stats)
+        self.scheduler.start()
+
+    @contextmanager
+    def _session(self):
+        with self.database.session() as session:
+            yield session
+
+    def scan(self, memo: str | None = None) -> EngineResult:
+        with self._session() as session:
+            result = self.walker.run(session, memo=memo)
+            self.telemetry.observe("scan.total", float(result["total"]))
+            self.telemetry.observe("scan.processed", float(result["processed"]))
+            self.index.build(session)
+            return EngineResult(True, result)
+
+    def classify(self, artifact_id: int) -> EngineResult:
+        with self._session() as session:
+            artifact = session.get(models.Artifact, artifact_id)
+            if not artifact:
+                return EngineResult(False, {}, "artifact_not_found")
+            result = self.classifier.classify(artifact.modality, artifact.entropy, artifact.attributes)
+            artifact.attributes = artifact.attributes | {"classification": result}
+            self.telemetry.observe("classification.score", result["score"])
+            return EngineResult(True, {"artifact_id": artifact_id, "classification": result})
+
+    def build_graph(self, artifact_ids: List[int]) -> EngineResult:
+        with self._session() as session:
+            result = self.graph.build(session, artifact_ids)
+            return EngineResult(True, result)
+
+    def stats_snapshot(self) -> EngineResult:
+        with self._session() as session:
+            data = self.stats.refresh(session)
+            return EngineResult(True, {"modality": data})
+
+    def latest_artifacts(self, limit: int = 20) -> EngineResult:
+        with self._session() as session:
+            repo = ArtifactRepository(session)
+            artifacts = repo.list_recent(limit=limit)
+            return EngineResult(
+                True,
+                {
+                    "artifacts": [
+                        {
+                            "id": artifact.id,
+                            "path": artifact.path,
+                            "modality": artifact.modality,
+                            "updated_at": artifact.updated_at.isoformat(),
+                        }
+                        for artifact in artifacts
+                    ]
+                },
+            )
+
+    def logs(self, limit: int = 50) -> EngineResult:
+        with self._session() as session:
+            repo = LogRepository(session)
+            entries = repo.latest(limit=limit)
+            return EngineResult(
+                True,
+                {
+                    "logs": [
+                        {
+                            "level": entry.level,
+                            "message": entry.message,
+                            "created_at": entry.created_at.isoformat(),
+                            "payload": entry.payload,
+                        }
+                        for entry in entries
+                    ]
+                },
+            )
+
+    def report(self) -> EngineResult:
+        with self._session() as session:
+            report = self.reporting.generate(session, self._last_telemetry)
+            return EngineResult(True, report)
+
+    def search(self, query: str) -> EngineResult:
+        results = self.index.search(query)
+        return EngineResult(True, {"query": query, "artifact_ids": results})
+
+    def watchdog(self) -> EngineResult:
+        with self._session() as session:
+            summary = self.watchdog_service.inspect(session)
+            return EngineResult(
+                True,
+                {
+                    "errors": summary.error_entries,
+                    "high_entropy": summary.high_entropy,
+                    "duplicates": summary.duplicates,
+                },
+            )
+
+    def shutdown(self) -> None:
+        self.scheduler.stop()
+        self.telemetry.stop()
+
+    def _capture_telemetry(self, payload: Dict[str, Dict[str, float]]) -> None:
+        self._last_telemetry = payload
+
+    def _scheduled_stats(self) -> None:
+        with self._session() as session:
+            self.stats.refresh(session)
+
+
+===== logging_setup.py =====
+"""Logging utilities for the scanner module."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Dict
+
+
+@dataclass(slots=True)
+class LoggingConfig:
+    level: int = logging.INFO
+    fmt: str = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+
+def setup_logging(config: LoggingConfig | None = None) -> Dict[str, logging.Logger]:
+    cfg = config or LoggingConfig()
+    logging.basicConfig(level=cfg.level, format=cfg.fmt)
+    return {
+        "scanner": logging.getLogger("scanner"),
+        "walker": logging.getLogger("scanner.walker"),
+        "fingerprint": logging.getLogger("scanner.fingerprint"),
+        "classifier": logging.getLogger("scanner.classifier"),
+        "graph": logging.getLogger("scanner.graph"),
+    }
+
+
+===== models.py =====
+"""ORM models describing scanned objects and similarity graph."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .database import Base
+
+Modality = Enum(
+    "text",
+    "audio",
+    "image",
+    "video",
+    "archive",
+    "unknown",
+    name="scanner_modality",
+)
+
+
+class ScanSource(Base):
+    __tablename__ = "scan_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    path: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    root: Mapped[str] = mapped_column(String(512), nullable=False)
+    recursive: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_patterns: Mapped[List[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    artifacts: Mapped[List["Artifact"]] = relationship(
+        "Artifact", back_populates="source", cascade="all, delete-orphan"
+    )
+
+
+class Artifact(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("scan_sources.id"))
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    modality: Mapped[str] = mapped_column(Modality, default="unknown")
+    signature: Mapped[str] = mapped_column(String(128), nullable=False)
+    hash_alg: Mapped[str] = mapped_column(String(16), default="sha256")
+    entropy: Mapped[float] = mapped_column(Float, default=0.0)
+    attributes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    source: Mapped["ScanSource"] = relationship("ScanSource", back_populates="artifacts")
+    signatures: Mapped[List["SignatureBlock"]] = relationship(
+        "SignatureBlock", back_populates="artifact", cascade="all, delete-orphan"
+    )
+    edges_from: Mapped[List["SimilarityEdge"]] = relationship(
+        "SimilarityEdge",
+        foreign_keys="SimilarityEdge.from_artifact_id",
+        back_populates="from_artifact",
+    )
+    edges_to: Mapped[List["SimilarityEdge"]] = relationship(
+        "SimilarityEdge",
+        foreign_keys="SimilarityEdge.to_artifact_id",
+        back_populates="to_artifact",
+    )
+
+
+class SignatureBlock(Base):
+    __tablename__ = "signature_blocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    artifact_id: Mapped[int] = mapped_column(ForeignKey("artifacts.id"))
+    offset: Mapped[int] = mapped_column(Integer, nullable=False)
+    signature: Mapped[str] = mapped_column(String(128), nullable=False)
+    block_size: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    artifact: Mapped["Artifact"] = relationship("Artifact", back_populates="signatures")
+
+
+class SimilarityEdge(Base):
+    __tablename__ = "similarity_edges"
+    __table_args__ = (
+        UniqueConstraint("from_artifact_id", "to_artifact_id", name="uix_similarity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    from_artifact_id: Mapped[int] = mapped_column(ForeignKey("artifacts.id"))
+    to_artifact_id: Mapped[int] = mapped_column(ForeignKey("artifacts.id"))
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    from_artifact: Mapped["Artifact"] = relationship(
+        "Artifact", foreign_keys=[from_artifact_id], back_populates="edges_from"
+    )
+    to_artifact: Mapped["Artifact"] = relationship(
+        "Artifact", foreign_keys=[to_artifact_id], back_populates="edges_to"
+    )
+
+
+class ScanRun(Base):
+    __tablename__ = "scan_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+    total_files: Mapped[int] = mapped_column(Integer, default=0)
+    processed_files: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[int] = mapped_column(Integer, default=0)
+    memo: Mapped[str | None] = mapped_column(Text)
+
+
+class ScanLog(Base):
+    __tablename__ = "scan_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("scan_runs.id"))
+    level: Mapped[str] = mapped_column(String(16), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ScanStat(Base):
+    __tablename__ = "scan_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+===== repositories.py =====
+"""Repository layer for scanner module."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Dict, Iterable, List, Sequence
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from . import models
+
+
+class BaseRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+
+class SourceRepository(BaseRepository):
+    def get_or_create(self, path: str, root: str, recursive: bool, patterns: List[str]) -> models.ScanSource:
+        stmt = select(models.ScanSource).where(models.ScanSource.path == path)
+        source = self.session.scalar(stmt)
+        if source:
+            return source
+        source = models.ScanSource(
+            path=path,
+            root=root,
+            recursive=recursive,
+            include_patterns=patterns,
+        )
+        self.session.add(source)
+        self.session.flush()
+        return source
+
+
+class ArtifactRepository(BaseRepository):
+    def upsert(
+        self,
+        source_id: int,
+        path: str,
+        size_bytes: int,
+        modality: str,
+        signature: str,
+        hash_alg: str,
+        entropy: float,
+        attributes: Dict,
+    ) -> models.Artifact:
+        stmt = select(models.Artifact).where(models.Artifact.signature == signature)
+        artifact = self.session.scalar(stmt)
+        if artifact:
+            artifact.path = path
+            artifact.size_bytes = size_bytes
+            artifact.modality = modality
+            artifact.hash_alg = hash_alg
+            artifact.entropy = entropy
+            artifact.attributes = attributes
+            artifact.updated_at = datetime.utcnow()
+        else:
+            artifact = models.Artifact(
+                source_id=source_id,
+                path=path,
+                size_bytes=size_bytes,
+                modality=modality,
+                signature=signature,
+                hash_alg=hash_alg,
+                entropy=entropy,
+                attributes=attributes,
+            )
+            self.session.add(artifact)
+            self.session.flush()
+        return artifact
+
+    def list_recent(self, limit: int = 50) -> List[models.Artifact]:
+        stmt = (
+            select(models.Artifact)
+            .order_by(models.Artifact.updated_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class SignatureRepository(BaseRepository):
+    def replace(self, artifact_id: int, blocks: Sequence[tuple[int, str, int]]) -> None:
+        self.session.query(models.SignatureBlock).filter(
+            models.SignatureBlock.artifact_id == artifact_id
+        ).delete(synchronize_session=False)
+        for offset, signature, block_size in blocks:
+            block = models.SignatureBlock(
+                artifact_id=artifact_id,
+                offset=offset,
+                signature=signature,
+                block_size=block_size,
+            )
+            self.session.add(block)
+
+    def load(self, artifact_id: int) -> List[models.SignatureBlock]:
+        stmt = select(models.SignatureBlock).where(models.SignatureBlock.artifact_id == artifact_id)
+        return list(self.session.scalars(stmt))
+
+
+class SimilarityRepository(BaseRepository):
+    def upsert(self, a_id: int, b_id: int, score: float, reason: str) -> models.SimilarityEdge:
+        if a_id == b_id:
+            raise ValueError("Cannot link artifact to itself")
+        key = tuple(sorted((a_id, b_id)))
+        stmt = select(models.SimilarityEdge).where(
+            models.SimilarityEdge.from_artifact_id == key[0],
+            models.SimilarityEdge.to_artifact_id == key[1],
+        )
+        edge = self.session.scalar(stmt)
+        if edge:
+            edge.score = score
+            edge.reason = reason
+            edge.created_at = datetime.utcnow()
+        else:
+            edge = models.SimilarityEdge(
+                from_artifact_id=key[0],
+                to_artifact_id=key[1],
+                score=score,
+                reason=reason,
+            )
+            self.session.add(edge)
+            self.session.flush()
+        return edge
+
+    def neighbors(self, artifact_id: int, limit: int = 20) -> List[models.SimilarityEdge]:
+        stmt = (
+            select(models.SimilarityEdge)
+            .where(
+                (models.SimilarityEdge.from_artifact_id == artifact_id)
+                | (models.SimilarityEdge.to_artifact_id == artifact_id)
+            )
+            .order_by(models.SimilarityEdge.score.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class RunRepository(BaseRepository):
+    def start_run(self, memo: str | None = None) -> models.ScanRun:
+        run = models.ScanRun(started_at=datetime.utcnow(), memo=memo)
+        self.session.add(run)
+        self.session.flush()
+        return run
+
+    def finish_run(self, run_id: int, total: int, processed: int, errors: int) -> None:
+        run = self.session.get(models.ScanRun, run_id)
+        if run:
+            run.finished_at = datetime.utcnow()
+            run.total_files = total
+            run.processed_files = processed
+            run.errors = errors
+
+
+class LogRepository(BaseRepository):
+    def add(self, run_id: int, level: str, message: str, payload: Dict | None = None) -> None:
+        entry = models.ScanLog(
+            run_id=run_id,
+            level=level,
+            message=message,
+            payload=payload or {},
+        )
+        self.session.add(entry)
+
+    def latest(self, limit: int = 50) -> List[models.ScanLog]:
+        stmt = (
+            select(models.ScanLog)
+            .order_by(models.ScanLog.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class StatRepository(BaseRepository):
+    def store(self, metric: str, window_start: datetime, window_end: datetime, payload: Dict) -> None:
+        stat = models.ScanStat(
+            metric_name=metric,
+            window_start=window_start,
+            window_end=window_end,
+            payload=payload,
+        )
+        self.session.add(stat)
+
+    def recent(self, metric: str, limit: int = 10) -> List[models.ScanStat]:
+        stmt = (
+            select(models.ScanStat)
+            .where(models.ScanStat.metric_name == metric)
+            .order_by(models.ScanStat.window_end.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+def modality_stats(session: Session, window: timedelta) -> Dict[str, int]:
+    since = datetime.utcnow() - window
+    stmt = (
+        select(models.Artifact.modality, func.count(models.Artifact.id))
+        .where(models.Artifact.updated_at >= since)
+        .group_by(models.Artifact.modality)
+    )
+    return dict(session.execute(stmt).all())
+
+
+===== telemetry.py =====
+"""Telemetry utilities for multimodal scanner."""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List
+
+
+@dataclass
+class Sample:
+    timestamp: float
+    value: float
+
+
+@dataclass
+class Metric:
+    name: str
+    max_samples: int
+    samples: List[Sample] = field(default_factory=list)
+
+    def add(self, value: float) -> None:
+        self.samples.append(Sample(time.time(), value))
+        if len(self.samples) > self.max_samples:
+            self.samples = self.samples[-self.max_samples :]
+
+    def average(self) -> float:
+        if not self.samples:
+            return 0.0
+        return sum(sample.value for sample in self.samples) / len(self.samples)
+
+    def latest(self) -> float:
+        return self.samples[-1].value if self.samples else 0.0
+
+
+class Telemetry:
+    def __init__(self, max_samples: int = 500):
+        self.metrics: Dict[str, Metric] = {}
+        self.max_samples = max_samples
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._callback: Callable[[Dict[str, Dict[str, float]]], None] | None = None
+        self.interval = 30.0
+
+    def observe(self, name: str, value: float) -> None:
+        with self._lock:
+            metric = self.metrics.setdefault(name, Metric(name, self.max_samples))
+            metric.add(value)
+
+    def snapshot(self) -> Dict[str, Dict[str, float]]:
+        with self._lock:
+            return {
+                name: {
+                    "average": metric.average(),
+                    "latest": metric.latest(),
+                    "samples": len(metric.samples),
+                }
+                for name, metric in self.metrics.items()
+            }
+
+    def configure_export(self, interval: float, callback: Callable[[Dict[str, Dict[str, float]]], None]) -> None:
+        self.interval = interval
+        self._callback = callback
+
+    def start(self) -> None:
+        if self._thread or not self._callback:
+            return
+
+        def _loop():
+            while not self._stop.wait(self.interval):
+                self._callback(self.snapshot())
+            self._callback(self.snapshot())
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=2)
+            self._thread = None
+            self._stop.clear()
+
+
+===== utils.py =====
+"""Utility helpers for scanning and fingerprints."""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator, List
+
+
+def iter_files(root: Path, max_depth: int, follow_symlinks: bool, patterns: List[str]) -> Iterator[Path]:
+    patterns = [pattern.lower().strip() for pattern in patterns if pattern]
+    stack = [(root, 0)]
+    visited = set()
+
+    while stack:
+        current, depth = stack.pop()
+        if not current.exists():
+            continue
+        key = os.path.realpath(current)
+        if key in visited:
+            continue
+        visited.add(key)
+
+        for entry in current.iterdir():
+            if entry.is_dir():
+                if depth < max_depth:
+                    if not entry.is_symlink() or follow_symlinks:
+                        stack.append((entry, depth + 1))
+            else:
+                if any(entry.name.lower().endswith(pattern.replace("*", "")) for pattern in patterns):
+                    yield entry
+
+
+def entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    freq = {}
+    for byte in data:
+        freq[byte] = freq.get(byte, 0) + 1
+    total = len(data)
+    ent = 0.0
+    for count in freq.values():
+        p = count / total
+        ent -= p * math.log2(p)
+    return ent / 8.0
+
+
+def rolling_hash(file_path: Path, block_size: int, hash_alg: str) -> str:
+    h = hashlib.new(hash_alg)
+    with file_path.open("rb") as fh:
+        while chunk := fh.read(block_size):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def chunk_signatures(file_path: Path, block_size: int, hash_alg: str) -> List[tuple[int, str, int]]:
+    results = []
+    with file_path.open("rb") as fh:
+        offset = 0
+        while chunk := fh.read(block_size):
+            h = hashlib.new(hash_alg)
+            h.update(chunk)
+            results.append((offset, h.hexdigest(), len(chunk)))
+            offset += len(chunk)
+    return results
+
+
+def guess_modality(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".pdf", ".doc", ".docx"}:
+        return "text"
+    if suffix in {".mp3", ".wav", ".flac"}:
+        return "audio"
+    if suffix in {".png", ".jpg", ".jpeg", ".gif"}:
+        return "image"
+    if suffix in {".mp4", ".mov", ".avi"}:
+        return "video"
+    if suffix in {".zip", ".tar", ".gz"}:
+        return "archive"
+    return "unknown"
+
+
+===== api/routes.py =====
+"""Flask blueprint for the scanner module."""
+
+from __future__ import annotations
+
+from flask import Blueprint, jsonify, request
+
+from ..engine import ScannerEngine
+from . import schemas
+
+
+def create_blueprint(engine: ScannerEngine) -> Blueprint:
+    bp = Blueprint("scanner_api", __name__)
+
+    @bp.route("/health", methods=["GET"])
+    def health():
+        return jsonify(schemas.success({"status": "ok"}).to_dict())
+
+    @bp.route("/scan", methods=["POST"])
+    def trigger_scan():
+        memo = (request.get_json(silent=True) or {}).get("memo")
+        result = engine.scan(memo=memo)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 500)
+
+    @bp.route("/artifacts/latest", methods=["GET"])
+    def latest():
+        limit = int(request.args.get("limit", 20))
+        result = engine.latest_artifacts(limit=limit)
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/artifacts/<int:artifact_id>/classify", methods=["POST"])
+    def classify(artifact_id: int):
+        result = engine.classify(artifact_id)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 404)
+
+    @bp.route("/graph", methods=["POST"])
+    def build_graph():
+        payload = request.get_json(force=True, silent=True) or {}
+        artifact_ids = payload.get("artifact_ids", [])
+        result = engine.build_graph(artifact_ids)
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/stats", methods=["GET"])
+    def stats():
+        result = engine.stats_snapshot()
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/logs", methods=["GET"])
+    def logs():
+        result = engine.logs(limit=int(request.args.get("limit", 50)))
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/report", methods=["GET"])
+    def report():
+        result = engine.report()
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/search", methods=["GET"])
+    def search():
+        query = request.args.get("q", "")
+        result = engine.search(query)
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/watchdog", methods=["GET"])
+    def watchdog():
+        result = engine.watchdog()
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    return bp
+
+
+===== api/schemas.py =====
+"""Response envelope helpers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict
+
+
+def iso(dt: datetime | None = None) -> str:
+    dt = dt or datetime.utcnow()
+    return dt.replace(microsecond=0).isoformat() + "Z"
+
+
+@dataclass
+class Envelope:
+    ok: bool
+    payload: Dict[str, Any]
+    error: str | None = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"ok": self.ok, "payload": self.payload, "error": self.error, "timestamp": iso()}
+
+
+def success(payload: Dict[str, Any]) -> Envelope:
+    return Envelope(True, payload)
+
+
+def failure(message: str) -> Envelope:
+    return Envelope(False, {}, message)
+
+
+===== services/classifier.py =====
+"""Lightweight classifier for determining modality and quality."""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict
+
+from ..config import AppConfig
+
+LOGGER = logging.getLogger("scanner.classifier")
+
+
+class ModalityClassifier:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def classify(self, modality: str, entropy: float, attributes: Dict) -> Dict:
+        score = entropy if modality != "text" else min(entropy * 1.5, 1.0)
+        is_valid = score >= self._threshold(modality)
+        LOGGER.debug("Classified %s with score %.2f", modality, score)
+        return {"score": score, "valid": is_valid}
+
+    def _threshold(self, modality: str) -> float:
+        if modality == "text":
+            return self.config.classifier.text_threshold
+        if modality == "audio":
+            return self.config.classifier.audio_threshold
+        if modality == "image":
+            return self.config.classifier.image_threshold
+        return 0.4
+
+
+===== services/graph.py =====
+"""Similarity graph builder for artifact relations."""
+
+from __future__ import annotations
+
+import logging
+from itertools import combinations
+from typing import Dict, List
+
+from sqlalchemy.orm import Session
+
+from .. import models
+from ..config import AppConfig
+from ..repositories import ArtifactRepository, SimilarityRepository
+
+LOGGER = logging.getLogger("scanner.graph")
+
+
+class SimilarityGraph:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def build(self, session: Session, artifact_ids: List[int]) -> dict:
+        repo = ArtifactRepository(session)
+        similarity_repo = SimilarityRepository(session)
+        artifacts = [session.get(models.Artifact, aid) for aid in artifact_ids]
+        artifacts = [artifact for artifact in artifacts if artifact]
+        established = []
+        for a, b in combinations(artifacts, 2):
+            score = self._similarity(a, b)
+            if score >= self.config.graph_threshold:
+                edge = similarity_repo.upsert(a.id, b.id, score, reason="signature_overlap")
+                established.append({"edge_id": edge.id, "score": score, "from": a.id, "to": b.id})
+        LOGGER.info("Graph built with %s edges", len(established))
+        return {"edges": established}
+
+    def _similarity(self, a: models.Artifact, b: models.Artifact) -> float:
+        if not a.signatures or not b.signatures:
+            return 0.0
+        sigs_a = {block.signature for block in a.signatures}
+        sigs_b = {block.signature for block in b.signatures}
+        if not sigs_a or not sigs_b:
+            return 0.0
+        intersection = len(sigs_a & sigs_b)
+        union = len(sigs_a | sigs_b)
+        return intersection / union
+
+
+===== services/indexer.py =====
+"""Simple index builder that extracts keywords from artifact metadata."""
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from typing import Dict, List
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .. import models
+
+
+class KeywordIndex:
+    TOKEN_RE = re.compile(r"[a-zA-Z0-9а-яА-Я]{3,}")
+
+    def __init__(self):
+        self.index: Dict[str, List[int]] = defaultdict(list)
+
+    def build(self, session: Session, limit: int = 500) -> Dict[str, List[int]]:
+        self.index.clear()
+        rows = session.scalars(
+            select(models.Artifact).order_by(models.Artifact.updated_at.desc()).limit(limit)
+        ).all()
+        for artifact in rows:
+            tokens = self._tokens(artifact)
+            for token in tokens:
+                posting = self.index[token]
+                if artifact.id not in posting:
+                    posting.append(artifact.id)
+        return self.index
+
+    def search(self, query: str) -> List[int]:
+        token = query.lower()
+        return self.index.get(token, [])
+
+    def _tokens(self, artifact: models.Artifact) -> List[str]:
+        attrs = artifact.attributes or {}
+        text = f"{artifact.path} {attrs.get('extension', '')}"
+        return [match.group(0).lower() for match in self.TOKEN_RE.finditer(text)]
+
+
+===== services/reporting.py =====
+"""Report generation service."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Dict, List
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import LogRepository, StatRepository
+
+
+class ReportingService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def generate(self, session: Session, telemetry: Dict[str, Dict[str, float]]) -> Dict:
+        stat_repo = StatRepository(session)
+        stats = stat_repo.recent("modality", limit=1)
+        latest = stats[0].payload if stats else {}
+        body_lines = [
+            f"Отчёт сканера {datetime.utcnow():%Y-%m-%d %H:%M}",
+            "",
+            "Телеметрия:",
+        ]
+        for name, values in telemetry.items():
+            body_lines.append(f"- {name}: avg={values['average']:.2f} latest={values['latest']:.2f}")
+        body_lines.append("")
+        body_lines.append("Распределение по модальностям:")
+        if not latest:
+            body_lines.append("- данных нет")
+        else:
+            for modality, count in latest.items():
+                body_lines.append(f"- {modality}: {count}")
+        return {"title": body_lines[0], "body": "\n".join(body_lines)}
+
+
+===== services/scheduler.py =====
+"""Simple periodic scheduler."""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict
+
+
+@dataclass
+class Task:
+    name: str
+    interval: float
+    handler: Callable[[], None]
+    last_run: float = 0.0
+
+
+class Scheduler:
+    def __init__(self):
+        self._tasks: Dict[str, Task] = {}
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def add_task(self, name: str, interval: float, handler: Callable[[], None]) -> None:
+        self._tasks[name] = Task(name=name, interval=interval, handler=handler)
+
+    def start(self) -> None:
+        if self._thread:
+            return
+
+        def _loop():
+            while not self._stop.is_set():
+                now = time.time()
+                for task in self._tasks.values():
+                    if now - task.last_run >= task.interval:
+                        try:
+                            task.handler()
+                        finally:
+                            task.last_run = now
+                self._stop.wait(1.0)
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=2)
+            self._thread = None
+            self._stop.clear()
+
+
+===== services/statistics.py =====
+"""Statistics aggregation for scanner."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Dict
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import StatRepository, modality_stats
+
+
+class StatisticsService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def refresh(self, session: Session) -> Dict:
+        stats_repo = StatRepository(session)
+        window = self.config.stats_window
+        data = modality_stats(session, window)
+        now = datetime.utcnow()
+        stats_repo.store(
+            "modality",
+            window_start=now - window,
+            window_end=now,
+            payload=data,
+        )
+        return data
+
+
+===== services/walker.py =====
+"""Filesystem walker for multimodal scanner."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Iterable, List
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import ArtifactRepository, LogRepository, RunRepository, SignatureRepository, SourceRepository
+from .. import utils
+
+LOGGER = logging.getLogger("scanner.walker")
+
+
+class ScanWalker:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def run(self, session: Session, memo: str | None = None) -> dict:
+        run_repo = RunRepository(session)
+        source_repo = SourceRepository(session)
+        artifact_repo = ArtifactRepository(session)
+        signature_repo = SignatureRepository(session)
+        log_repo = LogRepository(session)
+
+        run = run_repo.start_run(memo)
+        total = processed = errors = 0
+        for root in self.config.source.root_paths:
+            root_path = Path(root).expanduser()
+            if not root_path.exists():
+                log_repo.add(run.id, "warning", "Root path missing", {"path": str(root_path)})
+                continue
+            source = source_repo.get_or_create(
+                path=str(root_path),
+                root=str(root_path),
+                recursive=True,
+                patterns=self.config.source.include_patterns,
+            )
+            for file_path in utils.iter_files(
+                root_path,
+                max_depth=self.config.source.max_depth,
+                follow_symlinks=self.config.source.follow_symlinks,
+                patterns=self.config.source.include_patterns,
+            ):
+                total += 1
+                try:
+                    modality = utils.guess_modality(file_path)
+                    signature = utils.rolling_hash(
+                        file_path, self.config.fingerprint.block_size, self.config.fingerprint.hash_alg
+                    )
+                    entropy = utils.entropy(file_path.read_bytes()[:4096])
+                    attributes = {
+                        "extension": file_path.suffix.lower(),
+                        "parent": str(file_path.parent),
+                    }
+                    artifact = artifact_repo.upsert(
+                        source_id=source.id,
+                        path=str(file_path),
+                        size_bytes=file_path.stat().st_size,
+                        modality=modality,
+                        signature=signature,
+                        hash_alg=self.config.fingerprint.hash_alg,
+                        entropy=entropy,
+                        attributes=attributes,
+                    )
+                    blocks = utils.chunk_signatures(
+                        file_path,
+                        block_size=self.config.fingerprint.block_size,
+                        hash_alg=self.config.fingerprint.hash_alg,
+                    )
+                    signature_repo.replace(artifact.id, blocks)
+                    processed += 1
+                except Exception as exc:
+                    errors += 1
+                    log_repo.add(
+                        run.id,
+                        "error",
+                        "Failed to process file",
+                        {"path": str(file_path), "error": str(exc)},
+                    )
+        run_repo.finish_run(run.id, total=total, processed=processed, errors=errors)
+        LOGGER.info("Scan finished: total=%s processed=%s errors=%s", total, processed, errors)
+        return {"run_id": run.id, "total": total, "processed": processed, "errors": errors}
+
+
+===== services/watchdog.py =====
+"""Watchdog service detecting anomalies in scan results."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List
+
+from sqlalchemy import select, func
+from sqlalchemy.orm import Session
+
+from .. import models
+from ..config import AppConfig
+
+
+@dataclass
+class WatchdogReport:
+    error_entries: int
+    high_entropy: List[Dict]
+    duplicates: List[Dict]
+
+
+class WatchdogService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def inspect(self, session: Session, limit: int = 10) -> WatchdogReport:
+        errors = session.scalars(
+            select(models.ScanLog)
+            .where(models.ScanLog.level == "error")
+            .order_by(models.ScanLog.created_at.desc())
+            .limit(limit)
+        ).all()
+
+        entropy_threshold = 0.9
+        high_entropy_rows = session.scalars(
+            select(models.Artifact)
+            .where(models.Artifact.entropy >= entropy_threshold)
+            .order_by(models.Artifact.entropy.desc())
+            .limit(limit)
+        ).all()
+        high_entropy = [
+            {"id": row.id, "path": row.path, "entropy": row.entropy} for row in high_entropy_rows
+        ]
+
+        duplicates_rows = session.execute(
+            select(models.Artifact.signature, func.count(models.Artifact.id))
+            .group_by(models.Artifact.signature)
+            .having(func.count(models.Artifact.id) > 1)
+            .limit(limit)
+        ).all()
+        duplicates = [{"signature": signature, "count": count} for signature, count in duplicates_rows]
+
+        return WatchdogReport(
+            error_entries=len(errors),
+            high_entropy=high_entropy,
+            duplicates=duplicates,
+        )
+

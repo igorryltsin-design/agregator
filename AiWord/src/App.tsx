@@ -829,11 +829,6 @@ export default function App() {
   // Сохранение темы
   useEffect(() => {
     localStorage.setItem('llm-writer-dark-mode', JSON.stringify(isDarkMode));
-    if (isDarkMode) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
   }, [isDarkMode]);
 
   // Сохранение кеша
@@ -2854,7 +2849,7 @@ export default function App() {
   ]), [missingCites]);
 
   return (
-    <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'dark bg-gray-900' : 'bg-gray-50'}`}>
+    <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'aiword-dark bg-gray-900' : 'bg-gray-50'}`}>
       {/* Шапка */}
       <header className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700 sticky top-0 z-50">
         <div className="w-full pl-0 pr-3 sm:pr-6 lg:pr-8" style={{ paddingLeft: 'env(safe-area-inset-left, 0px)' }}>

@@ -87,16 +87,22 @@ class LlmCache:
 _default_cache = LlmCache()
 
 
+def _scoped_key(key: str, scope: str | None = None) -> str:
+    if not scope:
+        return f"global::{key}"
+    return f"{scope}::{key}"
+
+
 def configure_llm_cache(*, enabled: bool, max_items: int, ttl_seconds: int) -> None:
     _default_cache.configure(enabled=enabled, max_items=max_items, ttl_seconds=ttl_seconds)
 
 
-def llm_cache_get(key: str) -> Optional[CachedLLMResponse]:
-    return _default_cache.get(key)
+def llm_cache_get(key: str, *, scope: str | None = None) -> Optional[CachedLLMResponse]:
+    return _default_cache.get(_scoped_key(key, scope))
 
 
-def llm_cache_set(key: str, response: CachedLLMResponse) -> None:
-    _default_cache.set(key, response)
+def llm_cache_set(key: str, response: CachedLLMResponse, *, scope: str | None = None) -> None:
+    _default_cache.set(_scoped_key(key, scope), response)
 
 
 def llm_cache_clear() -> None:

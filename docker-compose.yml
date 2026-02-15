@@ -15,6 +15,8 @@ services:
       - ./backups:/app/backups
       - ./models:/app/models
     restart: always
+    depends_on:
+      - postgres
     healthcheck:
       test: ["CMD", "healthcheck.sh"]
       interval: 30s
@@ -22,4 +24,18 @@ services:
       retries: 3
       start_period: 10s
 
-volumes: {}
+  postgres:
+    image: postgres:16-alpine
+    container_name: agregator-postgres
+    environment:
+      POSTGRES_DB: agregator
+      POSTGRES_USER: agregator
+      POSTGRES_PASSWORD: agregator
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data: {}

@@ -1,0 +1,559 @@
+openapi: 3.1.0
+info:
+  title: Agregator API
+  description: |
+    REST API for Agregator — a local web application for scientific materials
+    management, with RAG-based document chat, AI search, and OSINT capabilities.
+  version: 2.12.3
+  contact:
+    name: Agregator Team
+
+servers:
+  - url: http://localhost:5050
+    description: Local development
+
+tags:
+  - name: Auth
+    description: Authentication and session management
+  - name: Files
+    description: File CRUD operations and metadata
+  - name: Collections
+    description: Collection management
+  - name: Search
+    description: Classic full-text and AI-powered search
+  - name: Doc Chat
+    description: RAG-based document question-answering
+  - name: Facets
+    description: Faceted search aggregations
+  - name: Settings
+    description: Application settings management
+  - name: Admin
+    description: Administrative operations
+  - name: Health
+    description: Health and diagnostics
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------------------
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  example: admin
+                password:
+                  type: string
+                  example: admin123
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  user:
+                    $ref: "#/components/schemas/User"
+        "401":
+          description: Invalid credentials
+
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: End current session
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Get current user
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  user:
+                    $ref: "#/components/schemas/User"
+        "401":
+          description: Not authenticated
+
+  # ---------------------------------------------------------------------------
+  # Files
+  # ---------------------------------------------------------------------------
+  /api/files:
+    get:
+      tags: [Files]
+      summary: List files
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search query
+        - name: type
+          in: query
+          schema:
+            type: string
+          description: Material type filter
+        - name: collection_id
+          in: query
+          schema:
+            type: integer
+          description: Collection filter
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: Paginated file list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/File"
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  pages:
+                    type: integer
+
+  /api/files/{id}:
+    get:
+      tags: [Files]
+      summary: Get file by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: File details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/File"
+        "404":
+          description: File not found
+
+    put:
+      tags: [Files]
+      summary: Update file metadata
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                author:
+                  type: string
+                year:
+                  type: string
+                material_type:
+                  type: string
+                keywords:
+                  type: string
+      responses:
+        "200":
+          description: Updated file
+
+    delete:
+      tags: [Files]
+      summary: Delete file
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: File deleted
+
+  # ---------------------------------------------------------------------------
+  # Search
+  # ---------------------------------------------------------------------------
+  /api/search:
+    get:
+      tags: [Search]
+      summary: Full-text search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: collection_id
+          in: query
+          schema:
+            type: integer
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/File"
+                  total:
+                    type: integer
+                  query:
+                    type: string
+
+  /api/ai-search:
+    post:
+      tags: [Search]
+      summary: AI-powered search with LLM answer generation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                  description: Natural language search query
+                stream:
+                  type: boolean
+                  default: false
+                  description: Stream results via NDJSON
+                top_k:
+                  type: integer
+                  default: 3
+                deep_search:
+                  type: boolean
+                  default: true
+                use_rag:
+                  type: boolean
+                  default: false
+                full_text:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: AI search results (JSON or NDJSON stream)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  answer:
+                    type: string
+                  keywords:
+                    type: array
+                    items:
+                      type: string
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                  query_hash:
+                    type: string
+            application/x-ndjson:
+              schema:
+                type: string
+                description: Newline-delimited JSON events
+
+  # ---------------------------------------------------------------------------
+  # Doc Chat
+  # ---------------------------------------------------------------------------
+  /api/doc-chat/documents:
+    get:
+      tags: [Doc Chat]
+      summary: List available documents for chat
+      responses:
+        "200":
+          description: Available documents
+
+  /api/doc-chat/prepare:
+    post:
+      tags: [Doc Chat]
+      summary: Prepare documents for chat session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                file_ids:
+                  type: array
+                  items:
+                    type: integer
+      responses:
+        "200":
+          description: Session prepared
+
+  /api/doc-chat/ask:
+    post:
+      tags: [Doc Chat]
+      summary: Ask a question about prepared documents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question:
+                  type: string
+                session_id:
+                  type: string
+                mode:
+                  type: string
+                  enum: [default, quote, overview, formulas]
+      responses:
+        "200":
+          description: Answer from document context
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  answer:
+                    type: string
+
+  # ---------------------------------------------------------------------------
+  # Facets
+  # ---------------------------------------------------------------------------
+  /api/facets:
+    get:
+      tags: [Facets]
+      summary: Get faceted aggregations
+      parameters:
+        - name: context
+          in: query
+          schema:
+            type: string
+            enum: [search, graph]
+      responses:
+        "200":
+          description: Facet data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FacetData"
+
+  /api/material-types:
+    get:
+      tags: [Facets]
+      summary: List configured material types
+      responses:
+        "200":
+          description: Material types
+
+  # ---------------------------------------------------------------------------
+  # Settings
+  # ---------------------------------------------------------------------------
+  /api/settings:
+    get:
+      tags: [Settings]
+      summary: Get current settings
+      responses:
+        "200":
+          description: Settings object
+    post:
+      tags: [Settings]
+      summary: Update settings
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Settings updated
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        "200":
+          description: Application is healthy
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Application metrics
+      responses:
+        "200":
+          description: Metrics data
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, editor, viewer]
+        full_name:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        permissions:
+          type: object
+          properties:
+            can_admin:
+              type: boolean
+            can_edit:
+              type: boolean
+            can_view:
+              type: boolean
+
+    File:
+      type: object
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        author:
+          type: string
+        filename:
+          type: string
+        material_type:
+          type: string
+        year:
+          type: string
+          nullable: true
+        size:
+          type: integer
+        collection_id:
+          type: integer
+          nullable: true
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tag"
+
+    Tag:
+      type: object
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+
+    FacetData:
+      type: object
+      properties:
+        types:
+          type: array
+          items:
+            type: object
+            properties:
+              key:
+                type: string
+              label:
+                type: string
+              count:
+                type: integer
+        tags:
+          type: array
+          items:
+            type: object
+            properties:
+              key:
+                type: string
+              value:
+                type: string
+              count:
+                type: integer
+        authors:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              count:
+                type: integer
+        years:
+          type: array
+          items:
+            type: object
+            properties:
+              year:
+                type: string
+              count:
+                type: integer

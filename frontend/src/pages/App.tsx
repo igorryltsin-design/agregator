@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, Outlet, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { useToasts } from '../ui/Toasts'
 import { useAuth } from '../ui/Auth'
+import { OfflineIndicator } from '../ui/OfflineIndicator'
 import VoiceSearchButton from '../ui/VoiceSearchButton'
 import ProgressPanel, { ProgressBullet } from '../ui/ProgressPanel'
 import agregatorLogo from '../../logo/agregator.png'
@@ -74,6 +75,35 @@ export default function App() {
   const helpTitleId = 'agregator-help-title'
   const helpDescId = 'agregator-help-desc'
   const iconButtonClass = 'btn btn-outline-secondary icon-only'
+  const breadcrumbs = useMemo(() => {
+    const pathname = location.pathname.replace(/\/+$/, '') || '/'
+    const map: Record<string, string> = {
+      '/': 'Каталог',
+      '/doc-chat': 'Чат по документу',
+      '/osint': 'OSINT',
+      '/graph': 'Граф',
+      '/stats': 'Статистика',
+      '/settings': 'Настройки',
+      '/ingest': 'Импорт',
+      '/profile': 'Профиль',
+      '/users': 'Пользователи',
+      '/admin': 'Администрирование',
+      '/admin/status': 'Состояние',
+      '/admin/tasks': 'Задачи',
+      '/admin/logs': 'Логи',
+      '/admin/ai-metrics': 'AI метрики',
+      '/admin/collections': 'Коллекции',
+    }
+    const parts = pathname.split('/').filter(Boolean)
+    const crumbs: Array<{ to: string; label: string }> = [{ to: '/', label: 'Каталог' }]
+    if (parts.length === 0) return crumbs
+    let acc = ''
+    for (const part of parts) {
+      acc += `/${part}`
+      crumbs.push({ to: acc, label: map[acc] || part })
+    }
+    return crumbs
+  }, [location.pathname])
 
   useEffect(() => {
     if (!loading && !user) {
@@ -306,16 +336,24 @@ export default function App() {
     nav('/login', { replace: true })
   }
 
-  const adminMenuItems = useMemo(() => ([
-    { to: 'admin/status', label: 'Состояние' },
-    { to: 'settings', label: 'Настройки' },
-    { to: 'users', label: 'Пользователи' },
-    { to: 'admin/tasks', label: 'Задачи' },
-    { to: 'admin/logs', label: 'Логи' },
-    { to: 'admin/llm', label: 'LLM' },
-    { to: 'admin/ai-metrics', label: 'AI метрики' },
-    { to: 'admin/facets', label: 'Фасеты' },
-    { to: 'admin/collections', label: 'Коллекции' },
+  const adminMenuGroups = useMemo(() => ([
+    {
+      title: 'Мониторинг',
+      items: [
+        { to: 'admin/status', label: 'Состояние' },
+        { to: 'admin/tasks', label: 'Задачи' },
+        { to: 'admin/logs', label: 'Логи' },
+        { to: 'admin/ai-metrics', label: 'AI метрики' },
+      ],
+    },
+    {
+      title: 'Управление',
+      items: [
+        { to: 'users', label: 'Пользователи' },
+        { to: 'admin/collections', label: 'Коллекции' },
+        { to: 'settings', label: 'Настройки' },
+      ],
+    },
   ]), [])
 
   if (loading) {
@@ -331,16 +369,16 @@ export default function App() {
   }
 
   return (
-    <div>
-      <nav className="navbar navbar-expand px-3 py-2 mb-3">
-        <div className="d-flex align-items-center gap-2 w-100">
+    <div className="app-shell">
+      <nav className="navbar navbar-expand px-3 py-2 mb-3 app-topbar">
+        <div className="d-flex align-items-center gap-2 w-100 app-topbar__row">
           <Link className="navbar-brand m-0" to="/" style={{ color: 'var(--text)' }}>
             <span className="app-brand-badge">
               <img src={agregatorLogo} alt="Agregator" />
             </span>
           </Link>
-          <div className="d-flex align-items-center gap-2" style={{ width: 600, maxWidth: '60%', flex: '0 1 auto' }}>
-            <div className="position-relative flex-grow-1">
+          <div className="d-flex align-items-center gap-2 app-search-wrap" style={{ width: 600, maxWidth: '60%', flex: '0 1 auto' }}>
+            <div className="position-relative flex-grow-1 app-search-input-wrap">
               <input
                 className="form-control pe-5"
                 placeholder="Поиск…"
@@ -362,7 +400,7 @@ export default function App() {
             </button>
           </div>
           <VoiceSearchButton onTranscribed={handleVoiceSearch} onError={handleVoiceError} />
-          <div className="ms-auto d-flex align-items-center gap-2 flex-wrap justify-content-end" style={{ rowGap: '0.3rem' }}>
+          <div className="ms-auto d-flex align-items-center gap-2 flex-wrap justify-content-end app-topbar__actions" style={{ rowGap: '0.3rem' }}>
             <Link
               className={`${iconButtonClass} doc-chat-nav-icon`}
               to="doc-chat"
@@ -395,6 +433,11 @@ export default function App() {
             <Link className={iconButtonClass} to="stats" aria-label="Статистика" data-tooltip="Статистика">
               <span className="icon-glyph" aria-hidden="true">📊</span>
             </Link>
+            {isAdmin && (
+              <Link className={iconButtonClass} to="osint" aria-label="OSINT-поиск" data-tooltip="OSINT-поиск">
+                <span className="icon-glyph" aria-hidden="true">🕵️</span>
+              </Link>
+            )}
             {canImport && (
               <Link className={iconButtonClass} to="ingest" aria-label="Импорт" data-tooltip="Импорт">
                 <span className="icon-glyph" aria-hidden="true">📥</span>
@@ -402,25 +445,44 @@ export default function App() {
             )}
             {isAdmin && (
               <div className="position-relative" ref={adminMenuRef}>
-                <button className="btn btn-outline-secondary" type="button" onClick={() => setAdminMenuOpen(v => !v)} aria-expanded={adminMenuOpen}>
-                  Администрирование ▾
+                <button
+                  className={iconButtonClass}
+                  type="button"
+                  onClick={() => setAdminMenuOpen(v => !v)}
+                  aria-expanded={adminMenuOpen}
+                  aria-label="Админ-раздел"
+                  data-tooltip="Админ-раздел"
+                >
+                  <span className="icon-glyph" aria-hidden="true">🛠️</span>
                 </button>
                 {adminMenuOpen && (
-                  <div className="border rounded-3" style={{ position: 'absolute', top: 'calc(100% + 4px)', right: 0, minWidth: 200, background: 'var(--surface)', boxShadow: 'var(--card-shadow)', zIndex: 1500 }}>
-                    {adminMenuItems.map(item => (
-                      <Link
-                        key={item.to}
-                        className="d-block px-3 py-2 text-decoration-none"
-                        style={{ color: 'var(--text)' }}
-                        to={item.to}
-                        onClick={() => setAdminMenuOpen(false)}
-                      >
-                        {item.label}
-                      </Link>
+                  <div className="border rounded-3 app-admin-menu" style={{ position: 'absolute', top: 'calc(100% + 4px)', right: 0, minWidth: 260, background: 'var(--surface)', boxShadow: 'var(--card-shadow)', zIndex: 1500 }}>
+                    {adminMenuGroups.map(group => (
+                      <div key={group.title} className="py-1">
+                        <div className="px-3 pt-2 pb-1 text-uppercase fw-semibold" style={{ fontSize: 11, letterSpacing: 0.5, color: 'var(--muted)' }}>
+                          {group.title}
+                        </div>
+                        {group.items.map(item => (
+                          <Link
+                            key={item.to}
+                            className="d-block px-3 py-2 text-decoration-none"
+                            style={{ color: 'var(--text)' }}
+                            to={item.to}
+                            onClick={() => setAdminMenuOpen(false)}
+                          >
+                            {item.label}
+                          </Link>
+                        ))}
+                      </div>
                     ))}
                   </div>
                 )}
               </div>
+            )}
+            {isAdmin && (
+              <Link className={iconButtonClass} to="settings" aria-label="Настройки" data-tooltip="Настройки">
+                <span className="icon-glyph" aria-hidden="true">⚙️</span>
+              </Link>
             )}
             <Link className={iconButtonClass} to="profile" aria-label="Профиль" data-tooltip="Профиль">
               <span className="icon-glyph" aria-hidden="true">👤</span>
@@ -555,7 +617,27 @@ export default function App() {
           </div>
         </div>
       )}
-      <div className="container-fluid">
+      {breadcrumbs.length > 1 && (
+        <div className="container-fluid mb-2 app-breadcrumbs-wrap">
+          <nav aria-label="Хлебные крошки">
+            <ol className="breadcrumb mb-0 app-breadcrumbs">
+              {breadcrumbs.map((crumb, idx) => {
+                const isLast = idx === breadcrumbs.length - 1
+                return (
+                  <li key={crumb.to} className={`breadcrumb-item ${isLast ? 'active' : ''}`} aria-current={isLast ? 'page' : undefined}>
+                    {isLast ? (
+                      <span>{crumb.label}</span>
+                    ) : (
+                      <Link to={crumb.to}>{crumb.label}</Link>
+                    )}
+                  </li>
+                )
+              })}
+            </ol>
+          </nav>
+        </div>
+      )}
+      <div className="container-fluid app-content-shell">
         <Outlet />
       </div>
 
@@ -600,6 +682,7 @@ export default function App() {
         </div>
       )}
 
+      <OfflineIndicator />
     </div>
   )
 }

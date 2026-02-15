@@ -1,0 +1,1536 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agregator Export</title>
+    <style>
+      :root { color-scheme: light; }
+      body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f6efe6; color: #1b1411; }
+      header { padding: 12px 20px; border-bottom: 1px solid rgba(191, 168, 145, 0.5); background: #fff6ea; position: sticky; top: 0; z-index: 10; }
+      h1 { margin: 0 0 8px; font-size: 22px; }
+      .brand { display: flex; align-items: center; gap: 10px; margin: 0; }
+      .header-row { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; }
+      .header-actions { display: flex; gap: 6px; align-items: center; justify-content: flex-start; flex-wrap: nowrap; }
+      .header-help { font-size: 12px; color: #6b5a4b; white-space: nowrap; }
+      .brand-text { display: flex; flex-direction: column; gap: 2px; }
+      .brand-sub { font-size: 11px; color: #6b5a4b; font-weight: 500; }
+      .logo { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; }
+      .logo svg { width: 34px; height: 34px; display: block; }
+      .meta { color: #6b5a4b; font-size: 13px; }
+      .layout { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 20px; padding: 18px 28px 32px; align-items: start; }
+      .panel { background: #fff; border: 1px solid rgba(191, 168, 145, 0.5); border-radius: 16px; padding: 14px; }
+      .sidebar { position: sticky; top: 16px; align-self: start; display: flex; flex-direction: column; gap: 12px; max-height: calc(100vh - 32px); overflow: auto; }
+      .filters { display: flex; flex-direction: column; }
+      .filters input { width: 100%; margin-bottom: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(191, 168, 145, 0.5); box-sizing: border-box; }
+      .filters .toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #6b5a4b; margin: 0 0 10px; padding-left: 2px; line-height: 1.2; }
+      .filters .toggle input { margin: 0; width: 18px; height: 18px; }
+      .segmented { display: inline-flex; border: 1px solid rgba(191, 168, 145, 0.5); border-radius: 999px; overflow: hidden; background: #fff8f0; }
+      .segmented button { border: none; padding: 6px 12px; font-size: 12px; background: transparent; cursor: pointer; }
+      .segmented button.active { background: #2f8a5c; color: #fff; }
+      .desc-controls { display: flex; gap: 6px; margin-top: 10px; }
+      .desc-controls button { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+      .desc-controls button.active { border-color: #2f8a5c; background: #e7f3ed; color: #2f8a5c; }
+      .controls { display: flex; align-items: center; gap: 10px; margin: 10px 0 6px; flex-wrap: wrap; }
+      .controls select { padding: 6px 8px; border-radius: 8px; border: 1px solid rgba(191, 168, 145, 0.5); background: #fff; }
+      .pager { display: flex; align-items: center; gap: 8px; }
+      .pager button { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+      .pager button:disabled { opacity: 0.5; cursor: default; }
+      .facet { display: grid; gap: 8px; max-height: 40vh; overflow: auto; }
+      .facet button { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 8px 10px; text-align: left; cursor: pointer; }
+      .facet button.active { border-color: #2f8a5c; box-shadow: inset 0 0 0 1px rgba(47, 138, 92, 0.35); }
+      .chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
+      .chip { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+      .chip.active { border-color: #2f8a5c; background: #e7f3ed; color: #2f8a5c; }
+      .toolbar { display: flex; gap: 6px; flex-wrap: nowrap; align-items: center; margin: 0; overflow: hidden; }
+      .toolbar button { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+      .toolbar button[aria-pressed="true"], .toolbar button[data-active="true"] { font-weight: 700; }
+      .toolbar button[aria-pressed="true"]::before, .toolbar button[data-active="true"]::before { content: "● "; font-weight: 900; }
+      .toolbar button.active, .toolbar button[data-active="true"] { border-color: #1f8a5c !important; background: #1f8a5c !important; color: #ffffff !important; box-shadow: 0 0 0 2px rgba(31,138,92,0.45) !important; }
+      .toolbar button[data-active="true"] * { color: #ffffff !important; }
+      .toolbar button[data-active="true"]::after { content: ""; display: inline-block; width: 8px; height: 8px; margin-left: 6px; border-radius: 50%; background: #ffffff; box-shadow: 0 0 0 2px rgba(255,255,255,0.25); }
+      .pill { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+      .theme-dark { background: #0f0e0d; color: #f5efe7; }
+      .theme-dark header { background: #141210; border-bottom-color: rgba(191,168,145,0.2); }
+      .theme-dark .panel { background: #151311; border-color: rgba(191,168,145,0.2); }
+      .theme-dark .meta { color: #b7a99d; }
+      .theme-dark .card { background: #141210; border-color: rgba(191,168,145,0.2); }
+      .theme-dark .tag { background: #1d2a22; color: #bfe6d3; }
+      .theme-dark .toolbar button, .theme-dark .pill, .theme-dark .chip, .theme-dark .facet button, .theme-dark .actions button { background: #141210; border-color: #3a2f27; color: #e7dbcf; }
+      .theme-dark .toolbar button.active, .theme-dark .toolbar button[data-active="true"] { background: #32d188 !important; border-color: #7dffb0 !important; color: #0b120b !important; box-shadow: 0 0 0 2px rgba(125,255,176,0.55) !important; }
+      .theme-dark .toolbar button[data-active="true"]::after { background: #0b120b; }
+      .theme-dark .toolbar button#toggleTheme { background: #1c1713; }
+      .theme-dark .toolbar button#toggleTheme.active { background: #f5d26b; color: #1a1408; border-color: #f5d26b; }
+      .theme-dark .pill { background: #141210; border-color: #3a2f27; color: #e7dbcf; }
+      .theme-dark .conflict-item { background: #141210; border-color: #3a2f27; color: #e7dbcf; }
+      .theme-dark .conflict-item.active { background: #2f8a5c; border-color: #6bd19b; color: #0f140f; }
+      .theme-dark .link { color: #8cc6ff; }
+      .theme-dark input, .theme-dark select, .theme-dark textarea { background: #1a1714; color: #f5efe7; border-color: rgba(191,168,145,0.25); }
+      .theme-dark mark { background: #9a7b2a; color: #fff2cf; }
+      .list { display: grid; gap: 12px; }
+      .list.two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .compact .card { padding: 10px; }
+      .compact .card p { display: none; }
+      .card { background: #fff; border: 1px solid rgba(191, 168, 145, 0.5); border-radius: 16px; padding: 14px; }
+      .card.active { border-color: #2f8a5c !important; outline: 2px solid rgba(47, 138, 92, 0.6); outline-offset: 2px; box-shadow: 0 0 0 3px rgba(47, 138, 92, 0.35), inset 0 0 0 1px rgba(47, 138, 92, 0.2); }
+      .card h3 { margin: 0 0 6px; font-size: 16px; line-height: 1.3; word-break: break-word; }
+      .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef4f0; color: #2f8a5c; font-size: 12px; }
+      .link { color: #2f6c9e; text-decoration: none; }
+      .link:hover { text-decoration: underline; }
+      .grid { display: grid; gap: 6px; font-size: 13px; color: #6b5a4b; }
+      .detail { }
+      .empty { color: #6b5a4b; font-size: 13px; }
+      .actions { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 4px; }
+      .actions button { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+      .quick-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+      .quick-actions button { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 4px 8px; cursor: pointer; font-size: 11px; }
+      .card.suspicious { border-color: rgba(189, 63, 63, 0.6); box-shadow: inset 0 0 0 1px rgba(189, 63, 63, 0.15); }
+      .card.favorite { border-color: rgba(208, 122, 54, 0.6); box-shadow: inset 0 0 0 1px rgba(208, 122, 54, 0.15); }
+      .card.compare { border-color: rgba(47, 138, 92, 0.6); box-shadow: inset 0 0 0 1px rgba(47, 138, 92, 0.15); }
+      .card.first-match { box-shadow: 0 0 0 3px rgba(208, 122, 54, 0.25); }
+      .favorites-list, .compare-list { display: grid; gap: 6px; }
+      .favorites-item, .compare-item { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+      .favorites-item strong, .compare-item strong { display: block; }
+      .note-input { width: 100%; min-height: 80px; border: 1px solid rgba(191, 168, 145, 0.5); border-radius: 10px; padding: 8px 10px; font-size: 12px; background: #fff8f0; color: #2b2420; }
+      .theme-dark .favorites-item, .theme-dark .compare-item, .theme-dark .note-input { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #f5efe7; }
+      .theme-dark .quick-actions button { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #f5efe7; }
+      .theme-dark .card.active { border-color: #7dffb0 !important; outline: 2px solid rgba(125, 255, 176, 0.5); outline-offset: 2px; box-shadow: 0 0 0 3px rgba(125, 255, 176, 0.35), inset 0 0 0 1px rgba(125, 255, 176, 0.25); }
+      .similar-list { display: grid; gap: 6px; }
+      .similar-item { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+      .similar-item strong { display: block; }
+      .compare-table { overflow-x: auto; margin-top: 8px; }
+      .compare-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      .compare-table th, .compare-table td { border: 1px solid rgba(191, 168, 145, 0.5); padding: 6px 8px; text-align: left; vertical-align: top; }
+      .compare-table th { background: #f6eee4; }
+      .theme-dark .similar-item { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #f5efe7; }
+      .theme-dark .compare-table th, .theme-dark .compare-table td { border-color: rgba(191,168,145,0.35); }
+      .theme-dark .compare-table th { background: #221a15; }
+      .header-btn { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 4px 9px; font-size: 12px; cursor: pointer; position: relative; }
+      .header-btn .count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; border-radius: 999px; background: #2f8a5c; color: #fff; font-size: 11px; margin-left: 6px; padding: 0 5px; }
+      .dropdown { position: absolute; top: 38px; right: 0; background: #fff; border: 1px solid rgba(191, 168, 145, 0.5); border-radius: 12px; padding: 8px; min-width: 260px; box-shadow: 0 12px 24px rgba(0,0,0,0.15); z-index: 20; display: none; }
+      .dropdown.open { display: block; }
+      .dropdown .item { padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: 12px; }
+      .dropdown .item:hover { background: #f4eadf; }
+      .theme-dark .header-btn { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #f5efe7; }
+      .theme-dark .dropdown { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #f5efe7; }
+      .theme-dark .dropdown .item:hover { background: #2a211b; }
+      .modal { position: fixed; inset: 0; background: rgba(12, 9, 7, 0.45); display: none; align-items: center; justify-content: center; z-index: 50; }
+      .modal.open { display: flex; }
+      .modal-content { background: #fff; border-radius: 16px; border: 1px solid rgba(191, 168, 145, 0.5); padding: 16px; max-width: 90vw; max-height: 85vh; overflow: auto; }
+      .modal-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; }
+      .modal-title { font-size: 14px; font-weight: 600; }
+      .theme-dark .modal-content { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #f5efe7; }
+      .toggle-btn { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 12px; padding: 4px 9px; font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; color: #3b2f25; transition: all 0.15s ease; }
+      .toggle-btn[data-active="true"] { background: #2f8a5c; border-color: #2f8a5c; color: #fff; box-shadow: 0 0 0 2px rgba(47, 138, 92, 0.25); }
+      .toggle-icon-btn { padding: 6px; min-width: 36px; justify-content: center; }
+      .toggle-icon { font-size: 16px; }
+      .stats { display: grid; gap: 8px; }
+      .stat-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+      .stat-bar { height: 8px; border-radius: 999px; background: #f1e6d9; overflow: hidden; }
+      .stat-bar > span { display: block; height: 100%; background: linear-gradient(90deg, #2f8a5c, #9ad4b2); }
+      mark { background: #ffe08a; padding: 0 2px; border-radius: 3px; }
+      .hint { font-size: 12px; color: #6b5a4b; }
+      .word-cloud { display: flex; flex-wrap: wrap; gap: 6px; }
+      .word-cloud button { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+      .theme-dark .word-cloud button { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #f5efe7; }
+      .theme-dark .toggle-btn { background: #1c1713; border-color: rgba(191,168,145,0.35); color: #e7dbcf; }
+      .theme-dark .toggle-btn[data-active="true"] { background: #32d188; border-color: #7dffb0; color: #0b120b; box-shadow: 0 0 0 2px rgba(50, 209, 136, 0.25); }
+      .theme-dark .word-cloud button[style*="border-color:#2f8a5c"] { background: #2f8a5c; border-color: #6bd19b; color: #0f140f; }
+      .conflicts { display: grid; gap: 6px; }
+      .conflict-item { border: 1px solid rgba(191, 168, 145, 0.5); background: #fff8f0; border-radius: 10px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+      @media (max-width: 920px) { .layout { grid-template-columns: 1fr; } .detail { position: static; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="header-row">
+        <h1 class="brand">
+          <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 48 48" role="img" focusable="false">
+            <defs>
+              <linearGradient id="biblioLogo" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#2f8a5c"/>
+                <stop offset="100%" stop-color="#9ad4b2"/>
+              </linearGradient>
+            </defs>
+            <circle cx="24" cy="24" r="22" fill="url(#biblioLogo)" />
+            <path d="M18 14h9.5a6.5 6.5 0 0 1 0 13H18z" fill="#ffffff" opacity="0.95"/>
+            <path d="M18 27h10a5.5 5.5 0 0 1 0 11H18z" fill="#ffffff" opacity="0.85"/>
+            <rect x="14" y="12" width="4" height="24" rx="2" fill="#ffffff" opacity="0.9"/>
+          </svg>
+        </span>
+          <span class="brand-text">
+            <span>Agregator</span>
+            <span class="brand-sub">exported library</span>
+          </span>
+        </h1>
+      <div class="header-actions" id="viewToolbar">
+          <span class="pill" id="miniStats">Всего: 0 · Найдено: 0 · Страница 0/0</span>
+          <button id="toggleShowDesc" class="toggle-btn" data-label="Описания">Описания</button>
+          <button id="toggleLazyDesc" class="toggle-btn" data-label="Описания только у выбранной">Описания только у выбранной</button>
+          <button id="toggleCompact" class="toggle-btn" data-label="Компактный вид">Компактный вид</button>
+          <button id="toggleColumns" class="toggle-btn" data-label="Две колонки">Две колонки</button>
+          <button id="scrollTop" class="toggle-btn">Наверх</button>
+          <button id="scrollBottom" class="toggle-btn">Вниз</button>
+          <button id="resetFilters" class="toggle-btn">Сбросить всё</button>
+          <button id="toggleTheme" class="toggle-btn toggle-icon-btn" title="Темная тема">
+            <span class="toggle-icon">🌙</span>
+          </button>
+          <button id="toggleCompareModal" class="header-btn">Сравнение <span class="count" id="compareCount">0</span></button>
+          <button id="toggleSimilarList" class="header-btn">Похожие <span class="count" id="similarCount">0</span>
+            <div class="dropdown" id="similarDropdown"></div>
+          </button>
+      </div>
+        <div class="header-help">Горячие клавиши: / поиск · J/K навигация</div>
+      </div>
+    </header>
+    <main class="layout">
+      <aside class="sidebar">
+        <section class="panel filters">
+          <input id="q" placeholder="Поиск по названию/автору/ключевым" />
+          <input id="year" placeholder="Год" />
+          <input id="author" placeholder="Автор" />
+          <input id="qId" placeholder="ID документа" />
+          <input id="qPath" placeholder="Путь содержит..." />
+          <label class="toggle">
+            <input id="hasPath" type="checkbox" />
+            Только с файлом
+          </label>
+          <label class="toggle">
+            <input id="hasDesc" type="checkbox" />
+            Только с описанием
+          </label>
+          <label class="toggle">
+            <input id="suspiciousOnly" type="checkbox" />
+            Подозрительная классификация
+          </label>
+          <label class="toggle">
+            <input id="favoritesOnly" type="checkbox" />
+            Только избранные
+          </label>
+          <label class="toggle">
+            <input id="exactMatch" type="checkbox" />
+            Точное совпадение
+          </label>
+          <label class="toggle">
+            <input id="wordMode" type="checkbox" />
+            Поиск по словам
+          </label>
+          <label class="toggle">
+            <input id="ignoreStopwords" type="checkbox" />
+            Игнорировать стоп-слова
+          </label>
+          <div class="controls">
+            <span class="meta">Описание:</span>
+            <div class="segmented" id="descMode">
+              <button data-mode="short" class="active">Кратко</button>
+              <button data-mode="full">Полно</button>
+            </div>
+          </div>
+          <div class="controls">
+            <span class="meta">Облако ключевых:</span>
+            <div class="word-cloud" id="wordCloud"></div>
+          </div>
+          <div class="facet" id="facet"></div>
+        </section>
+        <section class="panel">
+          <div class="meta">Статистика по типам</div>
+          <div class="stats" id="typeStats"></div>
+        </section>
+        <section class="panel">
+          <div class="meta">Статистика по годам</div>
+          <div class="stats" id="yearStats"></div>
+        </section>
+        <section class="panel">
+          <div class="meta">Конфликты типов</div>
+          <div class="conflicts" id="typeConflicts"></div>
+        </section>
+        <section class="panel detail" id="detail">
+          <div class="empty">Выберите запись</div>
+        </section>
+        <section class="panel" id="favoritesPanel">
+          <div class="meta">Избранное</div>
+          <div class="favorites-list" id="favoritesList"></div>
+          <div class="actions">
+            <button id="exportFavoritesCsv">Экспорт избранных (CSV)</button>
+            <button id="exportFavoritesJson">Экспорт избранных (JSON)</button>
+          </div>
+        </section>
+        <section class="panel">
+          <button id="exportSuspicious">Экспортировать подозрительные (CSV)</button>
+          <button id="exportSuspiciousJson">Экспортировать подозрительные (JSON)</button>
+          <div class="hint">Отдаст CSV по записям, где вероятна ошибка типа.</div>
+        </section>
+        <section class="panel">
+          <button id="resetLocal">Сбросить локальные данные</button>
+          <div class="hint">Очистит фильтры, заметки, избранное и локальные правки.</div>
+        </section>
+      </aside>
+      <section class="panel">
+        <div class="meta" id="count"></div>
+        <div class="controls" id="pagerTop"></div>
+        <div class="list" id="list"></div>
+        <div class="meta" id="countBottom"></div>
+        <div class="controls" id="pagerBottom"></div>
+      </section>
+    </main>
+    <div class="modal" id="compareModal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div class="modal-title">Сравнение документов</div>
+          <button id="closeCompareModal" class="header-btn">Закрыть</button>
+        </div>
+        <div id="compareModalBody"></div>
+      </div>
+    </div>
+    <script>
+      window.__AGREGATOR_EXPORT__ = __EXPORT_DATA_JS__;
+      window.__AGREGATOR_EXPORT_META__ = __EXPORT_META_JS__;
+    </script>
+    <script src="items.js"></script>
+    <script>
+      const data = Array.isArray(window.__AGREGATOR_EXPORT__) ? window.__AGREGATOR_EXPORT__ : [];
+      if (!data.length) {
+        const hint = document.createElement("div");
+        hint.style.cssText = "margin:12px 0;padding:10px;border:1px dashed #c9b7a1;border-radius:10px;background:#fffaf2;color:#7a6655;font-size:12px;";
+        hint.textContent = "Данные экспорта не загрузились. Попробуйте открыть index.html через локальный сервер (например, `python -m http.server`).";
+        const countEl = document.getElementById("count");
+        if (countEl && countEl.parentElement) {
+          countEl.parentElement.insertBefore(hint, countEl);
+        }
+      }
+      const exportMeta = window.__AGREGATOR_EXPORT_META__ || {};
+      const state = {
+        q: "",
+        year: "",
+        author: "",
+        qId: "",
+        qPath: "",
+        type: "",
+        keyword: "",
+        showDesc: true,
+        lazyDesc: false,
+        hasPath: false,
+        hasDesc: false,
+        suspiciousOnly: false,
+        favoritesOnly: false,
+        exactMatch: false,
+        wordMode: false,
+        ignoreStopwords: false,
+        compact: false,
+        twoCol: false,
+        dark: false,
+        page: 1,
+        pageSize: 50,
+        descMode: "short",
+        descOverrides: {},
+        selectedId: null,
+        pageIds: [],
+        scrollY: 0,
+        compareIds: [],
+      };
+      const facetEl = document.getElementById("facet");
+      const listEl = document.getElementById("list");
+      const countEl = document.getElementById("count");
+      const detailEl = document.getElementById("detail");
+      const typeStatsEl = document.getElementById("typeStats");
+      const yearStatsEl = document.getElementById("yearStats");
+      const wordCloudEl = document.getElementById("wordCloud");
+      const typeConflictsEl = document.getElementById("typeConflicts");
+      const favoritesListEl = document.getElementById("favoritesList");
+      const compareListEl = document.getElementById("compareList");
+      const similarListEl = document.getElementById("similarList");
+      const similarCountEl = document.getElementById("similarCount");
+      const similarDropdownEl = document.getElementById("similarDropdown");
+      const compareModalEl = document.getElementById("compareModal");
+      const compareModalBodyEl = document.getElementById("compareModalBody");
+      const compareCountEl = document.getElementById("compareCount");
+      const compareTableEl = document.getElementById("compareTable") || compareModalBodyEl;
+      const normalize = (v) => String(v || "").toLowerCase();
+      const escapeHtml = (value) =>
+        String(value || "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+
+      const index = data.map((item) =>
+        normalize([item.title, item.author, item.keywords?.join(", "), item.path, item.summary, item.description].join(" "))
+      );
+
+      const stopwords = new Set([
+        "и","в","во","на","по","о","об","от","до","для","из","к","ко","с","со","что","это","как","при","без","или","ли","а","но","же","за","над","под","про","его","ее","их","мы","вы","они","он","она","оно"
+      ]);
+
+      const typeOverrides = (() => {
+        try {
+          const raw = localStorage.getItem("agregator.typeOverrides");
+          if (!raw) return {};
+          const parsed = JSON.parse(raw);
+          return parsed && typeof parsed === "object" ? parsed : {};
+        } catch (error) {
+          return {};
+        }
+      })();
+
+      const saveTypeOverrides = () => {
+        try {
+          localStorage.setItem("agregator.typeOverrides", JSON.stringify(typeOverrides));
+        } catch (error) {
+          // ignore
+        }
+      };
+
+      const getType = (item) => typeOverrides[item.id] || item.type || "";
+
+      const keywordCounts = data.reduce((acc, item) => {
+        (item.keywords || []).forEach((kw) => {
+          const key = normalize(kw);
+          if (!key) return;
+          acc[key] = (acc[key] || 0) + 1;
+        });
+        return acc;
+      }, {});
+
+      const facetCounts = data.reduce((acc, item) => {
+        const key = getType(item) || "Без типа";
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+
+      const yearCounts = data.reduce((acc, item) => {
+        const key = String(item.year || "").trim() || "—";
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+
+      const computeTypeCounts = () =>
+        data.reduce((acc, item) => {
+          const key = getType(item) || "Без типа";
+          acc[key] = (acc[key] || 0) + 1;
+          return acc;
+        }, {});
+
+      const standardPattern = /(гост|gost|iso|iec|din|en|astm|bs|сто|ту)\\s*[a-zа-я]*\\s*\\d{2,}[-–.]?\\d*/i;
+      const eskdPattern = /(ескд|единая система конструкторской документации)/i;
+
+      const loadManualSuspicious = () => {
+        try {
+          const raw = localStorage.getItem("agregator.manualSuspicious");
+          if (!raw) return new Set();
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            return new Set(parsed.map((id) => Number(id)).filter((id) => Number.isFinite(id)));
+          }
+        } catch (error) {
+          // ignore
+        }
+        return new Set();
+      };
+
+      const saveManualSuspicious = (set) => {
+        try {
+          localStorage.setItem(
+            "agregator.manualSuspicious",
+            JSON.stringify(Array.from(set.values()))
+          );
+        } catch (error) {
+          // ignore
+        }
+      };
+
+      const manualSuspicious = loadManualSuspicious();
+
+      const loadFavorites = () => {
+        try {
+          const raw = localStorage.getItem("agregator.favorites");
+          if (!raw) return new Set();
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            return new Set(parsed.map((id) => Number(id)).filter((id) => Number.isFinite(id)));
+          }
+        } catch (error) {
+          // ignore
+        }
+        return new Set();
+      };
+
+      const saveFavorites = (set) => {
+        try {
+          localStorage.setItem(
+            "agregator.favorites",
+            JSON.stringify(Array.from(set.values()))
+          );
+        } catch (error) {
+          // ignore
+        }
+      };
+
+      const loadNotes = () => {
+        try {
+          const raw = localStorage.getItem("agregator.notes");
+          if (!raw) return {};
+          const parsed = JSON.parse(raw);
+          return parsed && typeof parsed === "object" ? parsed : {};
+        } catch (error) {
+          return {};
+        }
+      };
+
+      const saveNotes = (notes) => {
+        try {
+          localStorage.setItem("agregator.notes", JSON.stringify(notes));
+        } catch (error) {
+          // ignore
+        }
+      };
+
+      const favorites = loadFavorites();
+      const notes = loadNotes();
+
+      const typeHints = [
+        { type: "ГОСТ", re: /(гост|gost|iso|iec|din|en|astm|bs|сто|ту|ескд)/i },
+        { type: "Диссертация", re: /(диссертац)/i },
+        { type: "Автореферат диссертации", re: /(автореферат)/i },
+        { type: "Методические указания", re: /(методическ(ие|ая) указани|методическ(ие|ая) рекомендаци)/i },
+        { type: "Учебное пособие", re: /(учебн(ое|ая) пособие)/i },
+        { type: "Учебник", re: /(учебник)/i },
+        { type: "Лабораторный практикум", re: /(практикум|лабораторн(ый|ая))/i },
+        { type: "Отчёт", re: /(отчет|отчёт)/i },
+        { type: "Монография", re: /(монограф)/i },
+        { type: "Статья", re: /(статья|журнал|вестник)/i },
+        { type: "Презентация", re: /(презентац)/i },
+        { type: "Патент", re: /(патент)/i },
+      ];
+
+      const guessType = (item) => {
+        const hay = [item.title, item.summary, item.description, (item.keywords || []).join(" "), item.path].join(" ");
+        for (const hint of typeHints) {
+          if (hint.re.test(hay)) return hint.type;
+        }
+        return "";
+      };
+
+      const isSuspicious = (item) => {
+        if (manualSuspicious.has(item.id)) return true;
+        const hay = [item.title, item.summary, item.description, (item.keywords || []).join(" "), item.path]
+          .join(" ");
+        const hasStandard = standardPattern.test(hay) || eskdPattern.test(hay);
+        if (hasStandard && normalize(getType(item)) !== "гост") return true;
+        const guessed = guessType(item);
+        if (guessed) {
+          const current = normalize(getType(item));
+          if (current && !normalize(guessed).includes(current) && !current.includes(normalize(guessed))) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      function highlightText(text, query) {
+        const value = String(text || "");
+        if (!query) return escapeHtml(value);
+        const lower = value.toLowerCase();
+        const q = query.toLowerCase();
+        if (!q) return escapeHtml(value);
+        let result = "";
+        let idx = 0;
+        while (true) {
+          const found = lower.indexOf(q, idx);
+          if (found === -1) {
+            result += escapeHtml(value.slice(idx));
+            break;
+          }
+          result += escapeHtml(value.slice(idx, found));
+          result += "<mark>" + escapeHtml(value.slice(found, found + q.length)) + "</mark>";
+          idx = found + q.length;
+        }
+        return result;
+      }
+
+      function renderFacets() {
+        const counts = computeTypeCounts();
+        facetEl.innerHTML = Object.entries(counts)
+          .sort((a, b) => b[1] - a[1])
+          .map(([type, count]) => {
+            const active = state.type === type ? "active" : "";
+            return `<button class="${active}" data-type="${type}"><strong>${type}</strong><div class="meta">${count} файлов</div></button>`;
+          })
+          .join("");
+      }
+
+      function renderWordCloud() {
+        const items = Object.entries(keywordCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 40);
+        const max = items.reduce((acc, [, count]) => Math.max(acc, count), 1);
+        wordCloudEl.innerHTML = items
+          .map(([kw, count]) => {
+            const size = 12 + Math.round((count / max) * 12);
+            const activeStyle = state.keyword === kw
+              ? `style="font-size:${size}px; border-color:#2f8a5c; background:#e7f3ed; color:#2f8a5c;"`
+              : `style="font-size:${size}px"`;
+            return `<button data-kw="${kw}" ${activeStyle}>${kw}</button>`;
+          })
+          .join("");
+      }
+
+      function renderFavorites() {
+        const items = data.filter((item) => favorites.has(item.id));
+        favoritesListEl.innerHTML = items.length
+          ? items
+              .slice(0, 20)
+              .map(
+                (item) =>
+                  `<div class="favorites-item" data-id="${item.id}">
+                    <strong>${escapeHtml(item.title)}</strong>
+                    <span class="meta">${escapeHtml(item.author || "—")} · ${escapeHtml(item.year || "—")}</span>
+                  </div>`
+              )
+              .join("")
+          : '<div class="empty">Пока пусто</div>';
+      }
+
+      function renderCompare() {
+        const items = state.compareIds.map((id) => data.find((row) => row.id === id)).filter(Boolean);
+        if (compareCountEl) {
+          compareCountEl.textContent = String(items.length);
+        }
+        if (items.length < 2) {
+          if (compareTableEl) {
+            compareTableEl.innerHTML = '<div class="empty">Добавьте минимум 2 документа</div>';
+          }
+          return;
+        }
+        const rows = [
+          ["Название", (i) => i.title || "—"],
+          ["Автор", (i) => i.author || "—"],
+          ["Год", (i) => i.year || "—"],
+          ["Тип", (i) => getType(i) || "Без типа"],
+          ["Ключевые", (i) => (i.keywords || []).join(", ") || "—"],
+          ["Файл", (i) => i.path || "—"],
+          ["Краткое описание", (i) => i.summary || "—"],
+          ["Полное описание", (i) => i.description || "—"],
+        ];
+        compareTableEl.innerHTML =
+          "<table>" +
+          "<thead><tr><th>Поле</th>" +
+          items.map((item) => "<th>" + escapeHtml(item.title || "—") + "</th>").join("") +
+          "</tr></thead>" +
+          "<tbody>" +
+          rows
+            .map(([label, getter]) =>
+              "<tr>" +
+              "<th>" + label + "</th>" +
+              items.map((item) => "<td>" + escapeHtml(getter(item)) + "</td>").join("") +
+              "</tr>"
+            )
+            .join("") +
+          "</tbody></table>";
+      }
+
+      function renderSimilar(item) {
+        if (!similarListEl && !similarDropdownEl) {
+          return;
+        }
+        if (!item) {
+          if (similarListEl) {
+            similarListEl.innerHTML = '<div class="empty">Выберите запись</div>';
+          }
+          if (similarCountEl) similarCountEl.textContent = "0";
+          if (similarDropdownEl) similarDropdownEl.innerHTML = "";
+          return;
+        }
+        const ranked = data
+          .filter((row) => row.id !== item.id)
+          .map((row) => ({ row, score: similarityScore(item, row) }))
+          .filter((entry) => entry.score > 0.12)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 8);
+        if (similarCountEl) similarCountEl.textContent = String(ranked.length);
+        if (similarListEl) {
+          similarListEl.innerHTML = ranked.length
+            ? ranked
+                .map((entry) =>
+                  "<div class='similar-item' data-id='" + entry.row.id + "'>" +
+                  "<strong>" + escapeHtml(entry.row.title) + "</strong>" +
+                  "<span class='meta'>" +
+                  escapeHtml(entry.row.author || "—") +
+                  " · " +
+                  escapeHtml(entry.row.year || "—") +
+                  " · " +
+                  escapeHtml(getType(entry.row) || "Без типа") +
+                  "</span></div>"
+                )
+                .join("")
+            : '<div class="empty">Похожих не найдено</div>';
+        }
+        if (similarDropdownEl) {
+          similarDropdownEl.innerHTML = ranked.length
+            ? ranked
+                .map(
+                  (entry) =>
+                    "<div class='item' data-id='" + entry.row.id + "'>" +
+                    escapeHtml(entry.row.title) +
+                    "</div>"
+                )
+                .join("")
+            : "<div class='item'>Похожих не найдено</div>";
+        }
+      }
+
+      function selectItemById(id, options = {}) {
+        const { updateSimilar = true } = options;
+        const filtered = data.filter(match);
+        const idx = filtered.findIndex((item) => item.id === id);
+        if (idx >= 0) {
+          state.page = Math.floor(idx / state.pageSize) + 1;
+        }
+        state.selectedId = id;
+        const selected = data.find((row) => row.id === id);
+        renderDetail(selected);
+        renderList();
+        scrollToSelectedWithRetries();
+        setTimeout(() => {
+          scrollToSelectedWithRetries();
+        }, 120);
+        if (updateSimilar && selected) {
+          renderSimilar(selected);
+        }
+        saveState();
+      }
+
+      function renderStats(container, counts) {
+        const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 12);
+        const max = entries.reduce((acc, [, count]) => Math.max(acc, count), 1);
+        container.innerHTML = entries
+          .map(([key, count]) => `
+            <div class="stat-row" data-key="${escapeHtml(key)}">
+              <div>${escapeHtml(key)}</div>
+              <div class="meta">${count}</div>
+              <div class="stat-bar"><span style="width:${Math.round((count / max) * 100)}%"></span></div>
+            </div>`)
+          .join("");
+      }
+
+      function renderConflicts() {
+        const conflicts = {};
+        data.forEach((item) => {
+          const hay = [item.title, item.summary, item.description, (item.keywords || []).join(" "), item.path].join(" ");
+          let suggested = "";
+          if (standardPattern.test(hay) || eskdPattern.test(hay)) {
+            suggested = "ГОСТ";
+          } else if (/учебно-?методическ.*пособ/i.test(hay)) {
+            suggested = "Методические указания";
+          } else if (/методическ.*рекомендац/i.test(hay)) {
+            suggested = "Методические указания";
+          } else if (/\\bпрактикум\\b/i.test(hay)) {
+            suggested = "Лабораторный практикум";
+          } else if (/\\bотч[её]т\\b/i.test(hay) && !/отч[её]т\\s+о\\s+нир/i.test(hay)) {
+            suggested = "Отчёт (научный, технический, годовой)";
+          }
+          if (!suggested) return;
+          const current = getType(item) || "Без типа";
+          if (current === suggested) return;
+          const key = current + " → " + suggested;
+          conflicts[key] = (conflicts[key] || 0) + 1;
+        });
+        const entries = Object.entries(conflicts).sort((a, b) => b[1] - a[1]).slice(0, 12);
+        typeConflictsEl.innerHTML = entries
+          .map(([key, count]) => {
+            const from = key.split(" → ")[0];
+            const active = state.type === from ? "active" : "";
+            return `<div class="conflict-item ${active}" data-conflict="${key}">${escapeHtml(key)} <span class="meta">(${count})</span></div>`;
+          })
+          .join("");
+      }
+
+      function match(item, idx) {
+        if (state.q) {
+          const query = normalize(state.q);
+          if (state.exactMatch) {
+            if (!index[idx].includes(query)) return false;
+          } else if (state.wordMode) {
+            const words = query.split(/\s+/).filter(Boolean).filter((w) => !state.ignoreStopwords || !stopwords.has(w));
+            if (!words.every((w) => index[idx].includes(w))) return false;
+          } else {
+            if (!index[idx].includes(query)) return false;
+          }
+        }
+        if (state.qId && String(item.id || "").indexOf(state.qId.trim()) === -1) return false;
+        if (state.qPath && normalize(item.path || "").indexOf(normalize(state.qPath)) === -1) return false;
+        if (state.year && normalize(item.year) !== normalize(state.year)) return false;
+        if (state.author && !normalize(item.author).includes(normalize(state.author))) return false;
+        if (state.type && (getType(item) || "Без типа") !== state.type) return false;
+        if (state.keyword) {
+          const kws = (item.keywords || []).map(normalize);
+          if (!kws.includes(state.keyword)) return false;
+        }
+        if (state.hasPath && !item.path) return false;
+        const hasDesc = (item.summary || item.description || "").trim().length > 0;
+        if (state.hasDesc && !hasDesc) return false;
+        if (state.favoritesOnly && !favorites.has(item.id)) return false;
+        if (state.suspiciousOnly && !isSuspicious(item)) return false;
+        return true;
+      }
+
+      function getDesc(item, mode) {
+        const summary = item.summary || "";
+        const full = item.description || "";
+        if (mode === "full") return full || summary || "Описание отсутствует.";
+        if (summary) return summary;
+        if (!full) return "Описание отсутствует.";
+        return full.length > 420 ? full.slice(0, 420) + "…" : full;
+      }
+
+      function getItemMode(id) {
+        return state.descOverrides[id] || state.descMode;
+      }
+
+      function buildCitation(item) {
+        const author = item.author || "—";
+        const title = item.title || "Без названия";
+        const year = item.year || "—";
+        const type = getType(item) || "Документ";
+        return `${author}. ${title} (${year}). ${type}.`;
+      }
+
+      function buildCardText(item) {
+        const lines = [
+          `Название: ${item.title || "Без названия"}`,
+          `Автор: ${item.author || "—"}`,
+          `Год: ${item.year || "—"}`,
+          `Тип: ${getType(item) || "Без типа"}`,
+          `Ключевые: ${(item.keywords || []).join(", ") || "—"}`,
+          `Путь: ${item.path || "—"}`,
+        ];
+        return lines.join("\\n");
+      }
+
+      function tokenize(text) {
+        return String(text || "")
+          .toLowerCase()
+          .split(/[^a-zа-я0-9]+/i)
+          .filter((t) => t.length > 2 && !stopwords.has(t));
+      }
+
+      function similarityScore(a, b) {
+        const aTokens = new Set(tokenize([a.title, a.summary, a.description].join(" ")));
+        const bTokens = new Set(tokenize([b.title, b.summary, b.description].join(" ")));
+        const aKw = new Set((a.keywords || []).map(normalize));
+        const bKw = new Set((b.keywords || []).map(normalize));
+        const tokenInter = new Set([...aTokens].filter((t) => bTokens.has(t))).size;
+        const tokenUnion = new Set([...aTokens, ...bTokens]).size || 1;
+        const kwInter = new Set([...aKw].filter((t) => bKw.has(t))).size;
+        const kwUnion = new Set([...aKw, ...bKw]).size || 1;
+        return (tokenInter / tokenUnion) * 0.6 + (kwInter / kwUnion) * 0.4;
+      }
+
+      function renderList() {
+        const filtered = data.filter(match);
+        const total = filtered.length;
+        const totalPages = Math.max(1, Math.ceil(total / state.pageSize));
+        if (state.page > totalPages) state.page = totalPages;
+        const start = (state.page - 1) * state.pageSize;
+        const pageItems = filtered.slice(start, start + state.pageSize);
+        state.pageIds = pageItems.map((item) => item.id);
+        const pagerHtml = `
+          <div class="pager">
+            <button class="prevPage" ${state.page <= 1 ? "disabled" : ""}>Назад</button>
+            <span>Стр. ${state.page} / ${totalPages}</span>
+            <button class="nextPage" ${state.page >= totalPages ? "disabled" : ""}>Вперед</button>
+          </div>
+          <label>На странице
+            <select class="pageSize">
+              <option value="20" ${state.pageSize === 20 ? "selected" : ""}>20</option>
+              <option value="50" ${state.pageSize === 50 ? "selected" : ""}>50</option>
+              <option value="100" ${state.pageSize === 100 ? "selected" : ""}>100</option>
+              <option value="200" ${state.pageSize === 200 ? "selected" : ""}>200</option>
+            </select>
+          </label>`;
+        countEl.innerHTML = `<div class="meta">Найдено: ${total}</div>`;
+        document.getElementById("countBottom").innerHTML = `<div class="meta">Найдено: ${total}</div>`;
+        const miniStatsEl = document.getElementById("miniStats");
+        if (miniStatsEl) {
+          miniStatsEl.textContent = `Всего: ${data.length} · Найдено: ${total} · Страница ${state.page}/${totalPages}`;
+        }
+        document.getElementById("pagerTop").innerHTML = pagerHtml;
+        document.getElementById("pagerBottom").innerHTML = pagerHtml;
+
+        listEl.innerHTML = pageItems
+          .map((item) => {
+            const mode = getItemMode(item.id);
+            const activeClass = state.selectedId === item.id ? "active" : "";
+            const suspiciousClass = isSuspicious(item) ? "suspicious" : "";
+            const favoriteClass = favorites.has(item.id) ? "favorite" : "";
+            const compareClass = state.compareIds.includes(item.id) ? "compare" : "";
+            const shortActive = mode === "short" ? "active" : "";
+            const fullActive = mode === "full" ? "active" : "";
+            const showDesc = state.showDesc && (!state.lazyDesc || state.selectedId === item.id);
+            const highlightedTitle = highlightText(item.title, state.q);
+            const highlightedAuthor = highlightText(item.author || "—", state.q);
+            const highlightedKeywords = highlightText((item.keywords || []).join(", "), state.q);
+            const displayType = getType(item) || "Без типа";
+            return `
+            <div class="card ${activeClass} ${suspiciousClass} ${favoriteClass} ${compareClass}" data-id="${item.id}">
+              <h3>${highlightedTitle}</h3>
+              <div class="grid">
+                <div>Автор: ${highlightedAuthor} · Год: ${escapeHtml(item.year || "—")}</div>
+                <div>Тип: <span class="tag">${escapeHtml(displayType)}</span></div>
+                ${item.path ? `<div>Файл: <a class="link" href="${escapeHtml(item.path)}">${escapeHtml(item.path)}</a></div>` : ""}
+                ${highlightedKeywords ? `<div>Ключевые: ${highlightedKeywords}</div>` : ""}
+              </div>
+              <div class="quick-actions">
+                <button data-action="favorite">${favorites.has(item.id) ? "★ Убрать" : "☆ В избранное"}</button>
+                <button data-action="compare">${state.compareIds.includes(item.id) ? "✓ В сравнении" : "Сравнить"}</button>
+                <button data-action="copyCard">Копировать карточку</button>
+              </div>
+              ${showDesc ? `
+                <div class="desc-controls">
+                  <button data-desc="short" class="${shortActive}">Кратко</button>
+                  <button data-desc="full" class="${fullActive}">Полно</button>
+                </div>
+                <p>${highlightText(getDesc(item, mode), state.q)}</p>
+              ` : ""}
+            </div>`;
+          })
+          .join("") || '<div class="empty">Ничего не найдено</div>';
+
+        const bindPager = (root) => {
+          const prevBtn = root.querySelector(".prevPage");
+          const nextBtn = root.querySelector(".nextPage");
+          const sizeSelect = root.querySelector(".pageSize");
+          if (prevBtn) prevBtn.onclick = () => { state.page = Math.max(1, state.page - 1); renderList(); };
+          if (nextBtn) nextBtn.onclick = () => { state.page = Math.min(totalPages, state.page + 1); renderList(); };
+          if (sizeSelect) sizeSelect.onchange = (e) => { state.pageSize = Number(e.target.value); state.page = 1; renderList(); };
+        };
+        const topPager = document.getElementById("pagerTop");
+        const bottomPager = document.getElementById("pagerBottom");
+        if (topPager) bindPager(topPager);
+        if (bottomPager) bindPager(bottomPager);
+        if (state.q && pageItems.length > 0) {
+          const first = listEl.querySelector(".card");
+          if (first) {
+            first.classList.add("first-match");
+            requestAnimationFrame(() => {
+              first.scrollIntoView({ block: "start", behavior: "smooth" });
+            });
+          }
+        }
+      }
+
+      function scrollToSelected() {
+        if (!state.selectedId) return;
+        const selectedCard = listEl.querySelector('.card[data-id="' + state.selectedId + '"]');
+        if (!selectedCard) return;
+        const rect = selectedCard.getBoundingClientRect();
+        const headerOffset = 96;
+        const target = Math.max(0, window.scrollY + rect.top - headerOffset);
+        window.scrollTo({ top: target, behavior: "smooth" });
+      }
+
+      function scrollToSelectedWithRetries() {
+        let attempts = 0;
+        const tick = () => {
+          attempts += 1;
+          scrollToSelected();
+          if (attempts < 3) {
+            requestAnimationFrame(tick);
+          }
+        };
+        requestAnimationFrame(tick);
+      }
+
+      function renderDetail(item) {
+        if (!item) {
+          detailEl.innerHTML = '<div class="empty">Выберите запись</div>';
+          return;
+        }
+        const mode = getItemMode(item.id);
+        const shortActive = mode === "short" ? "active" : "";
+        const fullActive = mode === "full" ? "active" : "";
+        const keywords = Array.isArray(item.keywords) ? item.keywords.join(", ") : "";
+        const typeOptions = Array.from(new Set(data.map((row) => row.type || "Без типа"))).filter(Boolean);
+        const noteValue = notes[item.id] || "";
+        detailEl.innerHTML = `
+          <h3>${escapeHtml(item.title)}</h3>
+          <div class="grid">
+            <div>Автор: ${escapeHtml(item.author || "—")}</div>
+            <div>Год: ${escapeHtml(item.year || "—")}</div>
+            <div>Тип: ${escapeHtml(getType(item) || "Без типа")}</div>
+            <div>Ключевые: ${escapeHtml(keywords || "—")}</div>
+            ${item.path ? `<div>Файл: <a class="link" href="${escapeHtml(item.path)}">${escapeHtml(item.path)}</a></div>` : ""}
+          </div>
+          <div class="controls">
+            <span class="meta">Заметка:</span>
+            <textarea id="noteInput" class="note-input" placeholder="Локальная заметка">${escapeHtml(noteValue)}</textarea>
+          </div>
+          <div class="controls">
+            <span class="meta">Локальная правка типа:</span>
+            <select id="localType">
+              <option value="">— без правки —</option>
+              ${typeOptions.map((opt) => `<option value="${escapeHtml(opt)}" ${getType(item) === opt ? "selected" : ""}>${escapeHtml(opt)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="actions">
+            <button id="copyCitation">Скопировать цитату</button>
+            <button id="copyCard">Скопировать карточку</button>
+            <button id="copyPath">Скопировать путь</button>
+            <button id="toggleSuspicious">
+              ${manualSuspicious.has(item.id) ? "Снять подозрительность" : "Пометить как подозрительный"}
+            </button>
+          </div>
+          ${state.showDesc ? `
+            <div class="desc-controls">
+              <button data-desc="short" class="${shortActive}">Кратко</button>
+              <button data-desc="full" class="${fullActive}">Полно</button>
+            </div>
+            <p>${escapeHtml(getDesc(item, mode))}</p>
+          ` : ""}
+        `;
+      }
+
+      function debounce(fn, delay) {
+        let t = null;
+        return (...args) => {
+          if (t) clearTimeout(t);
+          t = setTimeout(() => fn(...args), delay);
+        };
+      }
+
+      const saveState = () => {
+        try {
+          localStorage.setItem("agregator.state", JSON.stringify(state));
+        } catch (error) {
+          // ignore
+        }
+      };
+
+      const updateToolbarState = () => {
+        const bindActive = (id, active) => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.setAttribute("aria-pressed", !!active ? "true" : "false");
+            el.setAttribute("data-active", !!active ? "true" : "false");
+          }
+        };
+        bindActive("toggleShowDesc", state.showDesc);
+        bindActive("toggleLazyDesc", state.lazyDesc);
+        bindActive("toggleCompact", state.compact);
+        bindActive("toggleColumns", state.twoCol);
+        bindActive("toggleTheme", state.dark);
+        const themeBtn = document.getElementById("toggleTheme");
+        if (themeBtn) {
+          const icon = themeBtn.querySelector(".toggle-icon");
+          if (icon) {
+            icon.textContent = state.dark ? "☀️" : "🌙";
+          }
+        }
+      };
+
+      const loadState = () => {
+        try {
+          const raw = localStorage.getItem("agregator.state");
+          if (!raw) return;
+          const saved = JSON.parse(raw);
+          Object.assign(state, saved);
+        } catch (error) {
+          // ignore
+        }
+      };
+
+      const debouncedSearch = debounce(() => { state.page = 1; renderList(); renderDetail(null); saveState(); }, 200);
+      document.getElementById("q").addEventListener("input", (e) => { state.q = e.target.value; debouncedSearch(); });
+      document.getElementById("year").addEventListener("input", (e) => { state.year = e.target.value; debouncedSearch(); });
+      document.getElementById("author").addEventListener("input", (e) => { state.author = e.target.value; debouncedSearch(); });
+      document.getElementById("qId").addEventListener("input", (e) => { state.qId = e.target.value; debouncedSearch(); });
+      document.getElementById("qPath").addEventListener("input", (e) => { state.qPath = e.target.value; debouncedSearch(); });
+      document.getElementById("toggleShowDesc").addEventListener("click", () => {
+        state.showDesc = !state.showDesc;
+        renderList();
+        renderDetail(null);
+        updateToolbarState();
+        saveState();
+      });
+      document.getElementById("toggleLazyDesc").addEventListener("click", () => {
+        state.lazyDesc = !state.lazyDesc;
+        renderList();
+        updateToolbarState();
+        saveState();
+      });
+      document.getElementById("hasPath").addEventListener("change", (e) => { state.hasPath = e.target.checked; renderList(); saveState(); });
+      document.getElementById("hasDesc").addEventListener("change", (e) => { state.hasDesc = e.target.checked; renderList(); saveState(); });
+      document.getElementById("suspiciousOnly").addEventListener("change", (e) => { state.suspiciousOnly = e.target.checked; renderList(); saveState(); });
+      document.getElementById("favoritesOnly").addEventListener("change", (e) => { state.favoritesOnly = e.target.checked; renderList(); saveState(); });
+      document.getElementById("exactMatch").addEventListener("change", (e) => { state.exactMatch = e.target.checked; renderList(); saveState(); });
+      document.getElementById("wordMode").addEventListener("change", (e) => { state.wordMode = e.target.checked; renderList(); saveState(); });
+      document.getElementById("ignoreStopwords").addEventListener("change", (e) => { state.ignoreStopwords = e.target.checked; renderList(); saveState(); });
+
+      document.getElementById("descMode").addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-mode]");
+        if (!btn) return;
+        state.descMode = btn.dataset.mode;
+        state.descOverrides = {};
+        document.querySelectorAll("#descMode button").forEach((el) => {
+          el.classList.toggle("active", el.dataset.mode === state.descMode);
+        });
+        renderList();
+        renderDetail(state.selectedId ? data.find((item) => item.id === state.selectedId) : null);
+        saveState();
+      });
+
+      document.getElementById("resetFilters").addEventListener("click", () => {
+        Object.assign(state, {
+          q: "",
+          year: "",
+          author: "",
+          qId: "",
+          qPath: "",
+          type: "",
+          keyword: "",
+          showDesc: true,
+          lazyDesc: false,
+          hasPath: false,
+          hasDesc: false,
+          suspiciousOnly: false,
+          favoritesOnly: false,
+          exactMatch: false,
+          wordMode: false,
+          ignoreStopwords: false,
+          page: 1,
+        });
+        document.getElementById("q").value = "";
+        document.getElementById("year").value = "";
+        document.getElementById("author").value = "";
+        document.getElementById("qId").value = "";
+        document.getElementById("qPath").value = "";
+        document.getElementById("hasPath").checked = false;
+        document.getElementById("hasDesc").checked = false;
+        document.getElementById("suspiciousOnly").checked = false;
+        document.getElementById("favoritesOnly").checked = false;
+        document.getElementById("exactMatch").checked = false;
+        document.getElementById("wordMode").checked = false;
+        document.getElementById("ignoreStopwords").checked = false;
+        renderFacets();
+        renderWordCloud();
+        renderList();
+        renderDetail(null);
+        updateToolbarState();
+        saveState();
+      });
+
+
+      document.getElementById("scrollTop").addEventListener("click", () => {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      });
+      document.getElementById("scrollBottom").addEventListener("click", () => {
+        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      });
+      document.getElementById("toggleCompact").addEventListener("click", () => {
+        state.compact = !state.compact;
+        document.body.classList.toggle("compact", state.compact);
+        updateToolbarState();
+        saveState();
+      });
+      document.getElementById("toggleColumns").addEventListener("click", () => {
+        state.twoCol = !state.twoCol;
+        listEl.classList.toggle("two-col", state.twoCol);
+        updateToolbarState();
+        saveState();
+      });
+      document.getElementById("toggleTheme").addEventListener("click", () => {
+        state.dark = !state.dark;
+        document.body.classList.toggle("theme-dark", state.dark);
+        updateToolbarState();
+        saveState();
+      });
+
+      facetEl.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-type]");
+        if (!btn) return;
+        const type = btn.dataset.type;
+        state.type = state.type === type ? "" : type;
+        state.page = 1;
+        renderFacets();
+        renderList();
+      });
+
+      wordCloudEl.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-kw]");
+        if (!btn) return;
+        const kw = btn.dataset.kw;
+        state.keyword = state.keyword === kw ? "" : kw;
+        state.page = 1;
+        renderList();
+        renderWordCloud();
+      });
+
+      typeStatsEl.addEventListener("click", (e) => {
+        const row = e.target.closest(".stat-row");
+        if (!row) return;
+        const key = row.dataset.key;
+        state.type = state.type === key ? "" : key;
+        renderFacets();
+        renderList();
+      });
+
+      yearStatsEl.addEventListener("click", (e) => {
+        const row = e.target.closest(".stat-row");
+        if (!row) return;
+        const key = row.dataset.key;
+        state.year = state.year === key ? "" : key;
+        document.getElementById("year").value = state.year === "—" ? "" : state.year;
+        renderList();
+      });
+
+      typeConflictsEl.addEventListener("click", (e) => {
+        const item = e.target.closest(".conflict-item");
+        if (!item) return;
+        const parts = item.dataset.conflict.split(" → ");
+        if (parts.length !== 2) return;
+        const from = parts[0];
+        state.type = state.type === from ? "" : from;
+        renderFacets();
+        renderList();
+        renderConflicts();
+      });
+
+      favoritesListEl.addEventListener("click", (e) => {
+        const item = e.target.closest(".favorites-item");
+        if (!item) return;
+        const id = Number(item.dataset.id);
+        if (!id) return;
+        selectItemById(id, { updateSimilar: true });
+      });
+
+      if (compareListEl) {
+        compareListEl.addEventListener("click", (e) => {
+          const item = e.target.closest(".compare-item");
+          if (!item) return;
+          const id = Number(item.dataset.id);
+          if (!id) return;
+          selectItemById(id, { updateSimilar: true });
+        });
+      }
+
+
+      listEl.addEventListener("click", (e) => {
+        const actionBtn = e.target.closest("button[data-action]");
+        if (actionBtn) {
+          const card = actionBtn.closest(".card");
+          if (!card) return;
+          const id = Number(card.dataset.id);
+          const item = data.find((row) => row.id === id);
+          if (!item) return;
+          if (actionBtn.dataset.action === "favorite") {
+            if (favorites.has(id)) {
+              favorites.delete(id);
+            } else {
+              favorites.add(id);
+            }
+            saveFavorites(favorites);
+            renderFavorites();
+            selectItemById(id, { updateSimilar: true });
+            return;
+          }
+          if (actionBtn.dataset.action === "compare") {
+            if (state.compareIds.includes(id)) {
+              state.compareIds = state.compareIds.filter((val) => val !== id);
+            } else if (state.compareIds.length < 3) {
+              state.compareIds = [...state.compareIds, id];
+            }
+            renderCompare();
+            renderList();
+            saveState();
+            return;
+          }
+          if (actionBtn.dataset.action === "copyCard") {
+            navigator.clipboard.writeText(buildCardText(item));
+            return;
+          }
+        }
+        const descBtn = e.target.closest("button[data-desc]");
+        if (descBtn) {
+          const card = descBtn.closest(".card");
+          if (!card) return;
+          const id = Number(card.dataset.id);
+          state.descOverrides[id] = descBtn.dataset.desc;
+          if (state.selectedId === id) {
+            renderDetail(data.find((item) => item.id === id));
+            renderSimilar(data.find((item) => item.id === id));
+          }
+          renderList();
+          return;
+        }
+        const card = e.target.closest(".card");
+        if (!card) return;
+        const id = Number(card.dataset.id);
+        selectItemById(id, { updateSimilar: true });
+      });
+
+      detailEl.addEventListener("change", (e) => {
+        const localType = e.target.closest("#localType");
+        if (localType && state.selectedId) {
+          const value = localType.value;
+          if (value) {
+            typeOverrides[state.selectedId] = value;
+          } else {
+            delete typeOverrides[state.selectedId];
+          }
+          saveTypeOverrides();
+          renderDetail(data.find((item) => item.id === state.selectedId));
+          renderFacets();
+          renderStats(typeStatsEl, computeTypeCounts());
+          renderConflicts();
+          renderList();
+        }
+      });
+
+      detailEl.addEventListener("input", (e) => {
+        const noteInput = e.target.closest("#noteInput");
+        if (noteInput && state.selectedId) {
+          notes[state.selectedId] = noteInput.value;
+          saveNotes(notes);
+        }
+      });
+
+      detailEl.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-desc]");
+        if (btn) {
+          if (!state.selectedId) return;
+          state.descOverrides[state.selectedId] = btn.dataset.desc;
+          renderDetail(data.find((item) => item.id === state.selectedId));
+          renderList();
+          return;
+        }
+        const toggleSuspicious = e.target.closest("#toggleSuspicious");
+        if (toggleSuspicious && state.selectedId) {
+          if (manualSuspicious.has(state.selectedId)) {
+            manualSuspicious.delete(state.selectedId);
+          } else {
+            manualSuspicious.add(state.selectedId);
+          }
+          saveManualSuspicious(manualSuspicious);
+          selectItemById(state.selectedId, { updateSimilar: true });
+          return;
+        }
+        const copyCitation = e.target.closest("#copyCitation");
+        if (copyCitation && state.selectedId) {
+          const item = data.find((row) => row.id === state.selectedId);
+          if (item) navigator.clipboard.writeText(buildCitation(item));
+          return;
+        }
+        const copyCard = e.target.closest("#copyCard");
+        if (copyCard && state.selectedId) {
+          const item = data.find((row) => row.id === state.selectedId);
+          if (item) navigator.clipboard.writeText(buildCardText(item));
+          return;
+        }
+        const copyPath = e.target.closest("#copyPath");
+        if (copyPath && state.selectedId) {
+          const item = data.find((row) => row.id === state.selectedId);
+          if (item && item.path) navigator.clipboard.writeText(item.path);
+        }
+      });
+
+      document.getElementById("exportSuspicious").addEventListener("click", () => {
+        const rows = data.filter(isSuspicious);
+        const header = ["id","type","title","path"];
+        const csv = [header.join(",")].concat(
+          rows.map((item) => [item.id, getType(item), item.title, item.path]
+            .map((v) => String(v || "").replace(/"/g, '""'))
+            .map((v) => `"${v}"`).join(",")
+          )
+        ).join("\\n");
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "biblio-suspicious.csv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      });
+
+      document.getElementById("exportSuspiciousJson").addEventListener("click", () => {
+        const rows = data.filter(isSuspicious);
+        const blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "biblio-suspicious.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      });
+
+      document.getElementById("exportFavoritesCsv").addEventListener("click", () => {
+        const rows = data.filter((item) => favorites.has(item.id));
+        const header = ["id","type","title","path"];
+        const csv = [header.join(",")].concat(
+          rows.map((item) => [item.id, getType(item), item.title, item.path]
+            .map((v) => String(v || "").replace(/"/g, '""'))
+            .map((v) => `"${v}"`).join(",")
+          )
+        ).join("\\n");
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "biblio-favorites.csv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      });
+
+      document.getElementById("exportFavoritesJson").addEventListener("click", () => {
+        const rows = data.filter((item) => favorites.has(item.id));
+        const blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "biblio-favorites.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      });
+
+      const clearCompareBtn = document.getElementById("clearCompare");
+      if (clearCompareBtn) {
+        clearCompareBtn.addEventListener("click", () => {
+          state.compareIds = [];
+          renderCompare();
+          renderList();
+          saveState();
+        });
+      }
+
+      document.getElementById("toggleCompareModal").addEventListener("click", () => {
+        if (!compareModalEl || !compareModalBodyEl) return;
+        compareModalBodyEl.innerHTML = compareTableEl.innerHTML || '<div class="empty">Добавьте минимум 2 документа</div>';
+        compareModalEl.classList.add("open");
+      });
+
+      document.getElementById("closeCompareModal").addEventListener("click", () => {
+        compareModalEl.classList.remove("open");
+      });
+
+      document.getElementById("toggleSimilarList").addEventListener("click", (e) => {
+        if (e.target.closest("#similarDropdown")) return;
+        e.stopPropagation();
+        if (similarDropdownEl) {
+          similarDropdownEl.classList.toggle("open");
+        }
+      });
+
+      document.addEventListener("click", (e) => {
+        if (similarDropdownEl && !similarDropdownEl.contains(e.target)) {
+          similarDropdownEl.classList.remove("open");
+        }
+      });
+
+      if (similarDropdownEl) {
+        similarDropdownEl.addEventListener("click", (e) => {
+          e.stopPropagation();
+        });
+        similarDropdownEl.addEventListener("click", (e) => {
+          const item = e.target.closest(".item");
+          if (!item) return;
+          const id = Number(item.dataset.id);
+          if (!id) return;
+          similarDropdownEl.classList.remove("open");
+          selectItemById(id, { updateSimilar: true });
+        });
+      }
+
+      document.getElementById("resetLocal").addEventListener("click", () => {
+        try {
+          localStorage.removeItem("agregator.state");
+          localStorage.removeItem("agregator.notes");
+          localStorage.removeItem("agregator.favorites");
+          localStorage.removeItem("agregator.manualSuspicious");
+          localStorage.removeItem("agregator.typeOverrides");
+        } catch (error) {
+          // ignore
+        }
+        location.reload();
+      });
+
+      document.addEventListener("keydown", (e) => {
+        if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) {
+          return;
+        }
+        if (e.key === "/") {
+          e.preventDefault();
+          document.getElementById("q").focus();
+        }
+        if (e.key.toLowerCase() === "j") {
+          const idx = state.pageIds.indexOf(state.selectedId);
+          const next = idx === -1 ? 0 : Math.min(state.pageIds.length - 1, idx + 1);
+          const id = state.pageIds[next];
+          if (id) {
+            selectItemById(id, { updateSimilar: true });
+          }
+        }
+        if (e.key.toLowerCase() === "k") {
+          const idx = state.pageIds.indexOf(state.selectedId);
+          const prev = idx === -1 ? 0 : Math.max(0, idx - 1);
+          const id = state.pageIds[prev];
+          if (id) {
+            selectItemById(id, { updateSimilar: true });
+          }
+        }
+      });
+
+      const saveScroll = debounce(() => {
+        state.scrollY = window.scrollY || 0;
+        saveState();
+      }, 300);
+      window.addEventListener("scroll", saveScroll);
+
+      loadState();
+      document.body.classList.toggle("compact", state.compact);
+      listEl.classList.toggle("two-col", state.twoCol);
+      document.body.classList.toggle("theme-dark", state.dark);
+      document.getElementById("q").value = state.q;
+      document.getElementById("year").value = state.year;
+      document.getElementById("author").value = state.author;
+      document.getElementById("qId").value = state.qId;
+      document.getElementById("qPath").value = state.qPath;
+      document.getElementById("hasPath").checked = state.hasPath;
+      document.getElementById("hasDesc").checked = state.hasDesc;
+      document.getElementById("suspiciousOnly").checked = state.suspiciousOnly;
+      document.getElementById("favoritesOnly").checked = state.favoritesOnly;
+      document.getElementById("exactMatch").checked = state.exactMatch;
+      document.getElementById("wordMode").checked = state.wordMode;
+      document.getElementById("ignoreStopwords").checked = state.ignoreStopwords;
+
+      updateToolbarState();
+      renderFacets();
+      renderStats(typeStatsEl, computeTypeCounts());
+      renderStats(yearStatsEl, yearCounts);
+      renderWordCloud();
+      renderConflicts();
+      renderFavorites();
+      renderCompare();
+      renderList();
+        if (state.selectedId) {
+          const selected = data.find((item) => item.id === state.selectedId);
+          if (selected) {
+            renderDetail(selected);
+            renderSimilar(selected);
+          }
+        }
+      if (state.scrollY) {
+        requestAnimationFrame(() => {
+          window.scrollTo(0, state.scrollY);
+        });
+      }
+    </script>
+  </body>
+</html>

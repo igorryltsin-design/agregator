@@ -20,20 +20,29 @@ class BackgroundJob:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
     description: str | None = None
+    owner_id: int | None = None
 
 
 class TaskQueue:
     """Небольшая очередь на основе потоков, предотвращающая блокировки веб-процесса."""
 
-    def __init__(self, name: str, max_workers: int = 2, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        max_workers: int = 2,
+        logger: Optional[logging.Logger] = None,
+        per_owner_max_workers: int = 1,
+    ) -> None:
         self.name = name
         self.max_workers = max_workers
+        self.per_owner_max_workers = max(1, int(per_owner_max_workers or 1))
         self._queue: queue.Queue[Optional[BackgroundJob]] = queue.Queue()
         self._workers: list[threading.Thread] = []
         self._shutdown = threading.Event()
         self._logger = logger or logging.getLogger(f"agregator.task_queue.{name}")
         self._started = False
         self._lock = threading.Lock()
+        self._active_by_owner: dict[int, int] = {}
 
     def start(self) -> None:
         with self._lock:
@@ -65,6 +74,7 @@ class TaskQueue:
         func: Callable[..., Any],
         *args: Any,
         description: str | None = None,
+        owner_id: int | None = None,
         **kwargs: Any,
     ) -> str:
         if not self._started:
@@ -75,6 +85,7 @@ class TaskQueue:
             args=args,
             kwargs=kwargs,
             description=description,
+            owner_id=owner_id,
         )
         if not self._workers:
             self._logger.warning(
@@ -121,8 +132,37 @@ class TaskQueue:
             if job is None:
                 self._queue.task_done()
                 break
+            if not self._reserve_owner_slot(job):
+                # Возвращаем задачу обратно в очередь, если лимит owner исчерпан.
+                self._queue.put(job)
+                self._queue.task_done()
+                self._shutdown.wait(0.05)
+                continue
             self._execute(job)
+            self._release_owner_slot(job)
             self._queue.task_done()
+
+    def _reserve_owner_slot(self, job: BackgroundJob) -> bool:
+        owner_id = job.owner_id
+        if owner_id is None:
+            return True
+        with self._lock:
+            active = int(self._active_by_owner.get(owner_id, 0))
+            if active >= self.per_owner_max_workers:
+                return False
+            self._active_by_owner[owner_id] = active + 1
+            return True
+
+    def _release_owner_slot(self, job: BackgroundJob) -> None:
+        owner_id = job.owner_id
+        if owner_id is None:
+            return
+        with self._lock:
+            active = int(self._active_by_owner.get(owner_id, 0))
+            if active <= 1:
+                self._active_by_owner.pop(owner_id, None)
+            else:
+                self._active_by_owner[owner_id] = active - 1
 
     def _execute(self, job: BackgroundJob) -> None:
         desc = job.description or job.func.__name__
@@ -145,7 +185,9 @@ class TaskQueue:
             "name": self.name,
             "workers": len(self._workers),
             "max_workers": self.max_workers,
+            "per_owner_max_workers": self.per_owner_max_workers,
             "queued": self._queue.qsize(),
+            "active_by_owner": dict(self._active_by_owner),
             "shutdown": self._shutdown.is_set(),
             "started": self._started,
         }
@@ -170,9 +212,30 @@ def _resolve_worker_count() -> int:
     return max_workers
 
 
+def _resolve_per_owner_worker_count() -> int:
+    """Resolve and sanitize per-owner worker limit from environment."""
+    raw_value = os.getenv("AGREGATOR_TASK_PER_OWNER_MAX", "1")
+    logger = logging.getLogger("agregator.task_queue")
+    per_owner_max: int
+    try:
+        per_owner_max = int(str(raw_value).strip() or "1")
+    except (TypeError, ValueError):
+        logger.warning("Некорректное значение AGREGATOR_TASK_PER_OWNER_MAX=%r, используем 1.", raw_value)
+        per_owner_max = 1
+    if per_owner_max <= 0:
+        logger.warning("AGREGATOR_TASK_PER_OWNER_MAX=%s, увеличено до 1.", per_owner_max)
+        per_owner_max = 1
+    return per_owner_max
+
+
 def get_task_queue() -> TaskQueue:
     global _default_queue
     if _default_queue is None:
         max_workers = _resolve_worker_count()
-        _default_queue = TaskQueue(name="agregator", max_workers=max_workers)
+        per_owner_max_workers = _resolve_per_owner_worker_count()
+        _default_queue = TaskQueue(
+            name="agregator",
+            max_workers=max_workers,
+            per_owner_max_workers=per_owner_max_workers,
+        )
     return _default_queue

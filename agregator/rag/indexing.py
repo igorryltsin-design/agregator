@@ -540,6 +540,23 @@ def _safe_json_dumps(data: Dict) -> str:
         return json.dumps({"__fallback__": repr(data)}, ensure_ascii=False)
 
 
+def metadata_quality_payload(file_obj: Optional[File], text: str) -> Dict[str, object]:
+    checks = {
+        "title": bool((getattr(file_obj, "title", "") or "").strip()),
+        "author": bool((getattr(file_obj, "author", "") or "").strip()),
+        "year": bool((getattr(file_obj, "year", "") or "").strip()),
+        "material_type": bool((getattr(file_obj, "material_type", "") or "").strip()),
+        "keywords": bool((getattr(file_obj, "keywords", "") or "").strip()),
+        "abstract": bool((getattr(file_obj, "abstract", "") or "").strip()),
+        "text": bool((text or "").strip()),
+    }
+    total = len(checks)
+    filled = sum(1 for val in checks.values() if bool(val))
+    score = round((filled / total) if total else 0.0, 3)
+    bucket = "high" if score >= 0.75 else "medium" if score >= 0.45 else "low"
+    return {"score": score, "bucket": bucket, "filled": filled, "total": total}
+
+
 class RagIndexer:
     def __init__(
         self,
@@ -569,6 +586,17 @@ class RagIndexer:
         raw_hash = sha256((raw_text or "").encode("utf-8")).hexdigest() if raw_text is not None else None
         dedupe_hash = sha256(clean_text.encode("utf-8")).hexdigest() if clean_text else None
         lang = detect_language(clean_text)
+        quality = metadata_quality_payload(file_obj, clean_text)
+        enriched_metadata: Dict[str, object] = dict(metadata)
+        enriched_metadata.setdefault("file_id", file_obj.id)
+        enriched_metadata.setdefault("material_type", file_obj.material_type)
+        enriched_metadata.setdefault("title", file_obj.title)
+        enriched_metadata.setdefault("author", file_obj.author)
+        enriched_metadata.setdefault("year", file_obj.year)
+        enriched_metadata["metadata_quality"] = quality
+        if clean_text:
+            enriched_metadata.setdefault("char_count", len(clean_text))
+            enriched_metadata.setdefault("token_estimate", max(1, len(clean_text.split())))
 
         document = file_obj.rag_document
         if document is None:
@@ -597,7 +625,7 @@ class RagIndexer:
             sha256=raw_hash,
             dedupe_hash=dedupe_hash,
             normalizer_version=self.normalizer_version,
-            metadata_json=_safe_json_dumps(metadata),
+            metadata_json=_safe_json_dumps(enriched_metadata),
             raw_text=raw_text,
             clean_text=clean_text,
             lang_primary=lang,
@@ -626,7 +654,7 @@ class RagIndexer:
                 preview=chunk.preview,
                 keywords_top=", ".join(chunk.keywords),
                 lang_primary=chunk.lang_primary,
-                meta=_safe_json_dumps(chunk.meta),
+                meta=_safe_json_dumps({**chunk.meta, "metadata_quality": quality.get("score")}),
             )
             self.session.add(chunk_record)
 

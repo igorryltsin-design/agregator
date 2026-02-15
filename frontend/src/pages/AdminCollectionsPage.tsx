@@ -46,6 +46,20 @@ export default function AdminCollectionsPage() {
   const [deletingCollectionId, setDeletingCollectionId] = useState<number | null>(null)
   const [clearLoading, setClearLoading] = useState(false)
   const [exportLoading, setExportLoading] = useState(false)
+  const [exportModalOpen, setExportModalOpen] = useState(false)
+  const [exportIncludeFiles, setExportIncludeFiles] = useState(true)
+  const [exportCollectionId, setExportCollectionId] = useState<number | null>(null)
+  const [exportState, setExportState] = useState<{
+    status: 'idle' | 'starting' | 'running' | 'ready' | 'error'
+    progress: number
+    label: string
+    error?: string
+    taskId?: number
+    downloadUrl?: string
+    processed?: number
+    total?: number
+  }>({ status: 'idle', progress: 0, label: '' })
+  const exportPollRef = React.useRef<number | undefined>(undefined)
   const [ragLoading, setRagLoading] = useState(false)
   const [ragDeleteLoading, setRagDeleteLoading] = useState(false)
   const [memberForm, setMemberForm] = useState<{ username: string; role: string; userId: number | null }>({ username: '', role: 'viewer', userId: null })
@@ -89,6 +103,15 @@ export default function AdminCollectionsPage() {
       setSelectedId(collections[0].id)
     }
   }, [collections, selectedId])
+
+  const stopExportPoll = React.useCallback(() => {
+    if (exportPollRef.current !== undefined) {
+      window.clearInterval(exportPollRef.current)
+      exportPollRef.current = undefined
+    }
+  }, [])
+
+  useEffect(() => () => stopExportPoll(), [stopExportPoll])
 
   useEffect(() => {
     if (!selectedId) {
@@ -420,6 +443,104 @@ export default function AdminCollectionsPage() {
     }
   }
 
+  const resetExportState = () => {
+    stopExportPoll()
+    setExportState({ status: 'idle', progress: 0, label: '' })
+  }
+
+  const openExportModal = (collectionId: number | null) => {
+    if (!collectionId) return
+    setExportCollectionId(collectionId)
+    resetExportState()
+    setExportModalOpen(true)
+  }
+
+  const startExportHtml = async () => {
+    if (!exportCollectionId) return
+    stopExportPoll()
+    setExportState({ status: 'starting', progress: 0, label: 'Подготовка экспорта…' })
+    try {
+      const resp = await fetch('/api/export/html/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ collection_id: exportCollectionId, include_files: exportIncludeFiles }),
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok || !data?.task_id) {
+        throw new Error(data?.error || 'Не удалось запустить экспорт')
+      }
+      const taskId = Number(data.task_id)
+      const poll = async () => {
+        try {
+          const res = await fetch(`/api/export/html/jobs/${taskId}`)
+          const info = await res.json().catch(() => ({}))
+          if (!res.ok || !info?.task) {
+            throw new Error(info?.error || 'Ошибка чтения статуса экспорта')
+          }
+          const task = info.task
+          const payload = task.payload_json || {}
+          const stageLabel = payload.stage_label || payload.stage || ''
+          const processed = Number(payload.processed || 0)
+          const total = Number(payload.total || 0)
+          const percent = Math.max(0, Math.min(100, Math.round((task.progress || 0) * 100)))
+          if (task.status === 'completed') {
+            stopExportPoll()
+            setExportState({
+              status: 'ready',
+              progress: 100,
+              label: stageLabel || 'Готово',
+              taskId,
+              downloadUrl: `/api/export/html/jobs/${taskId}/download`,
+              processed,
+              total,
+            })
+            return
+          }
+          if (task.status === 'error') {
+            stopExportPoll()
+            setExportState({
+              status: 'error',
+              progress: percent,
+              label: stageLabel || 'Ошибка экспорта',
+              error: task.error || 'Неизвестная ошибка',
+              taskId,
+              processed,
+              total,
+            })
+            return
+          }
+          setExportState({
+            status: 'running',
+            progress: percent,
+            label: stageLabel || 'Экспорт…',
+            taskId,
+            processed,
+            total,
+          })
+        } catch (error: any) {
+          stopExportPoll()
+          setExportState({
+            status: 'error',
+            progress: 0,
+            label: 'Ошибка экспорта',
+            error: error?.message || String(error),
+            taskId,
+          })
+        }
+      }
+      await poll()
+      exportPollRef.current = window.setInterval(poll, 1200)
+    } catch (error: any) {
+      stopExportPoll()
+      setExportState({
+        status: 'error',
+        progress: 0,
+        label: 'Ошибка экспорта',
+        error: error?.message || String(error),
+      })
+    }
+  }
+
   const addMember = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!selectedId) return
@@ -500,7 +621,7 @@ export default function AdminCollectionsPage() {
   }
 
   return (
-    <div className="row g-3">
+    <div className="row g-3 admin-page-glass">
       <div className="col-lg-5">
         <div className="card p-3 h-100">
           <div className="d-flex justify-content-between align-items-center mb-2">
@@ -548,6 +669,14 @@ export default function AdminCollectionsPage() {
                     disabled={exportLoading}
                   >
                     {exportLoading ? '...' : 'Экспорт в Excel'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-primary btn-sm"
+                    onClick={() => openExportModal(selectedId)}
+                    disabled={!selectedId}
+                  >
+                    Экспорт HTML
                   </button>
                   {isAdmin && (
                     <div className="btn-group btn-group-sm">
@@ -737,6 +866,12 @@ export default function AdminCollectionsPage() {
                           {docChatCollectionId === col.id ? '…' : 'Обработать для чата'}
                         </button>
                         <button
+                          className="btn btn-sm btn-outline-primary"
+                          onClick={() => openExportModal(col.id)}
+                        >
+                          Экспорт HTML
+                        </button>
+                        <button
                           className="btn btn-sm btn-outline-danger"
                           onClick={() => deleteCollectionById(col.id)}
                           disabled={deletingCollectionId === col.id}
@@ -774,6 +909,84 @@ export default function AdminCollectionsPage() {
         </div>
       </div>
     </div>
-  </div>
-)
+      {exportModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Экспорт коллекции"
+          onClick={event => {
+            if (event.target === event.currentTarget) {
+              if (exportState.status !== 'running' && exportState.status !== 'starting') {
+                resetExportState()
+              }
+              setExportModalOpen(false)
+            }
+          }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1060 }}
+        >
+          <div className="card" role="document" style={{ width: '520px', maxWidth: '96vw', background: 'var(--surface)', borderColor: 'var(--border)' }}>
+            <div className="card-header d-flex justify-content-between align-items-center">
+              <div className="fw-semibold">Экспорт коллекции</div>
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                onClick={() => {
+                  if (exportState.status !== 'running' && exportState.status !== 'starting') {
+                    resetExportState()
+                  }
+                  setExportModalOpen(false)
+                }}
+              >
+                Закрыть
+              </button>
+            </div>
+            <div className="card-body">
+              <div className="d-flex align-items-center gap-2 mb-3">
+                <input
+                  id="exportIncludeFiles"
+                  type="checkbox"
+                  checked={exportIncludeFiles}
+                  disabled={exportState.status === 'running' || exportState.status === 'starting'}
+                  onChange={event => setExportIncludeFiles(event.target.checked)}
+                />
+                <label htmlFor="exportIncludeFiles" className="form-label mb-0">Включать файлы в архив</label>
+              </div>
+
+              {exportState.status === 'idle' && (
+                <button className="btn btn-primary" onClick={startExportHtml}>
+                  Начать экспорт
+                </button>
+              )}
+
+              {(exportState.status === 'starting' || exportState.status === 'running') && (
+                <>
+                  <div className="mb-2">
+                    <div className="progress" style={{ height: 10 }}>
+                      <div className="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style={{ width: `${Math.max(5, exportState.progress || 0)}%` }} />
+                    </div>
+                  </div>
+                  <div className="text-muted">
+                    {exportState.label || 'Экспорт…'}
+                    {exportState.total ? ` · ${exportState.processed || 0}/${exportState.total}` : ''}
+                  </div>
+                </>
+              )}
+
+              {exportState.status === 'ready' && (
+                <div className="d-flex flex-column gap-2">
+                  <div className="text-success">Экспорт готов.</div>
+                  {exportState.downloadUrl && (
+                    <a className="btn btn-success" href={exportState.downloadUrl}>Скачать архив</a>
+                  )}
+                </div>
+              )}
+
+              {exportState.status === 'error' && (
+                <div className="text-danger">Ошибка экспорта: {exportState.error || 'Неизвестная ошибка'}</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
 }

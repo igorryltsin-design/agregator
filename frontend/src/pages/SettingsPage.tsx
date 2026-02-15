@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
+import AdminFacetSettingsPage from './AdminFacetSettingsPage'
 import type { MaterialTypeDefinition } from '../utils/materialTypesStore'
 import { loadMaterialTypes } from '../utils/materialTypesStore'
 
@@ -20,6 +20,8 @@ type LlmEndpointInfo = {
   base_url: string
   model: string
   weight: number
+  context_length?: number | null
+  instances?: number
   purpose?: string | null
   purposes?: string[]
   provider?: string
@@ -28,6 +30,22 @@ type LlmPurposeOption = { id: string; label: string }
 type LlmProviderOption = { id: string; label: string }
 type AiwordAccessUser = { user_id: number; username?: string | null; full_name?: string | null }
 type UserSuggestion = { id: number; username: string; full_name?: string | null }
+type RuntimeField = {
+  name: string
+  api_key?: string
+  group: string
+  type: string
+  description: string
+  env_key?: string | null
+  runtime_mutable: boolean
+  visibility?: 'ui_safe' | 'ui_expert' | 'env_only'
+  restart_required?: boolean
+  constraints?: Record<string, any>
+  ui_component?: string
+  depends_on?: Record<string, any> | null
+  risk_level?: 'low' | 'medium' | 'high'
+  value: any
+}
 type Settings = {
   scan_root: string
   extract_text: boolean
@@ -50,6 +68,13 @@ type Settings = {
   audio_keywords_llm: boolean
   vision_images: boolean
   kw_to_tags: boolean
+  doc_chat_chunk_max_tokens: number
+  doc_chat_chunk_overlap: number
+  doc_chat_chunk_min_tokens: number
+  doc_chat_max_chunks: number
+  doc_chat_fallback_chunks: number
+  doc_chat_image_min_width: number
+  doc_chat_image_min_height: number
   type_detect_flow: string
   type_llm_override: boolean
   import_subdir: string
@@ -74,6 +99,11 @@ type Settings = {
   default_prune?: boolean
   type_dirs?: Record<string, string>
   material_types?: MaterialTypeDefinition[]
+  runtime_fields?: RuntimeField[]
+  settings_hub_v2_enabled?: boolean
+  database_dialect?: 'sqlite' | 'postgresql' | string
+  database_uri?: string
+  database_type_options?: string[]
 }
 
 const fallbackPromptDefaults: Record<string, string> = {
@@ -104,6 +134,149 @@ const sanitizeStringArray = (value: any): string[] => {
 const parseListInput = (value: string): string[] => value.split(/[,;\n]/).map(token => token.trim()).filter(Boolean)
 
 const formatListInput = (value?: string[]): string => (Array.isArray(value) && value.length ? value.join(', ') : '')
+
+const runtimeGroupLabels: Record<string, string> = {
+  llm: 'LLM',
+  llm_pool: 'LLM Pool',
+  rag: 'RAG',
+  doc_chat: 'Чат по документу',
+  scan: 'Сканирование',
+  ocr: 'OCR',
+  transcription: 'Транскрибация',
+  vision: 'Vision',
+  cache: 'Кеши',
+  facets: 'Фасеты',
+  type_detection: 'Определение типов',
+  feedback: 'Feedback',
+  prompts: 'Промпты',
+  general: 'Общие',
+  system: 'Система',
+  security: 'Безопасность',
+}
+
+const runtimeFieldI18n: Record<string, { label: string; description: string }> = {
+  lmstudio_api_base: { label: 'Базовый URL LLM API', description: 'Адрес OpenAI-совместимого endpoint для LLM-запросов.' },
+  lmstudio_model: { label: 'Модель LLM по умолчанию', description: 'Имя модели, используемой в маршруте по умолчанию.' },
+  lmstudio_api_key: { label: 'API-ключ LLM', description: 'Ключ доступа к LLM endpoint.' },
+  lm_default_provider: { label: 'Провайдер LLM по умолчанию', description: 'Провайдер, используемый как fallback для LLM-маршрута.' },
+  lm_max_input_chars: { label: 'Максимум символов во входе LLM', description: 'Ограничение длины текста перед отправкой в модель.' },
+  lm_max_output_tokens: { label: 'Максимум выходных токенов LLM', description: 'Ограничение размера ответа модели.' },
+  ai_rerank_llm: { label: 'LLM-реранжирование', description: 'Использовать LLM для реранжирования результатов поиска.' },
+  azure_openai_api_version: { label: 'Версия Azure OpenAI API', description: 'Версия API для совместимых Azure endpoint.' },
+  llm_pool_global_concurrency: { label: 'Глобальная конкуррентность LLM-пула', description: 'Сколько LLM-задач может выполняться одновременно во всем приложении.' },
+  llm_pool_per_user_concurrency: { label: 'Конкуррентность LLM-пула на пользователя', description: 'Сколько LLM-задач одновременно разрешено одному пользователю.' },
+  llm_queue_max_size: { label: 'Максимальный размер LLM-очереди', description: 'Общий лимит задач в очереди LLM.' },
+  llm_queue_per_user_max: { label: 'Лимит LLM-очереди на пользователя', description: 'Максимум задач LLM в очереди для одного пользователя.' },
+  llm_request_timeout_sec: { label: 'Таймаут LLM-запроса (сек)', description: 'Максимальное время ожидания ответа LLM.' },
+  llm_retry_count: { label: 'Количество повторов LLM-запроса', description: 'Сколько раз повторять запрос при временных ошибках.' },
+  llm_retry_backoff_ms: { label: 'Задержка между повторами (мс)', description: 'Пауза перед повторным LLM-запросом.' },
+  lmstudio_idle_unload_minutes: { label: 'Автовыгрузка моделей LM Studio (мин)', description: 'Через сколько минут простоя выгружать все модели из LM Studio. 0 — отключено.' },
+  rag_embedding_backend: { label: 'RAG backend эмбеддингов', description: 'Источник/механизм генерации эмбеддингов для RAG.' },
+  rag_embedding_model: { label: 'RAG модель эмбеддингов', description: 'Имя модели эмбеддингов.' },
+  rag_embedding_dim: { label: 'Размерность эмбеддингов', description: 'Длина вектора эмбеддинга.' },
+  rag_embedding_batch_size: { label: 'Batch эмбеддингов', description: 'Сколько элементов обрабатывать за один запрос эмбеддингов.' },
+  rag_embedding_device: { label: 'Устройство эмбеддингов', description: 'Устройство для локальных эмбеддингов (например, cpu/cuda:0).' },
+  rag_embedding_endpoint: { label: 'Endpoint эмбеддингов', description: 'URL endpoint для получения эмбеддингов.' },
+  rag_embedding_api_key: { label: 'API-ключ эмбеддингов', description: 'Ключ доступа к endpoint эмбеддингов.' },
+  rag_rerank_backend: { label: 'RAG backend реранкера', description: 'Бэкенд для реранжирования RAG-кандидатов.' },
+  rag_rerank_model: { label: 'RAG модель реранкера', description: 'Имя модели реранкера.' },
+  rag_rerank_device: { label: 'Устройство реранкера', description: 'Устройство выполнения реранкера.' },
+  rag_rerank_batch_size: { label: 'Batch реранкера', description: 'Размер пакета при реранжировании.' },
+  rag_rerank_max_length: { label: 'Максимальная длина реранкера', description: 'Максимальная длина входа в реранкер.' },
+  rag_rerank_max_chars: { label: 'Максимум символов на фрагмент', description: 'Лимит символов фрагмента для реранжирования.' },
+  ai_query_variants_max: { label: 'Максимум вариантов запроса', description: 'Сколько вариантов запроса генерировать для AI-поиска.' },
+  ai_rag_retry_enabled: { label: 'Автоповтор RAG', description: 'Повторять RAG с расширением контекста при низкой уверенности.' },
+  ai_rag_retry_threshold: { label: 'Порог автоповтора RAG', description: 'Порог уверенности, ниже которого запускается повтор.' },
+  doc_chat_chunk_max_tokens: { label: 'DocChat: максимум токенов чанка', description: 'Максимальный размер чанка в токенах.' },
+  doc_chat_chunk_overlap: { label: 'DocChat: перекрытие чанков', description: 'Сколько токенов повторяется между соседними чанками.' },
+  doc_chat_chunk_min_tokens: { label: 'DocChat: минимум токенов чанка', description: 'Минимальный размер чанка в токенах.' },
+  doc_chat_max_chunks: { label: 'DocChat: лимит чанков', description: 'Максимум чанков в контексте (0 — без ограничения).' },
+  doc_chat_fallback_chunks: { label: 'DocChat: fallback чанки', description: 'Дополнительные чанки при слабом основном результате.' },
+  doc_chat_image_min_width: { label: 'DocChat: мин. ширина изображения', description: 'Минимальная ширина изображения для анализа.' },
+  doc_chat_image_min_height: { label: 'DocChat: мин. высота изображения', description: 'Минимальная высота изображения для анализа.' },
+  scan_root: { label: 'Корневая папка сканирования', description: 'Базовый каталог, который сканирует индексатор.' },
+  extract_text: { label: 'Извлекать текст', description: 'Извлекать текст из документов во время сканирования.' },
+  import_subdir: { label: 'Подпапка импорта', description: 'Имя подпапки для импортируемых файлов.' },
+  collections_in_separate_dirs: { label: 'Коллекции в отдельных папках', description: 'Хранить коллекции в отдельных директориях.' },
+  collection_type_subdirs: { label: 'Подпапки по типам', description: 'Создавать подпапки по типам материалов внутри коллекции.' },
+  move_on_rename: { label: 'Перемещать при переименовании', description: 'Перемещать файл при изменении его имени/пути.' },
+  default_use_llm: { label: 'LLM по умолчанию при переиндексации', description: 'Использовать LLM-обработку при запуске сканирования.' },
+  default_prune: { label: 'Удалять отсутствующие файлы', description: 'Удалять из каталога записи для пропавших файлов.' },
+  ocr_langs: { label: 'OCR языки', description: 'Языки OCR в формате tesseract, например rus+eng.' },
+  pdf_ocr_pages: { label: 'Количество OCR-страниц PDF', description: 'Сколько страниц PDF обрабатывать OCR.' },
+  always_ocr_first_page_dissertation: { label: 'OCR первой страницы диссертаций', description: 'Всегда распознавать первую страницу диссертации.' },
+  transcribe_enabled: { label: 'Транскрибация включена', description: 'Включить распознавание аудио.' },
+  transcribe_backend: { label: 'Бэкенд транскрибации', description: 'Движок, используемый для распознавания аудио.' },
+  transcribe_model_path: { label: 'Модель/путь транскрибации', description: 'Путь или идентификатор модели транскрибации.' },
+  transcribe_language: { label: 'Язык транскрибации', description: 'Язык распознавания аудио по умолчанию.' },
+  summarize_audio: { label: 'Суммаризация аудио', description: 'Генерировать краткое содержание после транскрибации.' },
+  audio_keywords_llm: { label: 'Ключевые слова из аудио через LLM', description: 'Извлекать ключевые слова из аудио с помощью LLM.' },
+  images_vision_enabled: { label: 'Vision-анализ изображений', description: 'Разрешить анализ изображений через LLM vision.' },
+  keywords_to_tags_enabled: { label: 'Ключевые слова в теги', description: 'Конвертировать извлеченные ключевые слова в теги.' },
+  llm_cache_enabled: { label: 'LLM-кеш включен', description: 'Кешировать ответы LLM.' },
+  llm_cache_ttl_seconds: { label: 'TTL LLM-кеша (сек)', description: 'Время жизни записей LLM-кеша.' },
+  llm_cache_max_items: { label: 'Лимит элементов LLM-кеша', description: 'Максимальное число записей в LLM-кеше.' },
+  llm_cache_only_mode: { label: 'Только LLM-кеш', description: 'Не ходить в API, использовать только кеш.' },
+  search_cache_enabled: { label: 'Кеш поиска включен', description: 'Кешировать результаты поиска.' },
+  search_cache_ttl_seconds: { label: 'TTL кеша поиска (сек)', description: 'Время жизни записей кеша поиска.' },
+  search_cache_max_items: { label: 'Лимит элементов кеша поиска', description: 'Максимум записей в кеше поиска.' },
+  search_facet_tag_keys: { label: 'Разрешенные теги фасетов поиска', description: 'Список ключей тегов для фасетов поиска.' },
+  graph_facet_tag_keys: { label: 'Разрешенные теги фасетов графа', description: 'Список ключей тегов для фасетов графа.' },
+  search_facet_include_types: { label: 'Фасет типов в поиске', description: 'Показывать фасет по типам материалов.' },
+  type_detect_flow: { label: 'Пайплайн определения типа', description: 'Порядок этапов определения типа документа.' },
+  type_llm_override: { label: 'LLM может переопределять тип', description: 'Разрешить LLM менять тип после правил.' },
+  type_dirs: { label: 'Сопоставление типов и папок', description: 'Карта type -> директория хранения.' },
+  material_types: { label: 'Профили типов материалов', description: 'Набор правил и параметров классификации типов.' },
+  feedback_train_interval_hours: { label: 'Интервал обучения feedback (ч)', description: 'Как часто запускать дообучение по обратной связи.' },
+  feedback_train_cutoff_days: { label: 'Глубина feedback-данных (дни)', description: 'За сколько дней брать данные для обучения.' },
+  prompts: { label: 'Промпты', description: 'Кастомные промпты для LLM-задач.' },
+}
+
+const getRuntimeFieldLabel = (field: RuntimeField): string =>
+  runtimeFieldI18n[field.name]?.label || field.name
+
+const getRuntimeFieldDescription = (field: RuntimeField): string =>
+  runtimeFieldI18n[field.name]?.description || field.description || 'Без описания'
+
+const SAFE_GROUPS = new Set(['scan', 'ocr', 'llm', 'rag', 'doc_chat', 'transcription', 'vision'])
+const EXPERT_GROUPS = new Set(['llm_pool', 'cache', 'feedback', 'type_detection', 'prompts', 'general', 'system', 'security'])
+
+const stableStringify = (value: any): string => {
+  if (value === undefined) return 'undefined'
+  try {
+    return JSON.stringify(value, Object.keys(value || {}).sort())
+  } catch {
+    return String(value)
+  }
+}
+
+const normalizeRuntimeValue = (field: RuntimeField, raw: string | boolean): any => {
+  const type = (field.type || '').toLowerCase()
+  if (type.includes('bool')) {
+    return typeof raw === 'boolean' ? raw : String(raw).trim().toLowerCase() === 'true'
+  }
+  if (type.includes('int')) {
+    const parsed = parseInt(String(raw), 10)
+    return Number.isFinite(parsed) ? parsed : field.value
+  }
+  if (type.includes('float')) {
+    const parsed = parseFloat(String(raw))
+    return Number.isFinite(parsed) ? parsed : field.value
+  }
+  if (type.includes('list') || type.includes('dict') || type.includes('optional')) {
+    const text = String(raw ?? '').trim()
+    if (!text) return null
+    try {
+      return JSON.parse(text)
+    } catch {
+      if (type.includes('list')) {
+        return text.split(/[,;\n]/).map(token => token.trim()).filter(Boolean)
+      }
+      return text
+    }
+  }
+  return raw
+}
 
 const createEmptyMaterialType = (): MaterialTypeDefinition => ({
   key: '',
@@ -244,6 +417,27 @@ const normalizeSettings = (raw: any): Settings => {
     audio_keywords_llm: boolVal(raw?.audio_keywords_llm, true),
     vision_images: boolVal(raw?.vision_images, false),
     kw_to_tags: boolVal(raw?.kw_to_tags, true),
+    doc_chat_chunk_max_tokens: Number.isFinite(raw?.doc_chat_chunk_max_tokens)
+      ? Number(raw.doc_chat_chunk_max_tokens)
+      : 700,
+    doc_chat_chunk_overlap: Number.isFinite(raw?.doc_chat_chunk_overlap)
+      ? Number(raw.doc_chat_chunk_overlap)
+      : 120,
+    doc_chat_chunk_min_tokens: Number.isFinite(raw?.doc_chat_chunk_min_tokens)
+      ? Number(raw.doc_chat_chunk_min_tokens)
+      : 80,
+    doc_chat_max_chunks: Number.isFinite(raw?.doc_chat_max_chunks)
+      ? Number(raw.doc_chat_max_chunks)
+      : 0,
+    doc_chat_fallback_chunks: Number.isFinite(raw?.doc_chat_fallback_chunks)
+      ? Number(raw.doc_chat_fallback_chunks)
+      : 0,
+    doc_chat_image_min_width: Number.isFinite(raw?.doc_chat_image_min_width)
+      ? Number(raw.doc_chat_image_min_width)
+      : 0,
+    doc_chat_image_min_height: Number.isFinite(raw?.doc_chat_image_min_height)
+      ? Number(raw.doc_chat_image_min_height)
+      : 0,
     type_detect_flow: String(raw?.type_detect_flow || 'extension,filename,heuristics,llm'),
     type_llm_override: boolVal(raw?.type_llm_override, true),
     import_subdir: String(raw?.import_subdir || 'import'),
@@ -273,6 +467,11 @@ const normalizeSettings = (raw: any): Settings => {
     default_prune: boolVal(raw?.default_prune, true),
     type_dirs: raw?.type_dirs || {},
     material_types: materialTypes,
+    runtime_fields: Array.isArray(raw?.runtime_fields) ? raw.runtime_fields : [],
+    settings_hub_v2_enabled: raw?.settings_hub_v2_enabled !== false,
+    database_dialect: String(raw?.database_dialect || 'sqlite'),
+    database_uri: String(raw?.database_uri || ''),
+    database_type_options: Array.isArray(raw?.database_type_options) ? raw.database_type_options : ['sqlite', 'postgresql'],
   }
 }
 
@@ -296,6 +495,33 @@ export default function SettingsPage() {
   const [aiwordOptions, setAiwordOptions] = useState<UserSuggestion[]>([])
   const [aiwordLoading, setAiwordLoading] = useState(false)
   const [llmWeights, setLlmWeights] = useState<Record<number, string>>({})
+  const [llmContextDrafts, setLlmContextDrafts] = useState<Record<number, string>>({})
+  const [llmInstancesDrafts, setLlmInstancesDrafts] = useState<Record<number, string>>({})
+  const [lmstudioProbeUrl, setLmstudioProbeUrl] = useState('')
+  const [lmstudioLoading, setLmstudioLoading] = useState(false)
+  const [lmstudioModelsByBase, setLmstudioModelsByBase] = useState<Record<string, Array<{ id: string; name: string; loaded?: boolean | null }>>>({})
+  const [newMappingPurpose, setNewMappingPurpose] = useState('default')
+  const [newMappingModel, setNewMappingModel] = useState('')
+  const [newMappingName, setNewMappingName] = useState('')
+  const [newMappingWeight, setNewMappingWeight] = useState('1')
+  const [newMappingProvider, setNewMappingProvider] = useState('openai')
+  const [newMappingContext, setNewMappingContext] = useState('')
+  const [newMappingInstances, setNewMappingInstances] = useState('1')
+  const [activeTab, setActiveTab] = useState<'safe' | 'expert' | 'llm' | 'facets'>('safe')
+  const [runtimeSearch, setRuntimeSearch] = useState('')
+  const [runtimeChangedOnly, setRuntimeChangedOnly] = useState(false)
+  const [runtimeBaseline, setRuntimeBaseline] = useState<Record<string, any>>({})
+  const [dbType, setDbType] = useState<'sqlite' | 'postgresql'>('sqlite')
+  const [pgBackupFormat, setPgBackupFormat] = useState<'dump' | 'sql'>('dump')
+  const [migrationSqlitePath, setMigrationSqlitePath] = useState('catalogue.db')
+  const [migrationPgUrl, setMigrationPgUrl] = useState('')
+  const [migrationPgHost, setMigrationPgHost] = useState('localhost')
+  const [migrationPgPort, setMigrationPgPort] = useState('5432')
+  const [migrationPgDb, setMigrationPgDb] = useState('agregator')
+  const [migrationPgUser, setMigrationPgUser] = useState('agregator')
+  const [migrationPgPassword, setMigrationPgPassword] = useState('')
+  const [migrationMode, setMigrationMode] = useState<'dry-run' | 'run'>('dry-run')
+  const [migrationBusy, setMigrationBusy] = useState(false)
 
   useEffect(() => {
     if (!isAdmin) return
@@ -313,8 +539,27 @@ export default function SettingsPage() {
         const data = await r.json().catch(() => ({}))
         const normalized = normalizeSettings(data)
         setS(normalized)
+        const baseline: Record<string, any> = {}
+        ;(normalized.runtime_fields || []).forEach((field) => {
+          baseline[field.name] = field.value
+        })
+        setRuntimeBaseline(baseline)
         setReindexUseLLM(boolVal(normalized.default_use_llm, true))
         setReindexPrune(boolVal(normalized.default_prune, true))
+        setDbType((normalized.database_dialect === 'postgresql' ? 'postgresql' : 'sqlite'))
+        const uri = normalized.database_uri || ''
+        setMigrationPgUrl(uri)
+        if (uri) {
+          try {
+            const parsed = new URL(uri)
+            setMigrationPgHost(parsed.hostname || 'localhost')
+            setMigrationPgPort(parsed.port || '5432')
+            setMigrationPgDb((parsed.pathname || '/agregator').replace(/^\//, '') || 'agregator')
+            setMigrationPgUser(parsed.username ? decodeURIComponent(parsed.username) : 'agregator')
+          } catch {
+            // keep defaults when URI is not parseable
+          }
+        }
       } catch {
         if (!cancelled) {
           setError('Не удалось загрузить настройки')
@@ -327,11 +572,19 @@ export default function SettingsPage() {
   useEffect(() => {
     if (!s?.llm_endpoints) {
       setLlmWeights({})
+      setLlmContextDrafts({})
+      setLlmInstancesDrafts({})
       return
     }
     const map: Record<number, string> = {}
+    const contextMap: Record<number, string> = {}
+    const instancesMap: Record<number, string> = {}
     s.llm_endpoints.forEach(ep => { map[ep.id] = String(ep.weight ?? 1) })
+    s.llm_endpoints.forEach(ep => { contextMap[ep.id] = ep.context_length ? String(ep.context_length) : '' })
+    s.llm_endpoints.forEach(ep => { instancesMap[ep.id] = String(ep.instances ?? 1) })
     setLlmWeights(map)
+    setLlmContextDrafts(contextMap)
+    setLlmInstancesDrafts(instancesMap)
   }, [s?.llm_endpoints])
 
   const assignedAiwordIds = useMemo(() => new Set((s?.aiword_users || []).map(u => u.user_id)), [s?.aiword_users])
@@ -382,6 +635,12 @@ export default function SettingsPage() {
     }
     return Array.from(map.values())
   }, [s?.llm_providers, s?.lm_provider])
+  useEffect(() => {
+    if (!llmProviderOptions.length) return
+    if (!llmProviderOptions.some(opt => opt.id === newMappingProvider)) {
+      setNewMappingProvider(llmProviderOptions[0].id)
+    }
+  }, [llmProviderOptions, newMappingProvider])
   const llmProviderLabels = useMemo(() => {
     const map = new Map<string, string>()
     llmProviderOptions.forEach(opt => map.set(opt.id, opt.label))
@@ -469,7 +728,11 @@ export default function SettingsPage() {
     }
   }, [aiwordQuery, assignedAiwordIds, isAdmin])
 
-  const patchLlmEndpoint = useCallback(async (id: number, payload: Record<string, unknown>): Promise<LlmEndpointInfo | null> => {
+  const patchLlmEndpoint = useCallback(async (
+    id: number,
+    payload: Record<string, unknown>,
+    successMessage = 'LLM обновлена',
+  ): Promise<LlmEndpointInfo | null> => {
     try {
       const r = await fetch(`/api/admin/llm-endpoints/${id}`, {
         method: 'PATCH',
@@ -478,7 +741,7 @@ export default function SettingsPage() {
       })
       const data = await r.json().catch(() => ({}))
       if (r.ok && data?.ok && data.item) {
-        toasts.push('LLM обновлена', 'success')
+        toasts.push(successMessage, 'success')
         return data.item as LlmEndpointInfo
       }
       toasts.push(data?.error || 'Не удалось обновить LLM', 'error')
@@ -536,6 +799,154 @@ export default function SettingsPage() {
     }
   }, [patchLlmEndpoint, s])
 
+  const probeLmstudioModels = useCallback(async (baseUrlRaw?: string, endpointId?: number) => {
+    const baseUrl = (baseUrlRaw || lmstudioProbeUrl || '').trim()
+    if (!baseUrl) {
+      toasts.push('Укажите base URL LM Studio', 'error')
+      return
+    }
+    setLmstudioLoading(true)
+    try {
+      const query = new URLSearchParams({ base_url: baseUrl })
+      if (endpointId) query.set('endpoint_id', String(endpointId))
+      const r = await fetch(`/api/admin/lmstudio/models?${query.toString()}`)
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data?.ok) {
+        throw new Error(data?.error || 'Не удалось получить список моделей LM Studio')
+      }
+      const items = Array.isArray(data.items) ? data.items : []
+      setLmstudioModelsByBase(prev => ({ ...prev, [baseUrl]: items }))
+      if (!newMappingModel && items.length > 0) {
+        setNewMappingModel(String(items[0].id || ''))
+      }
+      toasts.push(`Получено моделей: ${items.length}`, 'success')
+    } catch (error: any) {
+      toasts.push(String(error?.message || error || 'Ошибка проверки моделей'), 'error')
+    } finally {
+      setLmstudioLoading(false)
+    }
+  }, [lmstudioProbeUrl, newMappingModel, toasts])
+
+  const loadLmstudioModel = useCallback(async (endpoint: LlmEndpointInfo) => {
+    try {
+      const contextRaw = llmContextDrafts[endpoint.id]
+      const instancesRaw = llmInstancesDrafts[endpoint.id]
+      const payload: Record<string, unknown> = { endpoint_id: endpoint.id }
+      if (contextRaw && Number.isFinite(Number(contextRaw)) && Number(contextRaw) > 0) {
+        payload.context_length = Math.max(256, parseInt(contextRaw, 10))
+      }
+      if (instancesRaw && Number.isFinite(Number(instancesRaw)) && Number(instancesRaw) > 0) {
+        payload.instances = Math.max(1, parseInt(instancesRaw, 10))
+      }
+      const r = await fetch('/api/admin/lmstudio/models/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data?.ok) {
+        throw new Error(data?.error || 'Не удалось загрузить модель в LM Studio')
+      }
+      toasts.push(`Модель ${endpoint.model} загружена`, 'success')
+      await probeLmstudioModels(endpoint.base_url, endpoint.id)
+    } catch (error: any) {
+      toasts.push(String(error?.message || error || 'Ошибка загрузки модели'), 'error')
+    }
+  }, [llmContextDrafts, llmInstancesDrafts, probeLmstudioModels, toasts])
+
+  const unloadLmstudioModel = useCallback(async (endpoint: LlmEndpointInfo) => {
+    try {
+      const r = await fetch('/api/admin/lmstudio/models/unload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint_id: endpoint.id }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data?.ok) {
+        throw new Error(data?.error || 'Не удалось выгрузить модель из LM Studio')
+      }
+      toasts.push(`Модель ${endpoint.model} выгружена`, 'success')
+      await probeLmstudioModels(endpoint.base_url, endpoint.id)
+    } catch (error: any) {
+      toasts.push(String(error?.message || error || 'Ошибка выгрузки модели'), 'error')
+    }
+  }, [probeLmstudioModels, toasts])
+
+  const createTaskMapping = useCallback(async () => {
+    const baseUrl = (lmstudioProbeUrl || '').trim()
+    if (!baseUrl) {
+      toasts.push('Укажите Base URL LM Studio', 'error')
+      return
+    }
+    if (!newMappingModel.trim()) {
+      toasts.push('Выберите модель из списка', 'error')
+      return
+    }
+    const purpose = (newMappingPurpose || 'default').trim()
+    const name = (newMappingName || `${purpose}:${newMappingModel}`).trim()
+    const payload: Record<string, unknown> = {
+      name,
+      base_url: baseUrl,
+      model: newMappingModel.trim(),
+      weight: parseFloat(newMappingWeight || '1') || 1,
+      purposes: [purpose],
+      provider: newMappingProvider || 'openai',
+    }
+    if (newMappingContext.trim()) {
+      payload.context_length = Math.max(256, parseInt(newMappingContext, 10) || 0)
+    }
+    if (newMappingInstances.trim()) {
+      payload.instances = Math.max(1, parseInt(newMappingInstances, 10) || 1)
+    }
+    try {
+      const r = await fetch('/api/admin/llm-endpoints', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data?.ok || !data.item) {
+        throw new Error(data?.error || 'Не удалось создать маршрут задачи')
+      }
+      setS(prev => {
+        if (!prev) return prev
+        return { ...prev, llm_endpoints: [data.item as LlmEndpointInfo, ...(prev.llm_endpoints || [])] }
+      })
+      setNewMappingName('')
+      toasts.push('Маршрут задачи добавлен', 'success')
+    } catch (error: any) {
+      toasts.push(String(error?.message || error || 'Ошибка добавления маршрута'), 'error')
+    }
+  }, [
+    lmstudioProbeUrl,
+    newMappingModel,
+    newMappingPurpose,
+    newMappingName,
+    newMappingWeight,
+    newMappingProvider,
+    newMappingContext,
+    newMappingInstances,
+    toasts,
+  ])
+
+  const removeTaskMapping = useCallback(async (endpointId: number) => {
+    if (!window.confirm('Удалить этот маршрут задачи?')) return
+    try {
+      const r = await fetch(`/api/admin/llm-endpoints/${endpointId}`, { method: 'DELETE' })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data?.ok) {
+        throw new Error(data?.error || 'Не удалось удалить маршрут задачи')
+      }
+      setS(prev => {
+        if (!prev) return prev
+        return { ...prev, llm_endpoints: (prev.llm_endpoints || []).filter(ep => ep.id !== endpointId) }
+      })
+      toasts.push('Маршрут удалён', 'success')
+    } catch (error: any) {
+      toasts.push(String(error?.message || error || 'Ошибка удаления маршрута'), 'error')
+    }
+  }, [toasts])
+
   const addAiwordUser = useCallback((entry: UserSuggestion) => {
     if (!s || assignedAiwordIds.has(entry.id)) return
     const nextEntry: AiwordAccessUser = { user_id: entry.id, username: entry.username, full_name: entry.full_name }
@@ -579,6 +990,23 @@ export default function SettingsPage() {
 
   const save = async () => {
     if (!s) return
+    const isChanged = (field: RuntimeField) => stableStringify(runtimeBaseline[field.name]) !== stableStringify(field.value)
+    const changedRuntime = (s.runtime_fields || []).filter(isChanged)
+    if (changedRuntime.length) {
+      const preview = changedRuntime.slice(0, 12).map(field => {
+        const before = runtimeBaseline[field.name]
+        const after = field.value
+        return `${field.name}: ${JSON.stringify(before)} -> ${JSON.stringify(after)}`
+      }).join('\n')
+      const restartHint = changedRuntime.some(field => field.restart_required)
+        ? '\n\nЧасть изменений требует перезапуска сервиса.'
+        : ''
+      const riskHint = changedRuntime.some(field => field.risk_level === 'high')
+        ? '\nЕсть high-risk параметры, проверьте значения.'
+        : ''
+      const approved = window.confirm(`Изменения runtime-полей (${changedRuntime.length}):\n${preview}${restartHint}${riskHint}\n\nСохранить?`)
+      if (!approved) return
+    }
     setSaving(true)
     try {
       const { llm_endpoints, llm_purposes, llm_providers, aiword_users, prompt_defaults: _promptDefaults, ...rest } = s
@@ -605,13 +1033,35 @@ export default function SettingsPage() {
       payload.rag_embedding_device = (payload.rag_embedding_device || '').trim()
       payload.rag_embedding_endpoint = (payload.rag_embedding_endpoint || '').trim()
       payload.rag_embedding_api_key = (payload.rag_embedding_api_key || '').trim()
+      const chunkMaxTokensRaw = parseInt(String(payload.doc_chat_chunk_max_tokens ?? ''), 10)
+      payload.doc_chat_chunk_max_tokens = Number.isFinite(chunkMaxTokensRaw) ? Math.max(16, chunkMaxTokensRaw) : 700
+      const chunkOverlapRaw = parseInt(String(payload.doc_chat_chunk_overlap ?? ''), 10)
+      payload.doc_chat_chunk_overlap = Number.isFinite(chunkOverlapRaw) ? Math.max(0, chunkOverlapRaw) : 120
+      const chunkMinTokensRaw = parseInt(String(payload.doc_chat_chunk_min_tokens ?? ''), 10)
+      payload.doc_chat_chunk_min_tokens = Number.isFinite(chunkMinTokensRaw) ? Math.max(1, chunkMinTokensRaw) : 80
+      const docChatMaxChunksRaw = parseInt(String(payload.doc_chat_max_chunks ?? ''), 10)
+      payload.doc_chat_max_chunks = Number.isFinite(docChatMaxChunksRaw) ? Math.max(0, docChatMaxChunksRaw) : 0
+      const docChatFallbackRaw = parseInt(String(payload.doc_chat_fallback_chunks ?? ''), 10)
+      payload.doc_chat_fallback_chunks = Number.isFinite(docChatFallbackRaw) ? Math.max(0, docChatFallbackRaw) : 0
+      const imgWidthRaw = parseInt(String(payload.doc_chat_image_min_width ?? ''), 10)
+      payload.doc_chat_image_min_width = Number.isFinite(imgWidthRaw) ? Math.max(0, imgWidthRaw) : 0
+      const imgHeightRaw = parseInt(String(payload.doc_chat_image_min_height ?? ''), 10)
+      payload.doc_chat_image_min_height = Number.isFinite(imgHeightRaw) ? Math.max(0, imgHeightRaw) : 0
       const preparedMaterialTypes = (payload.material_types || [])
         .map((item: MaterialTypeDefinition) => prepareMaterialTypeForSave(item))
         .filter((item): item is Record<string, any> => Boolean(item))
       payload.material_types = preparedMaterialTypes
+      const runtimeFieldsPayload: Record<string, any> = {}
+      for (const field of s.runtime_fields || []) {
+        runtimeFieldsPayload[field.name] = field.value
+      }
+      payload.runtime_fields = runtimeFieldsPayload
       const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       if (r.ok) {
         setS(prev => prev ? { ...prev, material_types: preparedMaterialTypes.map(normalizeMaterialTypeDefinition) } : prev)
+        const baseline: Record<string, any> = {}
+        ;(s.runtime_fields || []).forEach((field) => { baseline[field.name] = field.value })
+        setRuntimeBaseline(baseline)
         toasts.push('Настройки сохранены', 'success')
         loadMaterialTypes(true).catch(() => {})
       } else {
@@ -639,12 +1089,25 @@ export default function SettingsPage() {
 
   const backupDb = async () => {
     try {
-      const r = await fetch('/admin/backup-db', { method: 'POST' })
-      if (!r.ok) { alert('Ошибка резервного копирования'); return }
+      const payload = {
+        db_type: dbType,
+        format: dbType === 'postgresql' ? pgBackupFormat : 'db',
+      }
+      const r = await fetch('/admin/backup-db', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!r.ok) {
+        const msg = await r.json().then(v => v?.error || '').catch(() => '')
+        alert(msg || 'Ошибка резервного копирования')
+        return
+      }
       const blob = await r.blob()
       const a = document.createElement('a')
       a.href = URL.createObjectURL(blob)
-      a.download = 'catalogue_backup.db'
+      const ext = dbType === 'postgresql' ? (pgBackupFormat === 'sql' ? 'sql' : 'dump') : 'db'
+      a.download = `catalogue_backup.${ext}`
       a.click()
     } catch {
       alert('Ошибка резервного копирования')
@@ -664,11 +1127,51 @@ export default function SettingsPage() {
   const importDb = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     const fd = new FormData(e.currentTarget)
+    fd.set('db_type', dbType)
     try {
       const r = await fetch('/admin/import-db', { method: 'POST', body: fd })
-      alert(r.ok ? 'Импорт завершён. Перезапустите приложение.' : 'Ошибка импорта')
+      if (r.ok) {
+        alert('Импорт завершён. Перезапустите приложение.')
+        return
+      }
+      const msg = await r.json().then(v => v?.error || '').catch(() => '')
+      alert(msg || 'Ошибка импорта')
     } catch {
       alert('Ошибка импорта')
+    }
+  }
+
+  const runMigrationWizard = async () => {
+    const hasUrl = !!migrationPgUrl.trim()
+    if (!hasUrl && (!migrationPgHost.trim() || !migrationPgDb.trim() || !migrationPgUser.trim())) {
+      alert('Укажите PostgreSQL URL или поля адрес/база/логин')
+      return
+    }
+    if (migrationMode === 'run' && !confirm('Запустить реальную миграцию SQLite -> PostgreSQL?')) return
+    setMigrationBusy(true)
+    try {
+      const resp = await fetch('/admin/db/migrate-sqlite-to-postgres', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sqlite_path: migrationSqlitePath.trim() || 'catalogue.db',
+          postgres_url: migrationPgUrl.trim(),
+          postgres_host: migrationPgHost.trim(),
+          postgres_port: parseInt(migrationPgPort || '5432', 10) || 5432,
+          postgres_db: migrationPgDb.trim(),
+          postgres_user: migrationPgUser.trim(),
+          postgres_password: migrationPgPassword,
+          mode: migrationMode,
+        }),
+      })
+      const data = await resp.json().catch(() => ({}))
+      const output = String(data?.output || '').trim()
+      const result = data?.ok ? 'успешно' : 'с ошибкой'
+      alert(`Миграция (${migrationMode}) завершена ${result}. Код: ${data?.exit_code ?? 'n/a'}\n\n${output || 'Лог пуст'}`)
+    } catch {
+      alert('Ошибка запуска wizard-миграции')
+    } finally {
+      setMigrationBusy(false)
     }
   }
 
@@ -677,8 +1180,69 @@ export default function SettingsPage() {
   if (!s) return <div className="card p-3">Загрузка настроек…</div>
 
   const llmEndpoints = s.llm_endpoints || []
+  const probedModels = lmstudioModelsByBase[(lmstudioProbeUrl || '').trim()] || []
+  const llmTaskMappings = llmEndpoints.flatMap(ep => {
+    const purposes = ep.purposes && ep.purposes.length ? ep.purposes : ['default']
+    return purposes.map(purpose => ({
+      endpointId: ep.id,
+      purpose,
+      purposeLabel: llmPurposeLabels.get(purpose) || purpose,
+      model: ep.model,
+      provider: ep.provider || 'openai',
+      baseUrl: ep.base_url,
+      weight: ep.weight,
+      instances: ep.instances || 1,
+      contextLength: ep.context_length || null,
+      name: ep.name,
+    }))
+  })
   const aiwordUsers = s.aiword_users || []
   const materialTypes = s.material_types || []
+  const runtimeFields = s.runtime_fields || []
+  const runtimeFieldChanged = (field: RuntimeField) => stableStringify(runtimeBaseline[field.name]) !== stableStringify(field.value)
+  const runtimeChangedCount = runtimeFields.filter(runtimeFieldChanged).length
+  const runtimePendingRestartCount = runtimeFields.filter(field => runtimeFieldChanged(field) && field.restart_required).length
+  const runtimeHighRiskCount = runtimeFields.filter(field => runtimeFieldChanged(field) && field.risk_level === 'high').length
+  const runtimeSearchNormalized = runtimeSearch.trim().toLowerCase()
+  const visibleRuntimeFields = runtimeFields.filter(field => field.visibility !== 'env_only')
+  const runtimeFieldsForActiveTab = visibleRuntimeFields.filter(field => {
+    const belongsSafe = SAFE_GROUPS.has(field.group || 'general')
+    const belongsExpert = EXPERT_GROUPS.has(field.group || 'general') || !belongsSafe
+    if (s.settings_hub_v2_enabled !== false) {
+      if (activeTab === 'safe' && !belongsSafe) return false
+      if (activeTab === 'expert' && !belongsExpert) return false
+    }
+    return true
+  }).filter(field => {
+    if (runtimeChangedOnly && !runtimeFieldChanged(field)) return false
+    if (!runtimeSearchNormalized) return true
+    const hay = `${field.name} ${getRuntimeFieldLabel(field)} ${field.api_key || ''} ${getRuntimeFieldDescription(field)} ${field.group || ''}`.toLowerCase()
+    return hay.includes(runtimeSearchNormalized)
+  })
+  const llmRuntimeFields = visibleRuntimeFields.filter(field => ['llm', 'llm_pool', 'cache'].includes(field.group))
+    .filter(field => !['lmstudio_api_base', 'lmstudio_model', 'lmstudio_api_key', 'lm_default_provider'].includes(field.name))
+  const runtimeFieldsByGroup = runtimeFieldsForActiveTab.reduce<Record<string, RuntimeField[]>>((acc, field) => {
+    const group = field.group || 'general'
+    if (!acc[group]) acc[group] = []
+    acc[group].push(field)
+    return acc
+  }, {})
+
+  const updateRuntimeField = (name: string, raw: string | boolean) => {
+    setS(prev => {
+      if (!prev) return prev
+      const nextFields = (prev.runtime_fields || []).map(field => {
+        if (field.name !== name) return field
+        return { ...field, value: normalizeRuntimeValue(field, raw) }
+      })
+      return { ...prev, runtime_fields: nextFields }
+    })
+  }
+  const hubV2Enabled = s.settings_hub_v2_enabled !== false
+  const safeVisible = !hubV2Enabled || activeTab === 'safe'
+  const expertVisible = !hubV2Enabled || activeTab === 'expert'
+  const llmVisible = !hubV2Enabled || activeTab === 'llm'
+  const facetsVisible = !hubV2Enabled || activeTab === 'facets'
 
   return (
     <div className="d-grid gap-3">
@@ -716,8 +1280,20 @@ export default function SettingsPage() {
             <button className="btn btn-outline-secondary" onClick={reindex}>Переиндексировать библиотеку</button>
           </div>
         </div>
+        <div className="d-flex flex-wrap gap-2 align-items-center">
+          {hubV2Enabled && <button className={`btn btn-sm ${activeTab === 'safe' ? 'btn-primary' : 'btn-outline-primary'}`} onClick={() => setActiveTab('safe')}>Safe</button>}
+          {hubV2Enabled && <button className={`btn btn-sm ${activeTab === 'expert' ? 'btn-primary' : 'btn-outline-primary'}`} onClick={() => setActiveTab('expert')}>Expert</button>}
+          {hubV2Enabled && <button className={`btn btn-sm ${activeTab === 'llm' ? 'btn-primary' : 'btn-outline-primary'}`} onClick={() => setActiveTab('llm')}>LLM Endpoints</button>}
+          {hubV2Enabled && <button className={`btn btn-sm ${activeTab === 'facets' ? 'btn-primary' : 'btn-outline-primary'}`} onClick={() => setActiveTab('facets')}>Фасеты</button>}
+          <div className="ms-auto d-flex flex-wrap gap-2">
+            <span className="badge text-bg-secondary">изменено: {runtimeChangedCount}</span>
+            {runtimePendingRestartCount > 0 && <span className="badge text-bg-warning">нужен рестарт: {runtimePendingRestartCount}</span>}
+            {runtimeHighRiskCount > 0 && <span className="badge text-bg-danger">high-risk: {runtimeHighRiskCount}</span>}
+          </div>
+        </div>
       </div>
 
+      {safeVisible && (
       <div className="card p-3">
         <div className="fw-semibold mb-2">Индексатор и OCR</div>
         <div className="row g-3">
@@ -775,108 +1351,132 @@ export default function SettingsPage() {
           </div>
         </div>
       </div>
+      )}
 
+      {safeVisible && (
+      <>
       <div className="card p-3">
-        <div className="fw-semibold mb-2">LLM и типизация</div>
+        <div className="fw-semibold mb-2">Чат по документу</div>
+        <div className="text-muted mb-3" style={{ fontSize: 13 }}>
+          Управляйте разбиением текста, ограничениями по чанкам и минимальными размерами изображений для режима «Чат по документу». Fallback чанки добавляются как запас, если режимы не вернули достаточное число фрагментов.
+        </div>
         <div className="row g-3">
-          <div className="col-md-3">
-            <label className="form-label" htmlFor="lm-provider">Тип API</label>
-            <select
-              id="lm-provider"
-              className="form-select"
-              value={s.lm_provider}
-              onChange={e => setS({ ...s, lm_provider: e.target.value })}
-            >
-              {llmProviderOptions.map(opt => (
-                <option key={opt.id} value={opt.id}>{opt.label}</option>
-              ))}
-            </select>
+          <div className="col-md-4">
+            <label className="form-label">Максимум токенов на чанк</label>
+            <input
+              className="form-control"
+              type="number"
+              min={16}
+              value={s.doc_chat_chunk_max_tokens}
+              onChange={e => {
+                const next = Math.max(16, parseInt(e.target.value || '0', 10) || 0)
+                setS({ ...s, doc_chat_chunk_max_tokens: next })
+              }}
+            />
+            <div className="form-text">Граница токенов, после которой начинается новый чанк.</div>
           </div>
           <div className="col-md-4">
-            <label className="form-label">Базовый URL LLM</label>
-            <input className="form-control" placeholder="http://localhost:1234/v1" value={s.lm_base} onChange={e => setS({ ...s, lm_base: e.target.value })} />
+            <label className="form-label">Перекрытие токенов</label>
+            <input
+              className="form-control"
+              type="number"
+              min={0}
+              value={s.doc_chat_chunk_overlap}
+              onChange={e => {
+                const raw = parseInt(e.target.value || '0', 10)
+                const next = Number.isFinite(raw) ? Math.max(0, raw) : 0
+                setS({ ...s, doc_chat_chunk_overlap: next })
+              }}
+            />
+            <div className="form-text">Сколько токенов пересекаются между соседними чанками.</div>
           </div>
-          <div className="col-md-3">
-            <label className="form-label">Модель LLM</label>
-            <input className="form-control" placeholder="gpt-4o-mini" value={s.lm_model} onChange={e => setS({ ...s, lm_model: e.target.value })} />
+          <div className="col-md-4">
+            <label className="form-label">Минимум токенов в чанке</label>
+            <input
+              className="form-control"
+              type="number"
+              min={1}
+              value={s.doc_chat_chunk_min_tokens}
+              onChange={e => {
+                const raw = parseInt(e.target.value || '0', 10)
+                const next = Number.isFinite(raw) ? Math.max(1, raw) : 1
+                setS({ ...s, doc_chat_chunk_min_tokens: next })
+              }}
+            />
+            <div className="form-text">Не давайте чанкам быть слишком короткими, иначе они будут плохо ранжироваться.</div>
           </div>
-          <div className="col-md-2">
-            <label className="form-label">LM API Key</label>
-            <input className="form-control" placeholder="sk-..." value={s.lm_key} onChange={e => setS({ ...s, lm_key: e.target.value })} />
+          <div className="col-md-4">
+            <label className="form-label">Максимум чанков на ответ</label>
+            <input
+              className="form-control"
+              type="number"
+              min={0}
+              value={s.doc_chat_max_chunks}
+              onChange={e => {
+                const raw = parseInt(e.target.value || '0', 10)
+                const next = Number.isFinite(raw) ? Math.max(0, raw) : 0
+                setS({ ...s, doc_chat_max_chunks: next })
+              }}
+            />
+            <div className="form-text">0 — использовать стандартные режимы, иначе ограничить контекст до указанного числа.</div>
           </div>
+          <div className="col-md-4">
+            <label className="form-label">Fallback чанков</label>
+            <input
+              className="form-control"
+              type="number"
+              min={0}
+              value={s.doc_chat_fallback_chunks}
+              onChange={e => {
+                const raw = parseInt(e.target.value || '0', 10)
+                const next = Number.isFinite(raw) ? Math.max(0, raw) : 0
+                setS({ ...s, doc_chat_fallback_chunks: next })
+              }}
+            />
+            <div className="form-text">
+              Запасное количество чанков, которое добавляется, если основной режим не дал достаточный контекст.
+            </div>
+          </div>
+          <div className="col-md-4">
+            <label className="form-label">Минимальная ширина изображения</label>
+            <input
+              className="form-control"
+              type="number"
+              min={0}
+              value={s.doc_chat_image_min_width}
+              onChange={e => {
+                const raw = parseInt(e.target.value || '0', 10)
+                const next = Number.isFinite(raw) ? Math.max(0, raw) : 0
+                setS({ ...s, doc_chat_image_min_width: next })
+              }}
+            />
+            <div className="form-text">32 — фильтр по умолчанию, ниже отсекаются артефакты.</div>
+          </div>
+          <div className="col-md-4">
+            <label className="form-label">Минимальная высота изображения</label>
+            <input
+              className="form-control"
+              type="number"
+              min={0}
+              value={s.doc_chat_image_min_height}
+              onChange={e => {
+                const raw = parseInt(e.target.value || '0', 10)
+                const next = Number.isFinite(raw) ? Math.max(0, raw) : 0
+                setS({ ...s, doc_chat_image_min_height: next })
+              }}
+            />
+            <div className="form-text">32 — фильтр по умолчанию; исключаются поля меньше указанной высоты.</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card p-3">
+        <div className="fw-semibold mb-2">RAG и типизация</div>
+        <div className="row g-3">
           <div className="col-12">
-            <hr className="my-2" />
-          </div>
-          <div className="col-md-3">
-            <label className="form-label" htmlFor="rag-backend">RAG токенизатор</label>
-            <select
-              id="rag-backend"
-              className="form-select"
-              value={s.rag_embedding_backend}
-              onChange={e => setS({ ...s, rag_embedding_backend: e.target.value })}
-            >
-              {ragEmbeddingBackendOptions.map(opt => (
-                <option key={opt.id} value={opt.id}>{opt.label}</option>
-              ))}
-            </select>
-          </div>
-          <div className="col-md-3">
-            <label className="form-label">Модель токенизатора</label>
-            <input
-              className="form-control"
-              placeholder="nomic-ai/nomic-embed-text-v1.5-GGUF"
-              value={s.rag_embedding_model}
-              onChange={e => setS({ ...s, rag_embedding_model: e.target.value })}
-            />
-          </div>
-          <div className="col-md-3">
-            <label className="form-label">Endpoint токенизатора</label>
-            <input
-              className="form-control"
-              placeholder="http://localhost:1234/v1"
-              value={s.rag_embedding_endpoint}
-              onChange={e => setS({ ...s, rag_embedding_endpoint: e.target.value })}
-            />
-            <div className="form-text">Укажите адрес локального LM Studio или совместимого API.</div>
-          </div>
-          <div className="col-md-3">
-            <label className="form-label">API Key токенизатора</label>
-            <input
-              className="form-control"
-              placeholder="sk-..."
-              value={s.rag_embedding_api_key}
-              onChange={e => setS({ ...s, rag_embedding_api_key: e.target.value })}
-            />
-          </div>
-          <div className="col-md-2">
-            <label className="form-label">Размерность</label>
-            <input
-              className="form-control"
-              type="number"
-              min={1}
-              value={s.rag_embedding_dim}
-              onChange={e => setS({ ...s, rag_embedding_dim: parseInt(e.target.value || '0', 10) || 0 })}
-            />
-          </div>
-          <div className="col-md-2">
-            <label className="form-label">Batch</label>
-            <input
-              className="form-control"
-              type="number"
-              min={1}
-              value={s.rag_embedding_batch}
-              onChange={e => setS({ ...s, rag_embedding_batch: parseInt(e.target.value || '1', 10) || 1 })}
-            />
-          </div>
-          <div className="col-md-3">
-            <label className="form-label">Устройство (Sentence Transformers)</label>
-            <input
-              className="form-control"
-              placeholder="cpu / cuda:0"
-              value={s.rag_embedding_device ?? ''}
-              onChange={e => setS({ ...s, rag_embedding_device: e.target.value })}
-            />
-            <div className="form-text">Оставьте пустым для настройки по умолчанию.</div>
+            <div className="alert alert-light border mb-0">
+              Настройки токенизатора перенесены во вкладку <strong>LLM Endpoints</strong> и сохраняются вместе с LLM-конфигурацией.
+            </div>
           </div>
           <div className="col-md-3 d-flex align-items-end">
             <div className="form-check form-switch">
@@ -944,7 +1544,10 @@ export default function SettingsPage() {
           </div>
       </div>
     </div>
+    </>
+    )}
 
+      {expertVisible && (
       <div className="card p-3">
         <details>
           <summary className="fw-semibold">Типы документов и эвристики</summary>
@@ -960,7 +1563,9 @@ export default function SettingsPage() {
           </div>
         </details>
       </div>
+      )}
 
+      {safeVisible && (
       <div className="card p-3">
         <div className="fw-semibold mb-2">Транскрибация и аудио</div>
         <div className="row g-3">
@@ -1026,14 +1631,214 @@ export default function SettingsPage() {
           ))}
         </datalist>
       </div>
+      )}
 
+      {llmVisible && (
       <div className="card p-3">
         <div className="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
           <div>
             <div className="fw-semibold">Назначение LLM эндпоинтов</div>
             <div className="text-muted" style={{ fontSize: 13 }}>Выберите задачи для каждого эндпоинта. Один тип может обслуживаться несколькими LLM — запросы будут распределяться по очереди.</div>
           </div>
-          <Link className="btn btn-sm btn-outline-secondary" to="/admin/llm">Управление эндпоинтами</Link>
+          <span className="badge text-bg-info">Единая точка управления LLM в этом разделе</span>
+        </div>
+        <div className="border rounded-3 p-3 mb-3">
+          <div className="fw-semibold mb-2">Проверка моделей LM Studio по IP/URL</div>
+          <div className="row g-2 align-items-end">
+            <div className="col-md-9">
+              <label className="form-label">Base URL LM Studio</label>
+              <input
+                className="form-control"
+                placeholder="http://192.168.1.12:1234/v1"
+                value={lmstudioProbeUrl}
+                onChange={e => setLmstudioProbeUrl(e.target.value)}
+              />
+            </div>
+            <div className="col-md-3 d-grid">
+              <button className="btn btn-outline-primary" onClick={() => probeLmstudioModels()} disabled={lmstudioLoading}>
+                {lmstudioLoading ? 'Проверка…' : 'Проверить модели'}
+              </button>
+            </div>
+          </div>
+          <div className="mt-3 border rounded-3 p-3">
+            <div className="fw-semibold mb-2">Настройки токенизатора (RAG)</div>
+            <div className="row g-2">
+              <div className="col-md-3">
+                <label className="form-label" htmlFor="llm-tab-rag-backend">Backend</label>
+                <select
+                  id="llm-tab-rag-backend"
+                  className="form-select"
+                  value={s.rag_embedding_backend}
+                  onChange={e => setS({ ...s, rag_embedding_backend: e.target.value })}
+                >
+                  {ragEmbeddingBackendOptions.map(opt => (
+                    <option key={opt.id} value={opt.id}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-md-3">
+                <label className="form-label">Модель токенизатора</label>
+                <input
+                  className="form-control"
+                  placeholder="nomic-ai/nomic-embed-text-v1.5-GGUF"
+                  value={s.rag_embedding_model}
+                  onChange={e => setS({ ...s, rag_embedding_model: e.target.value })}
+                />
+              </div>
+              <div className="col-md-3">
+                <label className="form-label">Endpoint токенизатора</label>
+                <input
+                  className="form-control"
+                  placeholder="http://localhost:1234/v1"
+                  value={s.rag_embedding_endpoint}
+                  onChange={e => setS({ ...s, rag_embedding_endpoint: e.target.value })}
+                />
+              </div>
+              <div className="col-md-3">
+                <label className="form-label">API key токенизатора</label>
+                <input
+                  className="form-control"
+                  placeholder="sk-..."
+                  value={s.rag_embedding_api_key}
+                  onChange={e => setS({ ...s, rag_embedding_api_key: e.target.value })}
+                />
+              </div>
+              <div className="col-md-2">
+                <label className="form-label">Размерность</label>
+                <input
+                  className="form-control"
+                  type="number"
+                  min={1}
+                  value={s.rag_embedding_dim}
+                  onChange={e => setS({ ...s, rag_embedding_dim: parseInt(e.target.value || '0', 10) || 0 })}
+                />
+              </div>
+              <div className="col-md-2">
+                <label className="form-label">Batch</label>
+                <input
+                  className="form-control"
+                  type="number"
+                  min={1}
+                  value={s.rag_embedding_batch}
+                  onChange={e => setS({ ...s, rag_embedding_batch: parseInt(e.target.value || '1', 10) || 1 })}
+                />
+              </div>
+              <div className="col-md-4">
+                <label className="form-label">Устройство</label>
+                <input
+                  className="form-control"
+                  placeholder="cpu / cuda:0"
+                  value={s.rag_embedding_device ?? ''}
+                  onChange={e => setS({ ...s, rag_embedding_device: e.target.value })}
+                />
+              </div>
+            </div>
+          </div>
+          {probedModels.length > 0 && (
+            <div className="mt-3">
+              <div className="fw-semibold mb-2">Найденные модели</div>
+              <div className="d-flex flex-wrap gap-2">
+                {probedModels.map(item => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`btn btn-sm ${newMappingModel === item.id ? 'btn-primary' : 'btn-outline-secondary'}`}
+                    onClick={() => setNewMappingModel(item.id)}
+                  >
+                    {item.name}{item.loaded ? ' (loaded)' : ''}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="mt-3 border rounded-3 p-3">
+            <div className="fw-semibold mb-2">Добавить маршрут задачи (задача → модель)</div>
+            <div className="row g-2">
+              <div className="col-md-3">
+                <label className="form-label">Тип задачи</label>
+                <select className="form-select" value={newMappingPurpose} onChange={e => setNewMappingPurpose(e.target.value)}>
+                  {llmPurposes.map(option => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-md-3">
+                <label className="form-label">Модель</label>
+                <select className="form-select" value={newMappingModel} onChange={e => setNewMappingModel(e.target.value)}>
+                  <option value="">-- выберите модель --</option>
+                  {probedModels.map(item => (
+                    <option key={item.id} value={item.id}>{item.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-md-2">
+                <label className="form-label">Провайдер</label>
+                <select className="form-select" value={newMappingProvider} onChange={e => setNewMappingProvider(e.target.value)}>
+                  {llmProviderOptions.map(opt => (
+                    <option key={opt.id} value={opt.id}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-md-2">
+                <label className="form-label">Вес</label>
+                <input className="form-control" value={newMappingWeight} onChange={e => setNewMappingWeight(e.target.value)} />
+              </div>
+              <div className="col-md-2">
+                <label className="form-label">Копии</label>
+                <input className="form-control" type="number" min={1} value={newMappingInstances} onChange={e => setNewMappingInstances(e.target.value)} />
+              </div>
+              <div className="col-md-3">
+                <label className="form-label">Контекст</label>
+                <input className="form-control" type="number" min={256} value={newMappingContext} onChange={e => setNewMappingContext(e.target.value)} />
+              </div>
+              <div className="col-md-7">
+                <label className="form-label">Название маршрута</label>
+                <input className="form-control" placeholder="Опционально" value={newMappingName} onChange={e => setNewMappingName(e.target.value)} />
+              </div>
+              <div className="col-md-2 d-grid align-items-end">
+                <button className="btn btn-success" onClick={createTaskMapping}>Добавить</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="border rounded-3 p-3 mb-3">
+          <div className="fw-semibold mb-2">Текущие маршруты задач</div>
+          {llmTaskMappings.length === 0 ? (
+            <div className="text-muted">Маршрутов пока нет. Добавьте первый маршрут через форму выше.</div>
+          ) : (
+            <div className="table-responsive">
+              <table className="table table-sm align-middle">
+                <thead>
+                  <tr>
+                    <th>Задача</th>
+                    <th>Модель</th>
+                    <th>Провайдер</th>
+                    <th>Контекст</th>
+                    <th>Копии</th>
+                    <th>Вес</th>
+                    <th>Endpoint</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {llmTaskMappings.map(item => (
+                    <tr key={`${item.endpointId}:${item.purpose}`}>
+                      <td>{item.purposeLabel}</td>
+                      <td>{item.model}</td>
+                      <td>{item.provider}</td>
+                      <td>{item.contextLength || '—'}</td>
+                      <td>{item.instances}</td>
+                      <td>{item.weight}</td>
+                      <td>{item.name}</td>
+                      <td>
+                        <button className="btn btn-sm btn-outline-danger" onClick={() => removeTaskMapping(item.endpointId)}>Удалить</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
         <div className="d-grid gap-3">
           {llmEndpoints.length === 0 && (
@@ -1082,12 +1887,114 @@ export default function SettingsPage() {
                   </select>
                   <div className="form-text">Назначено: {chips.length ? chips.join(', ') : 'По умолчанию'}</div>
                 </div>
+                <div className="row g-2 mt-2">
+                  <div className="col-md-6">
+                    <label className="form-label">Модель endpoint</label>
+                    <select
+                      className="form-select"
+                      value={ep.model}
+                      onChange={e => {
+                        const value = e.target.value
+                        patchLlmEndpoint(ep.id, { model: value }, 'Модель endpoint обновлена').then((updated) => {
+                          if (!updated) return
+                          setS(prev => {
+                            if (!prev) return prev
+                            return {
+                              ...prev,
+                              llm_endpoints: (prev.llm_endpoints || []).map(item => item.id === ep.id ? { ...item, ...updated } : item),
+                            }
+                          })
+                        })
+                      }}
+                    >
+                      {(lmstudioModelsByBase[ep.base_url] || []).length === 0 && <option value={ep.model}>{ep.model}</option>}
+                      {(lmstudioModelsByBase[ep.base_url] || []).map(item => (
+                        <option key={item.id} value={item.id}>
+                          {item.name}{item.loaded ? ' (loaded)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="form-text">Список берётся из LM Studio v1 `/api/v1/models`.</div>
+                  </div>
+                  <div className="col-md-3">
+                    <label className="form-label">Контекст при загрузке</label>
+                    <input
+                      className="form-control"
+                      type="number"
+                      min={256}
+                      value={llmContextDrafts[ep.id] ?? ''}
+                      onChange={e => setLlmContextDrafts(prev => ({ ...prev, [ep.id]: e.target.value }))}
+                      onBlur={() => {
+                        const raw = llmContextDrafts[ep.id]
+                        const parsed = raw ? parseInt(raw, 10) : NaN
+                        const value = Number.isFinite(parsed) && parsed > 0 ? Math.max(256, parsed) : null
+                        patchLlmEndpoint(ep.id, { context_length: value }, 'Контекст endpoint обновлён')
+                      }}
+                    />
+                  </div>
+                  <div className="col-md-3">
+                    <label className="form-label">Копий модели</label>
+                    <input
+                      className="form-control"
+                      type="number"
+                      min={1}
+                      value={llmInstancesDrafts[ep.id] ?? '1'}
+                      onChange={e => setLlmInstancesDrafts(prev => ({ ...prev, [ep.id]: e.target.value }))}
+                      onBlur={() => {
+                        const parsed = Math.max(1, parseInt(llmInstancesDrafts[ep.id] || '1', 10) || 1)
+                        patchLlmEndpoint(ep.id, { instances: parsed }, 'Число копий endpoint обновлено')
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="d-flex flex-wrap gap-2 mt-2">
+                  <button className="btn btn-sm btn-outline-secondary" onClick={() => probeLmstudioModels(ep.base_url, ep.id)}>
+                    Обновить список моделей по этому URL
+                  </button>
+                  <button className="btn btn-sm btn-outline-success" onClick={() => loadLmstudioModel(ep)}>
+                    Загрузить модель в LM Studio
+                  </button>
+                  <button className="btn btn-sm btn-outline-warning" onClick={() => unloadLmstudioModel(ep)}>
+                    Выгрузить модель
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+        <hr className="my-3" />
+        <div className="fw-semibold mb-2">LLM Pool и тонкая настройка</div>
+        <div className="row g-3">
+          {llmRuntimeFields.map(field => {
+            const fieldType = (field.type || '').toLowerCase()
+            const valueText = String(field.value ?? '')
+            return (
+              <div key={`llm-runtime-${field.name}`} className="col-md-6">
+                <label className="form-label d-flex flex-wrap gap-2 align-items-center">
+                  <span>{getRuntimeFieldLabel(field)}</span>
+                  {field.restart_required ? <span className="badge text-bg-warning">restart</span> : null}
+                </label>
+                {fieldType.includes('bool') ? (
+                  <div className="form-check form-switch">
+                    <input className="form-check-input" type="checkbox" checked={!!field.value} onChange={e => updateRuntimeField(field.name, e.target.checked)} />
+                  </div>
+                ) : (
+                  <input
+                    className="form-control"
+                    type={fieldType.includes('int') || fieldType.includes('float') ? 'number' : 'text'}
+                    value={valueText}
+                    onChange={e => updateRuntimeField(field.name, e.target.value)}
+                  />
+                )}
+                <div className="form-text">{getRuntimeFieldDescription(field)}</div>
               </div>
             )
           })}
         </div>
       </div>
+      )}
 
+      {expertVisible && (
       <div className="card p-3">
         <div className="fw-semibold mb-1">Доступ к AIWord</div>
         <div className="text-muted mb-3" style={{ fontSize: 13 }}>Администраторы всегда имеют доступ. Назначьте дополнительных пользователей, начав вводить их имя или логин.</div>
@@ -1132,19 +2039,133 @@ export default function SettingsPage() {
           {aiwordUsers.length === 0 && <span className="text-muted" style={{ fontSize: 13 }}>Доступ ещё не назначен ни одному пользователю.</span>}
         </div>
       </div>
+      )}
 
+      {expertVisible && (
       <div className="card p-3">
         <div className="fw-semibold mb-2">Управление базой данных</div>
+        <div className="row g-2 mb-3">
+          <div className="col-md-4">
+            <label className="form-label">Тип БД</label>
+            <select
+              className="form-select"
+              value={dbType}
+              onChange={e => setDbType((e.target.value === 'postgresql' ? 'postgresql' : 'sqlite'))}
+            >
+              <option value="sqlite">SQLite (legacy .db)</option>
+              <option value="postgresql">PostgreSQL</option>
+            </select>
+          </div>
+          {dbType === 'postgresql' && (
+            <div className="col-md-4">
+              <label className="form-label">Формат backup</label>
+              <select
+                className="form-select"
+                value={pgBackupFormat}
+                onChange={e => setPgBackupFormat((e.target.value === 'sql' ? 'sql' : 'dump'))}
+              >
+                <option value="dump">Custom dump (.dump)</option>
+                <option value="sql">Plain SQL (.sql)</option>
+              </select>
+            </div>
+          )}
+          <div className="col-12">
+            <div className="form-text">
+              Активное подключение: <code>{s.database_dialect || 'unknown'}</code>
+              {s.database_uri ? <> · <code>{s.database_uri}</code></> : null}
+            </div>
+          </div>
+        </div>
         <div className="d-flex flex-wrap gap-2 align-items-center">
           <button className="btn btn-outline-primary" onClick={backupDb}>Резервная копия</button>
           <form onSubmit={importDb} className="d-flex gap-2 align-items-center">
-            <input className="form-control" type="file" name="dbfile" accept=".db" required />
-            <button className="btn btn-outline-secondary" type="submit">Импорт .db</button>
+            <input className="form-control" type="file" name="dbfile" accept={dbType === 'postgresql' ? '.dump,.sql,.backup' : '.db'} required />
+            <button className="btn btn-outline-secondary" type="submit">
+              {dbType === 'postgresql' ? 'Импорт PostgreSQL' : 'Импорт .db'}
+            </button>
           </form>
           <button className="btn btn-outline-danger" onClick={clearDb}>Очистить базу</button>
         </div>
       </div>
+      )}
 
+      {expertVisible && (
+      <div className="card p-3">
+        <div className="fw-semibold mb-2">Миграция SQLite → PostgreSQL (Wizard)</div>
+        <div className="row g-2">
+          <div className="col-md-4">
+            <label className="form-label">SQLite файл</label>
+            <input
+              className="form-control"
+              value={migrationSqlitePath}
+              onChange={e => setMigrationSqlitePath(e.target.value)}
+              placeholder="catalogue.db"
+            />
+          </div>
+          <div className="col-md-8">
+            <label className="form-label">PostgreSQL URL (опционально)</label>
+            <input
+              className="form-control"
+              value={migrationPgUrl}
+              onChange={e => setMigrationPgUrl(e.target.value)}
+              placeholder="postgresql://agregator:agregator@localhost:5432/agregator"
+            />
+          </div>
+          <div className="col-md-4">
+            <label className="form-label">Хост / адрес БД</label>
+            <input className="form-control" value={migrationPgHost} onChange={e => setMigrationPgHost(e.target.value)} placeholder="localhost" />
+            <div className="d-flex gap-2 flex-wrap mt-2">
+              <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setMigrationPgHost('localhost')}>
+                localhost
+              </button>
+              <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setMigrationPgHost('host.docker.internal')}>
+                host.docker.internal
+              </button>
+              <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setMigrationPgHost('postgres')}>
+                postgres
+              </button>
+            </div>
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Порт</label>
+            <input className="form-control" value={migrationPgPort} onChange={e => setMigrationPgPort(e.target.value)} placeholder="5432" />
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Имя БД</label>
+            <input className="form-control" value={migrationPgDb} onChange={e => setMigrationPgDb(e.target.value)} placeholder="agregator" />
+          </div>
+          <div className="col-md-3">
+            <label className="form-label">Логин</label>
+            <input className="form-control" value={migrationPgUser} onChange={e => setMigrationPgUser(e.target.value)} placeholder="agregator" />
+          </div>
+          <div className="col-md-4">
+            <label className="form-label">Пароль</label>
+            <input className="form-control" type="password" value={migrationPgPassword} onChange={e => setMigrationPgPassword(e.target.value)} placeholder="••••••••" />
+          </div>
+          <div className="col-md-2">
+            <label className="form-label">Режим</label>
+            <select
+              className="form-select"
+              value={migrationMode}
+              onChange={e => setMigrationMode(e.target.value === 'run' ? 'run' : 'dry-run')}
+            >
+              <option value="dry-run">dry-run</option>
+              <option value="run">run</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-text mt-2">
+          Wizard запускает `scripts/migrate_sqlite_to_postgres.sh`: backup, проверка подключения, перенос через pgloader (если есть), затем `alembic upgrade head`.
+        </div>
+        <div className="mt-3">
+          <button className="btn btn-outline-primary" onClick={runMigrationWizard} disabled={migrationBusy}>
+            {migrationBusy ? 'Выполнение…' : 'Запустить миграцию'}
+          </button>
+        </div>
+      </div>
+      )}
+
+      {expertVisible && (
       <div className="card p-3">
         <details>
           <summary className="fw-semibold">Промпты LLM</summary>
@@ -1179,6 +2200,118 @@ export default function SettingsPage() {
           </div>
         </details>
       </div>
+      )}
+
+      {expertVisible && (
+      <div className="card p-3">
+        <details>
+          <summary className="fw-semibold">Расширенные runtime-настройки (все параметры)</summary>
+          <div className="row g-2 mt-2">
+            <div className="col-md-8">
+              <input
+                className="form-control"
+                placeholder="Поиск по имени/описанию/env ключу"
+                value={runtimeSearch}
+                onChange={e => setRuntimeSearch(e.target.value)}
+              />
+            </div>
+            <div className="col-md-4 d-flex align-items-center">
+              <div className="form-check form-switch">
+                <input
+                  className="form-check-input"
+                  type="checkbox"
+                  id="runtimeChangedOnly"
+                  checked={runtimeChangedOnly}
+                  onChange={e => setRuntimeChangedOnly(e.target.checked)}
+                />
+                <label className="form-check-label" htmlFor="runtimeChangedOnly">Только изменённые поля</label>
+              </div>
+            </div>
+          </div>
+          <div className="text-muted mt-2 mb-3" style={{ fontSize: 13 }}>
+            Здесь отображаются все runtime-параметры сервера с описаниями. Поля синхронизируются с backend и сохраняются через общую кнопку «Сохранить».
+          </div>
+          <div className="d-grid gap-3">
+            {Object.keys(runtimeFieldsByGroup).length === 0 && (
+              <div className="text-muted">Нет полей по текущему фильтру.</div>
+            )}
+            {Object.entries(runtimeFieldsByGroup).map(([group, fields]) => (
+              <div key={group} className="border rounded-3 p-3" style={{ borderColor: 'var(--border)' }}>
+                <div className="fw-semibold mb-2">{runtimeGroupLabels[group] || group}</div>
+                <div className="row g-3">
+                  {fields.map(field => {
+                    const fieldType = (field.type || '').toLowerCase()
+                    const isBool = fieldType.includes('bool')
+                    const isNumber = fieldType.includes('int') || fieldType.includes('float')
+                    const isStructured = fieldType.includes('list') || fieldType.includes('dict') || fieldType.includes('optional')
+                    const valueText = isStructured
+                      ? (() => {
+                          try {
+                            return field.value === null || field.value === undefined ? '' : JSON.stringify(field.value, null, 2)
+                          } catch {
+                            return String(field.value ?? '')
+                          }
+                        })()
+                      : String(field.value ?? '')
+                    return (
+                      <div key={field.name} className="col-md-6">
+                        <label className="form-label d-flex flex-wrap align-items-center gap-2">
+                          <span>{getRuntimeFieldLabel(field)}</span>
+                          {field.env_key ? <code>{field.env_key}</code> : null}
+                          {runtimeFieldChanged(field) ? <span className="badge text-bg-secondary">changed</span> : null}
+                          {field.restart_required ? <span className="badge text-bg-warning">restart</span> : null}
+                          {field.risk_level === 'high' ? <span className="badge text-bg-danger">high-risk</span> : null}
+                        </label>
+                        {isBool ? (
+                          <div className="form-check form-switch">
+                            <input
+                              className="form-check-input"
+                              type="checkbox"
+                              checked={!!field.value}
+                              disabled={!field.runtime_mutable}
+                              onChange={e => updateRuntimeField(field.name, e.target.checked)}
+                            />
+                          </div>
+                        ) : isNumber ? (
+                          <input
+                            className="form-control"
+                            type="number"
+                            step={fieldType.includes('float') ? '0.01' : '1'}
+                            value={valueText}
+                            disabled={!field.runtime_mutable}
+                            onChange={e => updateRuntimeField(field.name, e.target.value)}
+                          />
+                        ) : isStructured ? (
+                          <textarea
+                            className="form-control"
+                            rows={4}
+                            value={valueText}
+                            disabled={!field.runtime_mutable}
+                            onChange={e => updateRuntimeField(field.name, e.target.value)}
+                          />
+                        ) : (
+                          <input
+                            className="form-control"
+                            value={valueText}
+                            disabled={!field.runtime_mutable}
+                            onChange={e => updateRuntimeField(field.name, e.target.value)}
+                          />
+                        )}
+                        <div className="form-text">{getRuntimeFieldDescription(field)}{field.api_key ? ` (API key: ${field.api_key})` : ''}</div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </details>
+      </div>
+      )}
+
+      {facetsVisible && (
+        <AdminFacetSettingsPage />
+      )}
     </div>
   )
 }

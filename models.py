@@ -16,6 +16,7 @@ class User(db.Model):
     full_name = db.Column(db.String, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    preferences = db.relationship("UserPreference", backref="user", lazy=True, cascade="all, delete-orphan")
 
     def set_password(self, password: str) -> None:
         self.password_hash = generate_password_hash(password.strip())
@@ -122,17 +123,36 @@ class UserActionLog(db.Model):
     user = db.relationship("User", backref="action_logs", lazy=True)
 
 
+class UserPreference(db.Model):
+    __tablename__ = "user_preferences"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    key = db.Column(db.String, nullable=False)
+    value = db.Column(db.String, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "key", name="uq_user_preference_key"),
+    )
+
+
 class TaskRecord(db.Model):
     __tablename__ = "task_records"
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String, nullable=False)
     status = db.Column(db.String, nullable=False, default="pending")
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True)
+    collection_id = db.Column(db.Integer, db.ForeignKey("collections.id", ondelete="SET NULL"), index=True, nullable=True)
     payload = db.Column(db.Text, nullable=True)
     progress = db.Column(db.Float, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     started_at = db.Column(db.DateTime, nullable=True)
     finished_at = db.Column(db.DateTime, nullable=True)
     error = db.Column(db.String, nullable=True)
+
+    user = db.relationship("User", lazy=True)
+    collection = db.relationship("Collection", lazy=True)
 
 
 class DocChatCache(db.Model):
@@ -162,6 +182,8 @@ class LlmEndpoint(db.Model):
     weight = db.Column(db.Float, nullable=False, default=1.0)
     purpose = db.Column(db.String, nullable=True)  # например rerank, summary, transcription
     provider = db.Column(db.String, nullable=False, default='openai', server_default='openai')
+    context_length = db.Column(db.Integer, nullable=True)
+    instances = db.Column(db.Integer, nullable=False, default=1, server_default='1')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 

@@ -1,0 +1,1597 @@
+===== README.md =====
+# Интегратор СППР
+
+Интегратор управляет потоками данных между подсистемами СППР и внешними контурами. Он формирует и контролирует топологию соединений, балансирует каналы, следит за надёжностью и публикует отчёты о состоянии обмена.
+
+## Возможности
+- регистрация модулей и построение направленных соединений (edges);
+- подключение каналов с приоритетами, адаптивное изменение пропускной способности и обход узких мест;
+- мониторинг задержек, потерь, коэффициентов достоверности; журналирование отклонений;
+- автоматическая генерация отчётов с ключевыми метриками;
+- REST/CLI интерфейсы для интеграции и эксплуатации.
+
+## Запуск
+```bash
+python -m program_modules.integrator_sppr.cli runserver --host 0.0.0.0 --port 8251
+```
+
+CLI-команды: `register-node`, `connect`, `add-channel`, `channel-metrics`, `snapshot`, `audit`, `reports`.
+
+
+===== __init__.py =====
+"""Integrator SPPR standalone module."""
+
+from .bootstrap import build_context
+from .app import create_app
+
+__all__ = ["build_context", "create_app"]
+
+
+===== app.py =====
+"""Flask application entry point for Integrator SPPR."""
+
+from __future__ import annotations
+
+import atexit
+
+from flask import Flask
+
+from .api.routes import create_blueprint
+from .bootstrap import build_context
+
+
+def create_app() -> Flask:
+    ctx = build_context()
+    app = Flask(__name__)
+    app.config["INTEGRATOR_CONFIG"] = ctx.config
+    app.register_blueprint(create_blueprint(ctx.engine), url_prefix="/integrator")
+    atexit.register(ctx.engine.shutdown)
+    return app
+
+
+if __name__ == "__main__":
+    app = create_app()
+    app.run(host="0.0.0.0", port=8251)
+
+
+===== bootstrap.py =====
+"""Bootstrap context for Integrator SPPR."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .config import AppConfig, load_config
+from .database import Database
+from .engine import IntegratorEngine
+from .logging_setup import setup_logging
+
+
+@dataclass
+class IntegratorContext:
+    config: AppConfig
+    database: Database
+    engine: IntegratorEngine
+
+
+def build_context(base_dir=None) -> IntegratorContext:
+    setup_logging()
+    config = load_config(base_dir)
+    database = Database(config.database_url)
+    database.create_all()
+    engine = IntegratorEngine(config, database)
+    return IntegratorContext(config=config, database=database, engine=engine)
+
+
+===== cli.py =====
+"""CLI for Integrator SPPR."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from .bootstrap import build_context
+
+
+def _print(data):
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Integrator SPPR CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    register = sub.add_parser("register-node", help="Register module node")
+    register.add_argument("--name", required=True)
+    register.add_argument("--kind", required=True, choices=["ingestion", "analytics", "dialog", "storage", "external"])
+    register.add_argument("--api-url", required=True)
+    register.add_argument("--priority", type=int)
+    register.add_argument("--base-dir")
+    register.set_defaults(cmd="register-node")
+
+    connect = sub.add_parser("connect", help="Connect nodes")
+    connect.add_argument("--from", dest="from_node", required=True)
+    connect.add_argument("--to", dest="to_node", required=True)
+    connect.add_argument("--max-bandwidth", type=float, default=100.0)
+    connect.add_argument("--base-dir")
+    connect.set_defaults(cmd="connect")
+
+    channel = sub.add_parser("add-channel", help="Attach channel to edge")
+    channel.add_argument("--edge-id", type=int, required=True)
+    channel.add_argument("--label", required=True)
+    channel.add_argument("--modality", required=True)
+    channel.add_argument("--priority", type=int)
+    channel.add_argument("--target-rate", type=float)
+    channel.add_argument("--base-dir")
+    channel.set_defaults(cmd="add-channel")
+
+    metrics = sub.add_parser("channel-metrics", help="Update channel stats")
+    metrics.add_argument("--channel-id", type=int, required=True)
+    metrics.add_argument("--actual-rate", type=float, required=True)
+    metrics.add_argument("--dropped", type=int, required=True)
+    metrics.add_argument("--retries", type=int, required=True)
+    metrics.add_argument("--base-dir")
+    metrics.set_defaults(cmd="channel-metrics")
+
+    snapshot = sub.add_parser("snapshot", help="Generate telemetry snapshot")
+    snapshot.add_argument("--base-dir")
+    snapshot.set_defaults(cmd="snapshot")
+
+    audit = sub.add_parser("audit", help="Show audit log")
+    audit.add_argument("--base-dir")
+    audit.set_defaults(cmd="audit")
+
+    reports = sub.add_parser("reports", help="List stored reports")
+    reports.add_argument("--base-dir")
+    reports.set_defaults(cmd="reports")
+
+    serve = sub.add_parser("runserver", help="Run HTTP server")
+    serve.add_argument("--host", default="0.0.0.0")
+    serve.add_argument("--port", type=int, default=8251)
+    serve.add_argument("--base-dir")
+    serve.set_defaults(cmd="runserver")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    ctx = build_context(Path(args.base_dir) if getattr(args, "base_dir", None) else None)
+
+    if args.command == "register-node":
+        payload = {
+            "name": args.name,
+            "kind": args.kind,
+            "api_url": args.api_url,
+            "priority": args.priority,
+        }
+        result = ctx.engine.register_node(payload)
+        _print(result.payload if result.ok else {"error": result.error})
+    elif args.command == "connect":
+        payload = {
+            "from": args.from_node,
+            "to": args.to_node,
+            "max_bandwidth": args.max_bandwidth,
+        }
+        result = ctx.engine.connect_nodes(payload)
+        _print(result.payload if result.ok else {"error": result.error})
+    elif args.command == "add-channel":
+        payload = {
+            "edge_id": args.edge_id,
+            "label": args.label,
+            "modality": args.modality,
+            "priority": args.priority,
+            "target_rate": args.target_rate,
+        }
+        result = ctx.engine.add_channel(payload)
+        _print(result.payload if result.ok else {"error": result.error})
+    elif args.command == "channel-metrics":
+        payload = {
+            "channel_id": args.channel_id,
+            "actual_rate": args.actual_rate,
+            "dropped": args.dropped,
+            "retries": args.retries,
+        }
+        result = ctx.engine.channel_metrics(payload)
+        _print(result.payload if result.ok else {"error": result.error})
+    elif args.command == "snapshot":
+        result = ctx.engine.snapshot()
+        _print(result.payload)
+    elif args.command == "audit":
+        result = ctx.engine.audit_log()
+        _print(result.payload)
+    elif args.command == "reports":
+        result = ctx.engine.reports()
+        _print(result.payload)
+    elif args.command == "runserver":
+        from .app import create_app
+
+        app = create_app()
+        app.run(host=args.host, port=args.port)
+    ctx.engine.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== config.py =====
+"""Configuration helpers for Integrator SPPR."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, Dict
+
+
+def _env(key: str, default: str) -> str:
+    value = os.getenv(key)
+    return value if value is not None else default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = _env(key, str(default)).lower()
+    if raw in {"1", "true", "yes", "y"}:
+        return True
+    if raw in {"0", "false", "no", "n"}:
+        return False
+    return default
+
+
+@dataclass(slots=True)
+class StreamConfig:
+    max_bandwidth: float = 1000.0
+    priority_levels: int = 5
+    default_priority: int = 3
+    smoothing_window: int = 60
+
+
+@dataclass(slots=True)
+class TopologyConfig:
+    max_edges: int = 200
+    heartbeat_interval: timedelta = timedelta(seconds=15)
+    retry_policy: Dict[str, Any] = field(
+        default_factory=lambda: {"base_delay": 2.0, "max_delay": 30.0, "factor": 2.0}
+    )
+
+
+@dataclass(slots=True)
+class ReliabilityConfig:
+    breach_threshold: float = 0.85
+    latency_budget_ms: int = 500
+    backpressure_limit: float = 0.9
+
+
+@dataclass(slots=True)
+class ReportingConfig:
+    snapshot_interval: timedelta = timedelta(minutes=5)
+    retention: timedelta = timedelta(days=7)
+
+
+@dataclass(slots=True)
+class AppConfig:
+    base_dir: Path
+    data_dir: Path
+    database_url: str
+    profile: str
+    stream: StreamConfig = field(default_factory=StreamConfig)
+    topology: TopologyConfig = field(default_factory=TopologyConfig)
+    reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
+    reporting: ReportingConfig = field(default_factory=ReportingConfig)
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
+def load_config(base_dir: Path | None = None) -> AppConfig:
+    base = base_dir or Path(os.getenv("INTEGRATOR_HOME", Path.cwd()))
+    data_dir = base / "integrator-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "integrator_sppr.db"
+
+    stream = StreamConfig(
+        max_bandwidth=_env_float("INTEGRATOR_MAX_BW", 1000.0),
+        priority_levels=_env_int("INTEGRATOR_PRI_LEVELS", 5),
+        default_priority=_env_int("INTEGRATOR_PRI_DEFAULT", 3),
+        smoothing_window=_env_int("INTEGRATOR_SMOOTH_WINDOW", 60),
+    )
+    topology = TopologyConfig(
+        max_edges=_env_int("INTEGRATOR_MAX_EDGES", 200),
+        heartbeat_interval=timedelta(
+            seconds=_env_int("INTEGRATOR_HEARTBEAT_SEC", 15)
+        ),
+        retry_policy={
+            "base_delay": _env_float("INTEGRATOR_RETRY_BASE", 2.0),
+            "max_delay": _env_float("INTEGRATOR_RETRY_MAX", 30.0),
+            "factor": _env_float("INTEGRATOR_RETRY_FACTOR", 2.0),
+        },
+    )
+    reliability = ReliabilityConfig(
+        breach_threshold=_env_float("INTEGRATOR_RELIABILITY_THRESHOLD", 0.85),
+        latency_budget_ms=_env_int("INTEGRATOR_LATENCY_BUDGET_MS", 500),
+        backpressure_limit=_env_float("INTEGRATOR_BACKPRESSURE_LIMIT", 0.9),
+    )
+    reporting = ReportingConfig(
+        snapshot_interval=timedelta(
+            minutes=_env_int("INTEGRATOR_REPORT_INTERVAL_MIN", 5)
+        ),
+        retention=timedelta(days=_env_int("INTEGRATOR_REPORT_RETENTION_DAYS", 7)),
+    )
+    extras = {
+        "instance_id": _env("INTEGRATOR_INSTANCE_ID", "integrator-local"),
+        "environment": _env("INTEGRATOR_ENVIRONMENT", "development"),
+    }
+
+    return AppConfig(
+        base_dir=base,
+        data_dir=data_dir,
+        database_url=f"sqlite:///{db_path}",
+        profile=_env("INTEGRATOR_PROFILE", "default"),
+        stream=stream,
+        topology=topology,
+        reliability=reliability,
+        reporting=reporting,
+        extras=extras,
+    )
+
+
+===== database.py =====
+"""SQLAlchemy helpers."""
+
+from __future__ import annotations
+
+import contextlib
+from typing import Iterator
+
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+
+class Base(DeclarativeBase):
+    """Declarative base."""
+
+
+class Database:
+    def __init__(self, url: str, echo: bool = False) -> None:
+        self._engine: Engine = create_engine(url, echo=echo, future=True)
+        self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False)
+
+    def create_all(self) -> None:
+        from . import models  # noqa: F401
+
+        Base.metadata.create_all(self._engine)
+
+    @contextlib.contextmanager
+    def session(self) -> Iterator[Session]:
+        session = self._session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+
+===== engine.py =====
+"""Integrator engine coordinating topology, streams, monitoring and reporting."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any, Dict
+
+from .config import AppConfig
+from .database import Database
+from .repositories import AuditRepository, ReportRepository
+from .services.monitor import MonitoringService
+from .services.reporting import ReportingService
+from .services.streams import StreamService
+from .services.topology import TopologyService
+from .services.scheduler import SchedulerService
+from .services.diagnostics import DiagnosticService
+
+
+@dataclass
+class EngineResult:
+    ok: bool
+    payload: Dict[str, Any]
+    error: str | None = None
+
+
+class IntegratorEngine:
+    def __init__(self, config: AppConfig, database: Database):
+        self.config = config
+        self.database = database
+        self.topology = TopologyService(config)
+        self.streams = StreamService(config)
+        self.monitor = MonitoringService(config)
+        self.reporting = ReportingService(config)
+        self.diagnostics = DiagnosticService()
+        self.scheduler = SchedulerService()
+        self._configure_scheduler()
+
+    def _configure_scheduler(self) -> None:
+        interval = self.config.reporting.snapshot_interval.total_seconds()
+        self.scheduler.add_task("reporting", interval, self._scheduled_snapshot)
+        self.scheduler.start()
+
+    def shutdown(self) -> None:
+        self.scheduler.stop()
+
+    @contextmanager
+    def _session(self):
+        with self.database.session() as session:
+            yield session
+
+    def register_node(self, payload: dict) -> EngineResult:
+        required = {"name", "kind", "api_url"}
+        missing = required - payload.keys()
+        if missing:
+            return EngineResult(False, {}, f"Отсутствуют поля: {', '.join(sorted(missing))}")
+        with self._session() as session:
+            priority = (
+                int(payload["priority"])
+                if payload.get("priority") is not None
+                else self.config.stream.default_priority
+            )
+            result = self.topology.register_node(
+                session,
+                payload["name"],
+                payload["kind"],
+                payload["api_url"],
+                priority=priority,
+            )
+            return EngineResult(True, result)
+
+    def connect_nodes(self, payload: dict) -> EngineResult:
+        required = {"from", "to"}
+        missing = required - payload.keys()
+        if missing:
+            return EngineResult(False, {}, f"Отсутствуют поля: {', '.join(sorted(missing))}")
+        with self._session() as session:
+            result = self.topology.connect(
+                session,
+                payload["from"],
+                payload["to"],
+                max_bandwidth=float(payload.get("max_bandwidth", self.config.stream.max_bandwidth / 10)),
+            )
+            return EngineResult(True, result)
+
+    def heartbeat(self, node: str) -> EngineResult:
+        with self._session() as session:
+            result = self.topology.heartbeat(session, node)
+            return EngineResult(True, result)
+
+    def add_channel(self, payload: dict) -> EngineResult:
+        required = {"edge_id", "label", "modality"}
+        missing = required - payload.keys()
+        if missing:
+            return EngineResult(False, {}, f"Отсутствуют поля: {', '.join(sorted(missing))}")
+        with self._session() as session:
+            result = self.streams.add_channel(
+                session,
+                edge_id=int(payload["edge_id"]),
+                label=payload["label"],
+                modality=payload["modality"],
+                priority=int(payload["priority"]) if payload.get("priority") is not None else None,
+                target_rate=float(payload["target_rate"]) if payload.get("target_rate") is not None else None,
+            )
+            return EngineResult(True, result)
+
+    def channel_metrics(self, payload: dict) -> EngineResult:
+        required = {"channel_id", "actual_rate", "dropped", "retries"}
+        missing = required - payload.keys()
+        if missing:
+            return EngineResult(False, {}, f"Отсутствуют поля: {', '.join(sorted(missing))}")
+        with self._session() as session:
+            result = self.streams.update_channel_metrics(
+                session,
+                channel_id=int(payload["channel_id"]),
+                actual_rate=float(payload["actual_rate"]),
+                dropped=int(payload["dropped"]),
+                retries=int(payload["retries"]),
+            )
+            ok = "error" not in result
+            return EngineResult(ok, result if ok else {}, None if ok else "channel_not_found")
+
+    def snapshot(self) -> EngineResult:
+        with self._session() as session:
+            telemetry = self.monitor.evaluate(session)
+            breaches = self.monitor.detect_breaches(session)
+            report = self.reporting.generate(session, telemetry, breaches)
+            nodes = [
+                status.__dict__
+                for status in self.diagnostics.snapshot(session)
+            ]
+            return EngineResult(True, {"telemetry": telemetry, "breaches": breaches, "report": report, "nodes": nodes})
+
+    def audit_log(self) -> EngineResult:
+        with self._session() as session:
+            repo = AuditRepository(session)
+            records = repo.latest(limit=50)
+            return EngineResult(
+                True,
+                {
+                    "logs": [
+                        {
+                            "type": record.event_type,
+                            "level": record.level,
+                            "message": record.message,
+                            "created_at": record.created_at.isoformat(),
+                        }
+                        for record in records
+                    ]
+                },
+            )
+
+    def reports(self) -> EngineResult:
+        with self._session() as session:
+            repo = ReportRepository(session)
+            snapshots = repo.list_reports(limit=10)
+            return EngineResult(
+                True,
+                {
+                    "reports": [
+                        {
+                            "title": snapshot.title,
+                            "generated_at": snapshot.generated_at.isoformat(),
+                            "metrics": snapshot.metrics,
+                        }
+                        for snapshot in snapshots
+                    ]
+                },
+            )
+
+    def _scheduled_snapshot(self) -> None:
+        with self._session() as session:
+            telemetry = self.monitor.evaluate(session)
+            breaches = self.monitor.detect_breaches(session)
+            self.reporting.generate(session, telemetry, breaches)
+
+
+===== logging_setup.py =====
+"""Logging configuration for Integrator SPPR."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Dict
+
+
+@dataclass(slots=True)
+class LoggerConfig:
+    level: int = logging.INFO
+    fmt: str = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+
+def setup_logging(config: LoggerConfig | None = None) -> Dict[str, logging.Logger]:
+    cfg = config or LoggerConfig()
+    logging.basicConfig(level=cfg.level, format=cfg.fmt)
+    return {
+        "integrator": logging.getLogger("integrator"),
+        "streams": logging.getLogger("integrator.streams"),
+        "topology": logging.getLogger("integrator.topology"),
+        "monitor": logging.getLogger("integrator.monitor"),
+        "report": logging.getLogger("integrator.report"),
+    }
+
+
+===== models.py =====
+"""ORM models describing integration topology and telemetry."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .database import Base
+
+ModuleKind = Enum(
+    "ingestion",
+    "analytics",
+    "dialog",
+    "storage",
+    "external",
+    name="module_kind",
+)
+
+
+class Node(Base):
+    __tablename__ = "nodes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    kind: Mapped[str] = mapped_column(ModuleKind, nullable=False)
+    api_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="unknown")
+    priority: Mapped[int] = mapped_column(Integer, default=3)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    outgoing_edges: Mapped[List["Edge"]] = relationship(
+        "Edge", foreign_keys="Edge.from_node_id", back_populates="from_node"
+    )
+    incoming_edges: Mapped[List["Edge"]] = relationship(
+        "Edge", foreign_keys="Edge.to_node_id", back_populates="to_node"
+    )
+
+
+class Edge(Base):
+    __tablename__ = "edges"
+    __table_args__ = (UniqueConstraint("from_node_id", "to_node_id", name="uix_edge"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    from_node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"))
+    to_node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    max_bandwidth: Mapped[float] = mapped_column(Float, default=100.0)
+    current_bandwidth: Mapped[float] = mapped_column(Float, default=0.0)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    packet_loss: Mapped[float] = mapped_column(Float, default=0.0)
+    reliability: Mapped[float] = mapped_column(Float, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    from_node: Mapped["Node"] = relationship("Node", foreign_keys=[from_node_id], back_populates="outgoing_edges")
+    to_node: Mapped["Node"] = relationship("Node", foreign_keys=[to_node_id], back_populates="incoming_edges")
+    channels: Mapped[List["Channel"]] = relationship(
+        "Channel", back_populates="edge", cascade="all, delete-orphan"
+    )
+
+
+class Channel(Base):
+    __tablename__ = "channels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("edges.id"))
+    label: Mapped[str] = mapped_column(String(64), nullable=False)
+    modality: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=3)
+    target_rate: Mapped[float] = mapped_column(Float, default=10.0)
+    actual_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    dropped_packets: Mapped[int] = mapped_column(Integer, default=0)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
+    attributes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    edge: Mapped["Edge"] = relationship("Edge", back_populates="channels")
+    flows: Mapped[List["FlowStat"]] = relationship(
+        "FlowStat", back_populates="channel", cascade="all, delete-orphan"
+    )
+
+
+class FlowStat(Base):
+    __tablename__ = "flow_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    window_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    volume: Mapped[float] = mapped_column(Float, default=0.0)
+    avg_latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    reliability: Mapped[float] = mapped_column(Float, default=1.0)
+    pressure: Mapped[float] = mapped_column(Float, default=0.0)
+    snapshot: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    channel: Mapped["Channel"] = relationship("Channel", back_populates="flows")
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    level: Mapped[str] = mapped_column(String(16), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ReportSnapshot(Base):
+    __tablename__ = "report_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    metrics: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class Heartbeat(Base):
+    __tablename__ = "heartbeats"
+    __table_args__ = (UniqueConstraint("node_id", name="uix_heartbeat_node"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"))
+    status: Mapped[str] = mapped_column(String(32), default="unknown")
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    node: Mapped["Node"] = relationship("Node")
+
+
+===== repositories.py =====
+"""Repository layer for Integrator SPPR."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from . import models
+
+
+class BaseRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+
+class NodeRepository(BaseRepository):
+    def upsert(self, name: str, kind: str, api_url: str, priority: int) -> models.Node:
+        stmt = select(models.Node).where(models.Node.name == name)
+        node = self.session.scalar(stmt)
+        now = datetime.utcnow()
+        if node:
+            node.api_url = api_url
+            node.kind = kind
+            node.priority = priority
+            node.updated_at = now
+        else:
+            node = models.Node(
+                name=name,
+                kind=kind,
+                api_url=api_url,
+                priority=priority,
+                created_at=now,
+                updated_at=now,
+            )
+            self.session.add(node)
+            self.session.flush()
+        return node
+
+    def list_nodes(self) -> List[models.Node]:
+        return list(self.session.scalars(select(models.Node).order_by(models.Node.name)))
+
+
+class EdgeRepository(BaseRepository):
+    def link(
+        self,
+        from_node: int,
+        to_node: int,
+        max_bandwidth: float,
+    ) -> models.Edge:
+        stmt = select(models.Edge).where(
+            models.Edge.from_node_id == from_node,
+            models.Edge.to_node_id == to_node,
+        )
+        edge = self.session.scalar(stmt)
+        now = datetime.utcnow()
+        if edge:
+            edge.max_bandwidth = max_bandwidth
+            edge.updated_at = now
+        else:
+            edge = models.Edge(
+                from_node_id=from_node,
+                to_node_id=to_node,
+                max_bandwidth=max_bandwidth,
+                created_at=now,
+                updated_at=now,
+            )
+            self.session.add(edge)
+            self.session.flush()
+        return edge
+
+    def set_metrics(
+        self,
+        edge_id: int,
+        bandwidth: float,
+        latency_ms: float,
+        reliability: float,
+        packet_loss: float,
+    ) -> None:
+        edge = self.session.get(models.Edge, edge_id)
+        if not edge:
+            return
+        edge.current_bandwidth = bandwidth
+        edge.latency_ms = latency_ms
+        edge.reliability = reliability
+        edge.packet_loss = packet_loss
+        edge.updated_at = datetime.utcnow()
+
+    def edges_for_node(self, node_id: int) -> List[models.Edge]:
+        stmt = select(models.Edge).where(
+            (models.Edge.from_node_id == node_id) | (models.Edge.to_node_id == node_id)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class ChannelRepository(BaseRepository):
+    def add(
+        self,
+        edge_id: int,
+        label: str,
+        modality: str,
+        priority: int,
+        target_rate: float,
+    ) -> models.Channel:
+        channel = models.Channel(
+            edge_id=edge_id,
+            label=label,
+            modality=modality,
+            priority=priority,
+            target_rate=target_rate,
+            attributes={},
+        )
+        self.session.add(channel)
+        self.session.flush()
+        return channel
+
+    def update_stats(
+        self,
+        channel_id: int,
+        actual_rate: float,
+        dropped: int,
+        retries: int,
+        metadata: Dict,
+    ) -> None:
+        channel = self.session.get(models.Channel, channel_id)
+        if not channel:
+            return
+        channel.actual_rate = actual_rate
+        channel.dropped_packets = dropped
+        channel.retries = retries
+        channel.attributes = metadata
+        channel.updated_at = datetime.utcnow()
+
+    def list_channels(self) -> List[models.Channel]:
+        stmt = select(models.Channel).order_by(models.Channel.created_at.desc())
+        return list(self.session.scalars(stmt))
+
+
+class FlowRepository(BaseRepository):
+    def add_snapshot(
+        self,
+        channel_id: int,
+        window_start: datetime,
+        window_end: datetime,
+        volume: float,
+        avg_latency_ms: float,
+        reliability: float,
+        pressure: float,
+        snapshot: Dict,
+    ) -> models.FlowStat:
+        stat = models.FlowStat(
+            channel_id=channel_id,
+            window_start=window_start,
+            window_end=window_end,
+            volume=volume,
+            avg_latency_ms=avg_latency_ms,
+            reliability=reliability,
+            pressure=pressure,
+            snapshot=snapshot,
+        )
+        self.session.add(stat)
+        self.session.flush()
+        return stat
+
+    def recent(self, channel_id: int, limit: int = 10) -> List[models.FlowStat]:
+        stmt = (
+            select(models.FlowStat)
+            .where(models.FlowStat.channel_id == channel_id)
+            .order_by(models.FlowStat.window_end.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class AuditRepository(BaseRepository):
+    def add(self, event_type: str, level: str, message: str, payload: Dict) -> None:
+        record = models.AuditLog(
+            event_type=event_type,
+            level=level,
+            message=message,
+            payload=payload,
+        )
+        self.session.add(record)
+
+    def latest(self, limit: int = 100) -> List[models.AuditLog]:
+        stmt = (
+            select(models.AuditLog)
+            .order_by(models.AuditLog.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+
+class ReportRepository(BaseRepository):
+    def store(self, title: str, body: str, metrics: Dict[str, Any]) -> models.ReportSnapshot:
+        report = models.ReportSnapshot(
+            title=title,
+            body=body,
+            metrics=metrics,
+        )
+        self.session.add(report)
+        self.session.flush()
+        return report
+
+    def list_reports(self, limit: int = 10) -> List[models.ReportSnapshot]:
+        stmt = (
+            select(models.ReportSnapshot)
+            .order_by(models.ReportSnapshot.generated_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+    def purge(self, older_than: datetime) -> int:
+        stmt = select(models.ReportSnapshot.id).where(
+            models.ReportSnapshot.generated_at < older_than
+        )
+        ids = list(self.session.scalars(stmt))
+        if not ids:
+            return 0
+        deleted = (
+            self.session.query(models.ReportSnapshot)
+            .filter(models.ReportSnapshot.id.in_(ids))
+            .delete(synchronize_session=False)
+        )
+        return deleted
+
+
+class HeartbeatRepository(BaseRepository):
+    def update(self, node_id: int, status: str, latency_ms: float) -> models.Heartbeat:
+        stmt = select(models.Heartbeat).where(models.Heartbeat.node_id == node_id)
+        heartbeat = self.session.scalar(stmt)
+        now = datetime.utcnow()
+        if heartbeat:
+            heartbeat.status = status
+            heartbeat.latency_ms = latency_ms
+            heartbeat.updated_at = now
+        else:
+            heartbeat = models.Heartbeat(
+                node_id=node_id,
+                status=status,
+                latency_ms=latency_ms,
+                updated_at=now,
+            )
+            self.session.add(heartbeat)
+            self.session.flush()
+        return heartbeat
+
+    def stale(self, older_than: datetime) -> List[models.Heartbeat]:
+        stmt = select(models.Heartbeat).where(models.Heartbeat.updated_at < older_than)
+        return list(self.session.scalars(stmt))
+
+
+def bandwidth_summary(session: Session, window: timedelta) -> Dict[str, float]:
+    now = datetime.utcnow()
+    since = now - window
+    stmt = select(
+        func.sum(models.FlowStat.volume),
+        func.avg(models.FlowStat.avg_latency_ms),
+        func.avg(models.FlowStat.reliability),
+    ).where(models.FlowStat.window_end >= since)
+    total, latency, reliability = session.execute(stmt).one_or_none() or (0, 0, 0)
+    return {
+        "volume": float(total or 0.0),
+        "latency": float(latency or 0.0),
+        "reliability": float(reliability or 0.0),
+    }
+
+
+===== utils.py =====
+"""Utility helpers for stream normalization and load-balancing."""
+
+from __future__ import annotations
+
+import math
+import random
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Deque, Dict, Iterable, List
+
+
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def smoothing(values: Iterable[float], window: int) -> float:
+    values = list(values)[-window:]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def adaptive_priority(current: int, reliability: float, backpressure: float) -> int:
+    delta = 0
+    if reliability < 0.8:
+        delta -= 1
+    if backpressure > 0.8:
+        delta -= 1
+    if reliability > 0.95 and backpressure < 0.5:
+        delta += 1
+    return max(1, min(5, current + delta))
+
+
+@dataclass
+class SlidingGauge:
+    size: int
+    values: Deque[float] = field(default_factory=deque)
+
+    def push(self, value: float) -> float:
+        self.values.append(value)
+        if len(self.values) > self.size:
+            self.values.popleft()
+        return sum(self.values) / len(self.values)
+
+
+def reliability_index(latency_ms: float, packet_loss: float, retries: int) -> float:
+    latency_penalty = clamp(latency_ms / 1000.0)
+    loss_penalty = clamp(packet_loss)
+    retry_penalty = clamp(retries / 10.0)
+    score = 1.0 - (0.4 * latency_penalty + 0.4 * loss_penalty + 0.2 * retry_penalty)
+    return clamp(score)
+
+
+def simulated_latency() -> float:
+    return round(random.uniform(50, 600), 2)
+
+
+def simulated_loss() -> float:
+    return round(random.uniform(0.0, 0.2), 3)
+
+
+def timestamp() -> str:
+    return datetime.utcnow().isoformat()
+
+
+===== api/routes.py =====
+"""Flask blueprint for Integrator SPPR."""
+
+from __future__ import annotations
+
+from flask import Blueprint, jsonify, request
+
+from ..engine import IntegratorEngine
+from . import schemas
+
+
+def create_blueprint(engine: IntegratorEngine) -> Blueprint:
+    bp = Blueprint("integrator_api", __name__)
+
+    @bp.route("/health", methods=["GET"])
+    def health():
+        return jsonify(schemas.success({"status": "ok"}).to_dict())
+
+    @bp.route("/nodes", methods=["POST"])
+    def register_node():
+        payload = request.get_json(force=True, silent=True) or {}
+        result = engine.register_node(payload)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 400)
+
+    @bp.route("/edges", methods=["POST"])
+    def connect_nodes():
+        payload = request.get_json(force=True, silent=True) or {}
+        result = engine.connect_nodes(payload)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 400)
+
+    @bp.route("/heartbeat/<name>", methods=["POST"])
+    def heartbeat(name: str):
+        result = engine.heartbeat(name)
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/channels", methods=["POST"])
+    def add_channel():
+        payload = request.get_json(force=True, silent=True) or {}
+        result = engine.add_channel(payload)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 400)
+
+    @bp.route("/channels/metrics", methods=["POST"])
+    def channel_metrics():
+        payload = request.get_json(force=True, silent=True) or {}
+        result = engine.channel_metrics(payload)
+        envelope = schemas.success(result.payload) if result.ok else schemas.failure(result.error or "error")
+        return jsonify(envelope.to_dict()), (200 if result.ok else 400)
+
+    @bp.route("/snapshot", methods=["POST"])
+    def snapshot():
+        result = engine.snapshot()
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/audit", methods=["GET"])
+    def audit():
+        result = engine.audit_log()
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    @bp.route("/reports", methods=["GET"])
+    def reports():
+        result = engine.reports()
+        return jsonify(schemas.success(result.payload).to_dict())
+
+    return bp
+
+
+===== api/schemas.py =====
+"""Response envelopes."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict
+
+
+def iso(dt: datetime | None = None) -> str:
+    dt = dt or datetime.utcnow()
+    return dt.replace(microsecond=0).isoformat() + "Z"
+
+
+@dataclass
+class Envelope:
+    ok: bool
+    payload: Dict[str, Any]
+    error: str | None = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"ok": self.ok, "payload": self.payload, "error": self.error, "timestamp": iso()}
+
+
+def success(payload: Dict[str, Any]) -> Envelope:
+    return Envelope(True, payload)
+
+
+def failure(message: str) -> Envelope:
+    return Envelope(False, {}, message)
+
+
+===== services/diagnostics.py =====
+"""Diagnostics helpers for quick health summaries."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .. import models
+
+
+@dataclass
+class NodeStatus:
+    name: str
+    status: str
+    latency_ms: float
+
+
+class DiagnosticService:
+    def snapshot(self, session: Session) -> List[NodeStatus]:
+        rows = session.scalars(
+            select(models.Heartbeat).join(models.Node).order_by(models.Node.name)
+        ).all()
+        return [
+            NodeStatus(
+                name=row.node.name if row.node else "unknown",
+                status=row.status,
+                latency_ms=row.latency_ms,
+            )
+            for row in rows
+        ]
+
+
+===== services/monitor.py =====
+"""Monitoring service: computes telemetry, detects breaches."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Dict, List
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .. import models
+from ..config import AppConfig
+from ..repositories import AuditRepository, bandwidth_summary
+
+LOGGER = logging.getLogger("integrator.monitor")
+
+
+class MonitoringService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def evaluate(self, session: Session) -> Dict[str, float]:
+        summary = bandwidth_summary(session, self.config.reporting.snapshot_interval)
+        LOGGER.info(
+            "Telemetry: volume=%.2f latency=%.2f reliability=%.2f",
+            summary["volume"],
+            summary["latency"],
+            summary["reliability"],
+        )
+        return summary
+
+    def detect_breaches(self, session: Session) -> List[dict]:
+        flows = session.scalars(
+            select(models.FlowStat).order_by(models.FlowStat.window_end.desc()).limit(50)
+        ).all()
+        breaches: List[dict] = []
+        audit = AuditRepository(session)
+        for flow in flows:
+            if flow.reliability < self.config.reliability.breach_threshold:
+                payload = {
+                    "channel_id": flow.channel_id,
+                    "reliability": flow.reliability,
+                    "window_end": flow.window_end.isoformat(),
+                }
+                audit.add("reliability_breach", "warning", "Reliability below threshold", payload)
+                breaches.append(payload)
+            if flow.avg_latency_ms > self.config.reliability.latency_budget_ms:
+                payload = {
+                    "channel_id": flow.channel_id,
+                    "latency_ms": flow.avg_latency_ms,
+                    "window_end": flow.window_end.isoformat(),
+                }
+                audit.add("latency_breach", "warning", "Latency above budget", payload)
+                breaches.append(payload)
+        return breaches
+
+
+===== services/reporting.py =====
+"""Reporting utilities for Integrator SPPR."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Dict, List
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import AuditRepository, ReportRepository
+
+
+class ReportingService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def generate(self, session: Session, telemetry: Dict[str, float], breaches: List[dict]) -> dict:
+        repo = ReportRepository(session)
+        title = f"Отчёт интегратора {datetime.utcnow():%Y-%m-%d %H:%M}"
+        body = self._format_body(telemetry, breaches)
+        report = repo.store(title, body, metrics=telemetry)
+        cutoff = datetime.utcnow() - self.config.reporting.retention
+        repo.purge(cutoff)
+        return {"report_id": report.id, "title": report.title}
+
+    def _format_body(self, telemetry: Dict[str, float], breaches: List[dict]) -> str:
+        lines = [
+            "Сводка потоков:",
+            f"- Объём данных: {telemetry['volume']:.2f} МБ",
+            f"- Средняя задержка: {telemetry['latency']:.2f} мс",
+            f"- Надёжность: {telemetry['reliability']:.2f}",
+            "",
+            "Выявленные события:",
+        ]
+        if not breaches:
+            lines.append("- Отклонения не зафиксированы")
+        else:
+            for breach in breaches:
+                line = f"- Канал {breach.get('channel_id')} "
+                if "reliability" in breach:
+                    line += f"надёжность {breach['reliability']:.2f}"
+                if "latency_ms" in breach:
+                    line += f" задержка {breach['latency_ms']:.2f} мс"
+                lines.append(line)
+        return "\n".join(lines)
+
+
+===== services/scheduler.py =====
+"""Lightweight scheduler for periodic tasks."""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict
+
+
+@dataclass
+class ScheduledTask:
+    name: str
+    interval: float
+    handler: Callable[[], None]
+    last_run: float = 0.0
+
+
+class SchedulerService:
+    def __init__(self):
+        self._tasks: Dict[str, ScheduledTask] = {}
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def add_task(self, name: str, interval: float, handler: Callable[[], None]) -> None:
+        self._tasks[name] = ScheduledTask(name=name, interval=interval, handler=handler)
+
+    def start(self) -> None:
+        if self._thread:
+            return
+
+        def _loop():
+            while not self._stop.is_set():
+                now = time.time()
+                for task in self._tasks.values():
+                    if now - task.last_run >= task.interval:
+                        try:
+                            task.handler()
+                        finally:
+                            task.last_run = now
+                self._stop.wait(1.0)
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=2)
+            self._thread = None
+            self._stop.clear()
+
+
+===== services/streams.py =====
+"""Stream orchestration: balancing channels, recording flow stats."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .. import models
+from ..config import AppConfig
+from ..repositories import ChannelRepository, EdgeRepository, FlowRepository
+from .. import utils
+
+LOGGER = logging.getLogger("integrator.streams")
+
+
+class StreamService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.rate_history: Dict[int, List[float]] = {}
+
+    def add_channel(
+        self,
+        session: Session,
+        edge_id: int,
+        label: str,
+        modality: str,
+        priority: int | None = None,
+        target_rate: float | None = None,
+    ) -> dict:
+        repo = ChannelRepository(session)
+        channel = repo.add(
+            edge_id=edge_id,
+            label=label,
+            modality=modality,
+            priority=priority or self.config.stream.default_priority,
+            target_rate=target_rate or 10.0,
+        )
+        LOGGER.info("Channel %s attached to edge %s", label, edge_id)
+        return {"channel_id": channel.id, "label": channel.label}
+
+    def update_channel_metrics(
+        self,
+        session: Session,
+        channel_id: int,
+        actual_rate: float,
+        dropped: int,
+        retries: int,
+    ) -> dict:
+        channel = session.get(models.Channel, channel_id)
+        if not channel:
+            return {"error": "channel_not_found"}
+        backpressure = utils.clamp(actual_rate / max(channel.target_rate, 1.0))
+        reliability = utils.reliability_index(channel.edge.latency_ms, channel.edge.packet_loss, retries)
+        new_priority = utils.adaptive_priority(channel.priority, reliability, backpressure)
+        channel.priority = new_priority
+        repo = ChannelRepository(session)
+        repo.update_stats(
+            channel_id=channel_id,
+            actual_rate=actual_rate,
+            dropped=dropped,
+            retries=retries,
+            metadata={
+                "reliability": reliability,
+                "backpressure": backpressure,
+            },
+        )
+        LOGGER.debug(
+            "Channel %s metrics updated: rate=%s reliability=%s priority=%s",
+            channel.label,
+            actual_rate,
+            reliability,
+            new_priority,
+        )
+        return {
+            "channel_id": channel_id,
+            "priority": new_priority,
+            "reliability": reliability,
+            "backpressure": backpressure,
+        }
+
+    def record_flow(
+        self,
+        session: Session,
+        channel_id: int,
+        window: timedelta,
+        volume: float,
+        latency_ms: float,
+        reliability: float,
+        pressure: float,
+    ) -> dict:
+        repo = FlowRepository(session)
+        now = datetime.utcnow()
+        stat = repo.add_snapshot(
+            channel_id=channel_id,
+            window_start=now - window,
+            window_end=now,
+            volume=volume,
+            avg_latency_ms=latency_ms,
+            reliability=reliability,
+            pressure=pressure,
+            snapshot={
+                "bandwidth": volume / max(window.total_seconds(), 1.0),
+                "timestamp": utils.timestamp(),
+            },
+        )
+        LOGGER.debug("Flow snapshot stored for channel %s", channel_id)
+        return {"flow_id": stat.id}
+
+    def balance_edges(self, session: Session) -> List[dict]:
+        edges = session.scalars(select(models.Edge)).all()
+        adjustments: List[dict] = []
+        for edge in edges:
+            utilization = edge.current_bandwidth / max(edge.max_bandwidth, 1.0)
+            if utilization > 0.95:
+                edge.max_bandwidth *= 1.1
+                action = "increase"
+            elif utilization < 0.4:
+                edge.max_bandwidth *= 0.9
+                action = "decrease"
+            else:
+                action = "keep"
+            adjustments.append(
+                {
+                    "edge_id": edge.id,
+                    "from": edge.from_node.name if edge.from_node else None,
+                    "to": edge.to_node.name if edge.to_node else None,
+                    "action": action,
+                    "max_bandwidth": edge.max_bandwidth,
+                }
+            )
+        return adjustments
+
+
+===== services/topology.py =====
+"""Topology service for linking modules and tracking heartbeats."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List
+
+from sqlalchemy.orm import Session
+
+from ..config import AppConfig
+from ..repositories import EdgeRepository, HeartbeatRepository, NodeRepository
+from .. import utils
+
+LOGGER = logging.getLogger("integrator.topology")
+
+
+class TopologyService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def register_node(
+        self,
+        session: Session,
+        name: str,
+        kind: str,
+        api_url: str,
+        priority: int | None = None,
+    ) -> dict:
+        repo = NodeRepository(session)
+        node = repo.upsert(
+            name=name,
+            kind=kind,
+            api_url=api_url,
+            priority=priority or self.config.stream.default_priority,
+        )
+        LOGGER.info("Node %s registered as %s", node.name, node.kind)
+        return {"id": node.id, "name": node.name}
+
+    def connect(
+        self,
+        session: Session,
+        from_node: str,
+        to_node: str,
+        max_bandwidth: float,
+    ) -> dict:
+        node_repo = NodeRepository(session)
+        edge_repo = EdgeRepository(session)
+        a = node_repo.upsert(from_node, "external", "http://localhost", self.config.stream.default_priority)
+        b = node_repo.upsert(to_node, "external", "http://localhost", self.config.stream.default_priority)
+        edge = edge_repo.link(a.id, b.id, max_bandwidth=max_bandwidth)
+        LOGGER.info("Edge %s->%s configured", from_node, to_node)
+        return {"edge_id": edge.id, "from": from_node, "to": to_node}
+
+    def heartbeat(self, session: Session, node_name: str, latency_ms: float | None = None) -> dict:
+        node_repo = NodeRepository(session)
+        hb_repo = HeartbeatRepository(session)
+        node = node_repo.upsert(node_name, "external", "http://localhost", self.config.stream.default_priority)
+        latency = latency_ms or utils.simulated_latency()
+        heartbeat = hb_repo.update(node.id, status="alive", latency_ms=latency)
+        return {"node": node.name, "latency_ms": latency, "updated_at": heartbeat.updated_at.isoformat()}
+
+    def prune_stale(self, session: Session, threshold: timedelta) -> List[str]:
+        repo = HeartbeatRepository(session)
+        stale = repo.stale(datetime.utcnow() - threshold)
+        for entry in stale:
+            entry.status = "stale"
+        return [entry.node.name for entry in stale if entry.node]
+

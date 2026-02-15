@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+from .config_schema import CONFIG_FIELDS, FIELDS_BY_ENV, FIELDS_BY_NAME, field_snapshot_key
 
 if False:  # pragma: no cover - только для подсказок типов без циклического импорта
     from flask import Flask  # noqa: F401
@@ -55,6 +57,83 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+_FIELD_BY_SNAPSHOT_KEY: Dict[str, Any] = {field_snapshot_key(f): f for f in CONFIG_FIELDS}
+_FIELD_BY_JSON_KEY: Dict[str, Any] = {str((f.json_key or f.name)).lower(): f for f in CONFIG_FIELDS}
+_FIELD_TO_ATTR: Dict[str, str] = {
+    "ocr_langs": "ocr_langs_cfg",
+    "pdf_ocr_pages": "pdf_ocr_pages_cfg",
+}
+
+
+def _resolve_field_by_input_key(key: str):
+    token = str(key or "").strip()
+    if not token:
+        return None
+    lower = token.lower()
+    if lower in FIELDS_BY_NAME:
+        return FIELDS_BY_NAME[lower]
+    if lower in _FIELD_BY_JSON_KEY:
+        return _FIELD_BY_JSON_KEY[lower]
+    upper = token.upper()
+    if upper in _FIELD_BY_SNAPSHOT_KEY:
+        return _FIELD_BY_SNAPSHOT_KEY[upper]
+    if upper in FIELDS_BY_ENV:
+        return FIELDS_BY_ENV[upper]
+    return None
+
+
+def _coerce_schema_value(field_def, raw: Any) -> Any:
+    type_hint = (field_def.type_hint or "").lower()
+    if raw is None:
+        return None
+    if "bool" in type_hint:
+        return _coerce_bool(raw, default=bool(field_def.default))
+    if "int" in type_hint:
+        return int(raw)
+    if "float" in type_hint:
+        return float(raw)
+    if "path" in type_hint:
+        return Path(str(raw)).expanduser().resolve()
+    if "list" in type_hint:
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                return [item.strip() for item in raw.split(",") if item.strip()]
+        if isinstance(raw, (list, tuple)):
+            return list(raw)
+        return []
+    if "dict" in type_hint:
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        if isinstance(raw, Mapping):
+            return dict(raw)
+        return {}
+    return str(raw) if isinstance(raw, Path) else raw
+
+
+def _apply_constraints(field_def, value: Any) -> Any:
+    constraints = field_def.constraints or {}
+    if value is None:
+        return None
+    if "enum" in constraints:
+        allowed = set(constraints["enum"])
+        if value not in allowed:
+            raise ValueError(f"Value '{value}' not in enum for {field_def.name}")
+    if isinstance(value, (int, float)):
+        if "min" in constraints and value < constraints["min"]:
+            raise ValueError(f"Value below min for {field_def.name}")
+        if "max" in constraints and value > constraints["max"]:
+            raise ValueError(f"Value above max for {field_def.name}")
+    return value
 
 
 def _normalize_material_types(
@@ -144,6 +223,13 @@ class RuntimeSettings:
     ocr_langs_cfg: str
     pdf_ocr_pages_cfg: int
     always_ocr_first_page_dissertation: bool
+    doc_chat_chunk_max_tokens: int = 700
+    doc_chat_chunk_overlap: int = 120
+    doc_chat_chunk_min_tokens: int = 80
+    doc_chat_max_chunks: int = 0
+    doc_chat_fallback_chunks: int = 0
+    doc_chat_image_min_width: int = 32
+    doc_chat_image_min_height: int = 32
     rag_embedding_backend: str = "auto"
     rag_embedding_model: str = "intfloat/multilingual-e5-large"
     rag_embedding_dim: int = 384
@@ -164,6 +250,14 @@ class RuntimeSettings:
     rag_rerank_max_chars: int = 1200
     prompts: Dict[str, str] = field(default_factory=dict)
     ai_rerank_llm: bool = False
+    llm_pool_global_concurrency: int = 4
+    llm_pool_per_user_concurrency: int = 1
+    llm_queue_max_size: int = 100
+    llm_queue_per_user_max: int = 10
+    llm_request_timeout_sec: int = 90
+    llm_retry_count: int = 1
+    llm_retry_backoff_ms: int = 500
+    lmstudio_idle_unload_minutes: int = 0
     llm_cache_enabled: bool = True
     llm_cache_ttl_seconds: int = 600
     llm_cache_max_items: int = 256
@@ -214,6 +308,13 @@ class RuntimeSettings:
             audio_keywords_llm=config.audio_keywords_llm,
             images_vision_enabled=config.images_vision_enabled,
             keywords_to_tags_enabled=config.keywords_to_tags_enabled,
+            doc_chat_chunk_max_tokens=config.doc_chat_chunk_max_tokens,
+            doc_chat_chunk_overlap=config.doc_chat_chunk_overlap,
+            doc_chat_chunk_min_tokens=config.doc_chat_chunk_min_tokens,
+            doc_chat_max_chunks=config.doc_chat_max_chunks,
+            doc_chat_fallback_chunks=config.doc_chat_fallback_chunks,
+            doc_chat_image_min_width=config.doc_chat_image_min_width,
+            doc_chat_image_min_height=config.doc_chat_image_min_height,
             type_detect_flow=config.type_detect_flow,
             type_llm_override=config.type_llm_override,
             import_subdir=_sanitize_subdir(config.import_subdir),
@@ -228,6 +329,14 @@ class RuntimeSettings:
             always_ocr_first_page_dissertation=config.always_ocr_first_page_dissertation,
             prompts=dict(config.prompts),
             ai_rerank_llm=config.ai_rerank_llm,
+            llm_pool_global_concurrency=config.llm_pool_global_concurrency,
+            llm_pool_per_user_concurrency=config.llm_pool_per_user_concurrency,
+            llm_queue_max_size=config.llm_queue_max_size,
+            llm_queue_per_user_max=config.llm_queue_per_user_max,
+            llm_request_timeout_sec=config.llm_request_timeout_sec,
+            llm_retry_count=config.llm_retry_count,
+            llm_retry_backoff_ms=config.llm_retry_backoff_ms,
+            lmstudio_idle_unload_minutes=getattr(config, "lmstudio_idle_unload_minutes", 0),
             llm_cache_enabled=config.llm_cache_enabled,
             llm_cache_ttl_seconds=config.llm_cache_ttl_seconds,
             llm_cache_max_items=config.llm_cache_max_items,
@@ -275,6 +384,13 @@ class RuntimeSettings:
             "AUDIO_KEYWORDS_LLM": bool(self.audio_keywords_llm),
             "IMAGES_VISION_ENABLED": bool(self.images_vision_enabled),
             "KEYWORDS_TO_TAGS_ENABLED": bool(self.keywords_to_tags_enabled),
+            "DOC_CHAT_CHUNK_MAX_TOKENS": int(self.doc_chat_chunk_max_tokens),
+            "DOC_CHAT_CHUNK_OVERLAP": int(self.doc_chat_chunk_overlap),
+            "DOC_CHAT_CHUNK_MIN_TOKENS": int(self.doc_chat_chunk_min_tokens),
+            "DOC_CHAT_MAX_CHUNKS": int(self.doc_chat_max_chunks),
+            "DOC_CHAT_FALLBACK_CHUNKS": int(self.doc_chat_fallback_chunks),
+            "DOC_CHAT_IMAGE_MIN_WIDTH": int(self.doc_chat_image_min_width),
+            "DOC_CHAT_IMAGE_MIN_HEIGHT": int(self.doc_chat_image_min_height),
             "TYPE_DETECT_FLOW": self.type_detect_flow,
             "TYPE_LLM_OVERRIDE": bool(self.type_llm_override),
             "IMPORT_SUBDIR": self.import_subdir,
@@ -289,6 +405,14 @@ class RuntimeSettings:
             "ALWAYS_OCR_FIRST_PAGE_DISSERTATION": bool(self.always_ocr_first_page_dissertation),
             "PROMPTS": dict(self.prompts),
             "AI_RERANK_LLM": bool(self.ai_rerank_llm),
+            "LLM_POOL_GLOBAL_CONCURRENCY": int(self.llm_pool_global_concurrency),
+            "LLM_POOL_PER_USER_CONCURRENCY": int(self.llm_pool_per_user_concurrency),
+            "LLM_QUEUE_MAX_SIZE": int(self.llm_queue_max_size),
+            "LLM_QUEUE_PER_USER_MAX": int(self.llm_queue_per_user_max),
+            "LLM_REQUEST_TIMEOUT_SEC": int(self.llm_request_timeout_sec),
+            "LLM_RETRY_COUNT": int(self.llm_retry_count),
+            "LLM_RETRY_BACKOFF_MS": int(self.llm_retry_backoff_ms),
+            "LMSTUDIO_IDLE_UNLOAD_MINUTES": int(self.lmstudio_idle_unload_minutes),
             "AI_RAG_RETRY_ENABLED": bool(self.ai_rag_retry_enabled),
             "AI_RAG_RETRY_THRESHOLD": float(self.ai_rag_retry_threshold),
             "AI_FEEDBACK_TRAIN_INTERVAL_HOURS": float(self.feedback_train_interval_hours),
@@ -351,190 +475,50 @@ class RuntimeSettings:
         app.config["MATERIAL_TYPES"] = copy.deepcopy(self.material_types)
         app.config["AI_FEEDBACK_TRAIN_INTERVAL_HOURS"] = self.feedback_train_interval_hours
         app.config["AI_FEEDBACK_TRAIN_CUTOFF_DAYS"] = self.feedback_train_cutoff_days
+        app.config["LLM_POOL_GLOBAL_CONCURRENCY"] = self.llm_pool_global_concurrency
+        app.config["LLM_POOL_PER_USER_CONCURRENCY"] = self.llm_pool_per_user_concurrency
+        app.config["LLM_QUEUE_MAX_SIZE"] = self.llm_queue_max_size
+        app.config["LLM_QUEUE_PER_USER_MAX"] = self.llm_queue_per_user_max
+        app.config["LLM_REQUEST_TIMEOUT_SEC"] = self.llm_request_timeout_sec
+        app.config["LLM_RETRY_COUNT"] = self.llm_retry_count
+        app.config["LLM_RETRY_BACKOFF_MS"] = self.llm_retry_backoff_ms
+        app.config["LMSTUDIO_IDLE_UNLOAD_MINUTES"] = self.lmstudio_idle_unload_minutes
 
     # -- обновление -------------------------------------------------------
     def update_from_mapping(self, payload: Mapping[str, Any]) -> None:
         for key, raw in payload.items():
-            if key == "SCAN_ROOT" and raw:
-                self.scan_root = Path(str(raw)).expanduser().resolve()
-            elif key == "EXTRACT_TEXT":
-                self.extract_text = _coerce_bool(raw, default=self.extract_text)
-            elif key == "LMSTUDIO_API_BASE" and raw is not None:
-                self.lmstudio_api_base = str(raw)
-            elif key == "LMSTUDIO_MODEL" and raw is not None:
-                self.lmstudio_model = str(raw)
-            elif key == "LMSTUDIO_API_KEY":
-                self.lmstudio_api_key = str(raw or "")
-            elif key == "LM_DEFAULT_PROVIDER" and raw:
-                self.lm_default_provider = str(raw).strip().lower() or self.lm_default_provider
-            elif key == "RAG_EMBEDDING_BACKEND" and raw is not None:
-                text = str(raw).strip().lower()
-                self.rag_embedding_backend = text or self.rag_embedding_backend
-            elif key == "RAG_EMBEDDING_MODEL" and raw is not None:
-                self.rag_embedding_model = str(raw)
-            elif key == "RAG_EMBEDDING_DIM":
-                try:
-                    self.rag_embedding_dim = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "RAG_EMBEDDING_BATCH":
-                try:
-                    self.rag_embedding_batch_size = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "RAG_EMBEDDING_DEVICE":
-                self.rag_embedding_device = str(raw).strip() or None
-            elif key == "RAG_EMBEDDING_ENDPOINT" and raw is not None:
-                self.rag_embedding_endpoint = str(raw).strip()
-            elif key == "RAG_EMBEDDING_API_KEY":
-                self.rag_embedding_api_key = str(raw or "")
-            elif key == "RAG_RERANK_BACKEND" and raw is not None:
-                token = str(raw).strip().lower()
-                if token:
-                    self.rag_rerank_backend = token
-            elif key == "RAG_RERANK_MODEL" and raw is not None:
-                self.rag_rerank_model = str(raw)
-            elif key == "RAG_RERANK_DEVICE":
-                self.rag_rerank_device = str(raw).strip() or None
-            elif key == "RAG_RERANK_BATCH_SIZE":
-                try:
-                    self.rag_rerank_batch_size = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "RAG_RERANK_MAX_LENGTH":
-                try:
-                    self.rag_rerank_max_length = max(32, int(raw))
-                except Exception:
-                    pass
-            elif key == "RAG_RERANK_MAX_CHARS":
-                try:
-                    self.rag_rerank_max_chars = max(200, int(raw))
-                except Exception:
-                    pass
-            elif key == "AI_QUERY_VARIANTS_MAX":
-                try:
-                    self.ai_query_variants_max = max(0, int(raw))
-                except Exception:
-                    pass
-            elif key == "AI_RAG_RETRY_ENABLED":
-                self.ai_rag_retry_enabled = _coerce_bool(raw, default=self.ai_rag_retry_enabled)
-            elif key == "AI_RAG_RETRY_THRESHOLD":
-                try:
-                    self.ai_rag_retry_threshold = max(0.0, min(1.0, float(raw)))
-                except Exception:
-                    pass
-            elif key == "AI_FEEDBACK_TRAIN_INTERVAL_HOURS":
-                try:
-                    self.feedback_train_interval_hours = max(0.0, float(raw))
-                except Exception:
-                    pass
-            elif key == "AI_FEEDBACK_TRAIN_CUTOFF_DAYS":
-                try:
-                    self.feedback_train_cutoff_days = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "TRANSCRIBE_ENABLED":
-                self.transcribe_enabled = _coerce_bool(raw, default=self.transcribe_enabled)
-            elif key == "TRANSCRIBE_BACKEND" and raw is not None:
-                self.transcribe_backend = str(raw)
-            elif key == "TRANSCRIBE_MODEL_PATH" and raw is not None:
-                self.transcribe_model_path = str(raw)
-            elif key == "TRANSCRIBE_LANGUAGE" and raw is not None:
-                self.transcribe_language = str(raw)
-            elif key == "SUMMARIZE_AUDIO":
-                self.summarize_audio = _coerce_bool(raw, default=self.summarize_audio)
-            elif key == "AUDIO_KEYWORDS_LLM":
-                self.audio_keywords_llm = _coerce_bool(raw, default=self.audio_keywords_llm)
-            elif key == "IMAGES_VISION_ENABLED":
-                self.images_vision_enabled = _coerce_bool(raw, default=self.images_vision_enabled)
-            elif key == "KEYWORDS_TO_TAGS_ENABLED":
-                self.keywords_to_tags_enabled = _coerce_bool(raw, default=self.keywords_to_tags_enabled)
-            elif key == "TYPE_DETECT_FLOW" and raw is not None:
-                self.type_detect_flow = str(raw)
-            elif key == "TYPE_LLM_OVERRIDE":
-                self.type_llm_override = _coerce_bool(raw, default=self.type_llm_override)
-            elif key == "IMPORT_SUBDIR" and raw is not None:
-                self.import_subdir = _sanitize_subdir(str(raw))
-            elif key == "MOVE_ON_RENAME":
-                self.move_on_rename = _coerce_bool(raw, default=self.move_on_rename)
-            elif key == "COLLECTIONS_IN_SEPARATE_DIRS":
-                self.collections_in_separate_dirs = _coerce_bool(raw, default=self.collections_in_separate_dirs)
-            elif key == "COLLECTION_TYPE_SUBDIRS":
-                self.collection_type_subdirs = _coerce_bool(raw, default=self.collection_type_subdirs)
-            elif key == "TYPE_DIRS" and isinstance(raw, Mapping):
-                self.type_dirs = {str(k): str(v) for k, v in raw.items()}
-            elif key == "DEFAULT_USE_LLM":
-                self.default_use_llm = _coerce_bool(raw, default=self.default_use_llm)
-            elif key == "DEFAULT_PRUNE":
-                self.default_prune = _coerce_bool(raw, default=self.default_prune)
-            elif key == "OCR_LANGS_CFG" and raw is not None:
-                self.ocr_langs_cfg = str(raw)
-            elif key == "PDF_OCR_PAGES_CFG":
-                try:
-                    self.pdf_ocr_pages_cfg = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "ALWAYS_OCR_FIRST_PAGE_DISSERTATION":
-                self.always_ocr_first_page_dissertation = _coerce_bool(
-                    raw, default=self.always_ocr_first_page_dissertation
-                )
-            elif key == "PROMPTS" and isinstance(raw, Mapping):
+            if str(key).upper() == "PROMPTS" and isinstance(raw, Mapping):
                 for p_key, p_val in raw.items():
                     if isinstance(p_val, str):
                         self.prompts[str(p_key)] = p_val
-            elif key == "AI_RERANK_LLM":
-                self.ai_rerank_llm = _coerce_bool(raw, default=self.ai_rerank_llm)
-            elif key == "LLM_CACHE_ENABLED":
-                self.llm_cache_enabled = _coerce_bool(raw, default=self.llm_cache_enabled)
-            elif key == "LLM_CACHE_TTL_SECONDS":
-                try:
-                    self.llm_cache_ttl_seconds = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "LLM_CACHE_MAX_ITEMS":
-                try:
-                    self.llm_cache_max_items = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "LLM_CACHE_ONLY_MODE":
-                self.llm_cache_only_mode = _coerce_bool(raw, default=self.llm_cache_only_mode)
-            elif key == "SEARCH_CACHE_ENABLED":
-                self.search_cache_enabled = _coerce_bool(raw, default=self.search_cache_enabled)
-            elif key == "SEARCH_CACHE_TTL_SECONDS":
-                try:
-                    self.search_cache_ttl_seconds = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "SEARCH_CACHE_MAX_ITEMS":
-                try:
-                    self.search_cache_max_items = max(1, int(raw))
-                except Exception:
-                    pass
-            elif key == "LM_MAX_INPUT_CHARS":
-                try:
-                    self.lm_max_input_chars = max(500, int(raw))
-                except Exception:
-                    pass
-            elif key == "LM_MAX_OUTPUT_TOKENS":
-                try:
-                    self.lm_max_output_tokens = max(16, int(raw))
-                except Exception:
-                    pass
-            elif key == "AZURE_OPENAI_API_VERSION" and raw is not None:
-                token = str(raw).strip()
-                if token:
-                    self.azure_openai_api_version = token
-            elif key == "SEARCH_FACET_TAG_KEYS":
-                self.search_facet_tag_keys = _sanitize_list(raw) if raw is not None else None
-            elif key == "GRAPH_FACET_TAG_KEYS":
-                self.graph_facet_tag_keys = _sanitize_list(raw) if raw is not None else None
-            elif key == "SEARCH_FACET_INCLUDE_TYPES":
-                self.search_facet_include_types = _coerce_bool(
-                    raw, default=self.search_facet_include_types
-                )
-            elif key == "MATERIAL_TYPES":
+                continue
+
+            field_def = _resolve_field_by_input_key(str(key))
+            if not field_def or not field_def.runtime_mutable:
+                continue
+            attr_name = _FIELD_TO_ATTR.get(field_def.name, field_def.name)
+            if not hasattr(self, attr_name):
+                continue
+            try:
+                value = _coerce_schema_value(field_def, raw)
+                value = _apply_constraints(field_def, value)
+            except Exception:
+                continue
+
+            if field_def.name == "import_subdir" and value is not None:
+                value = _sanitize_subdir(str(value))
+            elif field_def.name in {"rag_embedding_device", "rag_rerank_device"}:
+                value = str(value).strip() or None
+            elif field_def.name in {"search_facet_tag_keys", "graph_facet_tag_keys"}:
+                value = _sanitize_list(value) if value is not None else None
+            elif field_def.name == "type_dirs" and isinstance(value, Mapping):
+                value = {str(k): str(v) for k, v in value.items()}
+            elif field_def.name == "material_types":
                 fallback = self.material_types or None
-                self.material_types = _normalize_material_types(raw, fallback=fallback)
+                value = _normalize_material_types(value, fallback=fallback)
+            elif field_def.name == "lm_default_provider" and value:
+                value = str(value).strip().lower()
+            setattr(self, attr_name, value)
 
         if not self.collections_in_separate_dirs:
             self.collection_type_subdirs = False

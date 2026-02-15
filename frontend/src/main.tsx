@@ -10,39 +10,38 @@ import StatsPage from './pages/StatsPage'
 import SettingsPage from './pages/SettingsPage'
 import IngestPage from './pages/IngestPage'
 import DocumentChatPage from './pages/DocumentChatPage'
+import OsintPage from './pages/OsintPage'
 import LoginPage from './pages/LoginPage'
 import ProfilePage from './pages/ProfilePage'
 import UsersPage from './pages/UsersPage'
 import AdminTasksPage from './pages/AdminTasksPage'
 import AdminLogsPage from './pages/AdminLogsPage'
-import AdminLlmPage from './pages/AdminLlmPage'
 import AdminCollectionsPage from './pages/AdminCollectionsPage'
 import AdminAiMetricsPage from './pages/AdminAiMetricsPage'
 import AdminServiceStatusPage from './pages/AdminServiceStatusPage'
-import AdminFacetSettingsPage from './pages/AdminFacetSettingsPage'
 import ToastProvider from './ui/Toasts'
 import AuthProvider from './ui/Auth'
+import { AppErrorBoundary, PageErrorBoundary } from './ui/ErrorBoundary'
 
 const router = createBrowserRouter([
   {
     path: '/',
     element: <App />,
     children: [
-      { index: true, element: <Catalogue /> },
-      { path: 'doc-chat', element: <DocumentChatPage /> },
-      { path: 'graph', element: <GraphPage /> },
-      { path: 'stats', element: <StatsPage /> },
-      { path: 'settings', element: <SettingsPage /> },
-      { path: 'ingest', element: <IngestPage /> },
-      { path: 'profile', element: <ProfilePage /> },
-      { path: 'users', element: <UsersPage /> },
-      { path: 'admin/tasks', element: <AdminTasksPage /> },
-      { path: 'admin/logs', element: <AdminLogsPage /> },
-      { path: 'admin/llm', element: <AdminLlmPage /> },
-      { path: 'admin/status', element: <AdminServiceStatusPage /> },
-      { path: 'admin/collections', element: <AdminCollectionsPage /> },
-      { path: 'admin/ai-metrics', element: <AdminAiMetricsPage /> },
-      { path: 'admin/facets', element: <AdminFacetSettingsPage /> },
+      { index: true, element: <PageErrorBoundary label="Каталог"><Catalogue /></PageErrorBoundary> },
+      { path: 'doc-chat', element: <PageErrorBoundary label="Чат по документу"><DocumentChatPage /></PageErrorBoundary> },
+      { path: 'osint', element: <PageErrorBoundary label="OSINT"><OsintPage /></PageErrorBoundary> },
+      { path: 'graph', element: <PageErrorBoundary label="Граф"><GraphPage /></PageErrorBoundary> },
+      { path: 'stats', element: <PageErrorBoundary label="Статистика"><StatsPage /></PageErrorBoundary> },
+      { path: 'settings', element: <PageErrorBoundary label="Настройки"><SettingsPage /></PageErrorBoundary> },
+      { path: 'ingest', element: <PageErrorBoundary label="Импорт"><IngestPage /></PageErrorBoundary> },
+      { path: 'profile', element: <PageErrorBoundary label="Профиль"><ProfilePage /></PageErrorBoundary> },
+      { path: 'users', element: <PageErrorBoundary label="Пользователи"><UsersPage /></PageErrorBoundary> },
+      { path: 'admin/tasks', element: <PageErrorBoundary label="Админ: задачи"><AdminTasksPage /></PageErrorBoundary> },
+      { path: 'admin/logs', element: <PageErrorBoundary label="Админ: логи"><AdminLogsPage /></PageErrorBoundary> },
+      { path: 'admin/status', element: <PageErrorBoundary label="Админ: состояние"><AdminServiceStatusPage /></PageErrorBoundary> },
+      { path: 'admin/collections', element: <PageErrorBoundary label="Админ: коллекции"><AdminCollectionsPage /></PageErrorBoundary> },
+      { path: 'admin/ai-metrics', element: <PageErrorBoundary label="Админ: AI метрики"><AdminAiMetricsPage /></PageErrorBoundary> },
     ],
   },
   { path: '/login', element: <LoginPage /> },
@@ -50,10 +49,12 @@ const router = createBrowserRouter([
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <ToastProvider>
-      <AuthProvider>
-        <RouterProvider router={router} />
-      </AuthProvider>
-    </ToastProvider>
+    <AppErrorBoundary>
+      <ToastProvider>
+        <AuthProvider>
+          <RouterProvider router={router} />
+        </AuthProvider>
+      </ToastProvider>
+    </AppErrorBoundary>
   </React.StrictMode>
 )

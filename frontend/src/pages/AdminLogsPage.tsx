@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { useAuth } from '../ui/Auth'
 import { useToasts } from '../ui/Toasts'
+import { EmptyState } from '../ui/EmptyState'
 
 type ActionLog = {
   id: number
@@ -287,7 +288,7 @@ export default function AdminLogsPage() {
   if (!isAdmin) return <div className="card p-3">Недостаточно прав.</div>
 
   return (
-    <div className="d-grid gap-3">
+    <div className="d-grid gap-3 admin-page-glass">
       <div className="card p-3">
         <div className="d-flex flex-wrap align-items-center gap-2 mb-3">
           <div className="fw-semibold fs-5 me-auto">Системный лог</div>
@@ -340,7 +341,7 @@ export default function AdminLogsPage() {
           ) : systemLogLines.length ? (
             <pre className="m-0 p-2" style={{ fontSize: 12, whiteSpace: 'pre-wrap' }}>{systemLogLines.join('\n')}</pre>
           ) : (
-            <div className="text-center text-muted py-4" style={{ fontSize: 13 }}>Лог пуст</div>
+            <EmptyState title="Лог пуст" description="Попробуйте обновить список или выбрать другой файл." />
           )}
         </div>
       </div>

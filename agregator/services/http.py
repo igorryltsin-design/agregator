@@ -77,6 +77,11 @@ def get_http_session() -> Session:
     return _SESSION
 
 
+def get_http_settings() -> HttpSettings:
+    """Возвращает текущие настройки HTTP-клиента."""
+    return _SETTINGS
+
+
 def _default_timeout() -> tuple[float, float]:
     connect = max(0.1, float(_SETTINGS.connect_timeout))
     read = max(connect + 1.0, float(_SETTINGS.timeout))

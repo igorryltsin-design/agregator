@@ -49,6 +49,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
     aiFilteredKeywords,
     aiSources,
     ragContext,
+    ragContextGroups,
     ragValidation,
     ragRetry,
     ragRisk,
@@ -102,7 +103,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
 
   return (
     <>
-      <div className="mb-2 d-flex align-items-center gap-2">
+      <div className="mb-2 d-flex align-items-center gap-2 ai-panel-topbar">
         <div className="form-check form-switch">
           <input className="form-check-input" type="checkbox" id="ai" checked={aiMode} onChange={e => setAiMode(e.target.checked)} />
           <label className="form-check-label" htmlFor="ai">Поиск ИИ</label>
@@ -120,7 +121,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
       </div>
 
       {aiMode && showAiSettings && (
-        <div className="card p-3 mb-2 bg-light">
+        <div className="card p-3 mb-2 bg-light ai-panel-card ai-panel-card--settings">
           <div className="row g-3">
             <div className="col-12 col-lg-3">
               <label className="form-label">Топ K (1–5)</label>
@@ -296,6 +297,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
 
       {aiMode && (aiProgress.length > 0 || aiLoading) && (
         <ProgressPanel
+          style={{ borderRadius: 16 }}
           className="mb-2"
           title="Прогресс поиска"
           caption={aiQueryHash ? `Хэш ${aiQueryHash.slice(0, 8)}` : undefined}
@@ -323,7 +325,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
         </div>
       )}
       {!!aiAnswer && (
-        <div className="card p-3 mb-2" aria-live="polite">
+        <div className="card p-3 mb-2 ai-panel-card ai-panel-card--answer" aria-live="polite">
           <div className="d-flex align-items-center justify-content-between mb-1 gap-2">
             <div className="fw-semibold">Ответ ИИ</div>
             {canSpeakAnswer && (
@@ -499,7 +501,7 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
       )}
 
       {aiUseRag && (ragContext?.length || ragRisk || displayedSources.length) && (
-        <div className="card p-3 mb-2">
+        <div className="card p-3 mb-2 ai-panel-card ai-panel-card--rag">
           <div className="d-flex justify-content-between align-items-center mb-2">
             <div className="fw-semibold">Контекст RAG</div>
             {ragRisk && (
@@ -612,6 +614,74 @@ const AiPanel: React.FC<AiPanelProps> = ({ ai }) => {
           )}
         </div>
       )}
+      {aiUseRag && ragContextGroups?.length ? (
+        <div className="card p-3 mb-2 ai-panel-card ai-panel-card--grouped">
+          <div className="fw-semibold mb-2">Обобщённый контекст по файлам</div>
+          {ragContextGroups.map((group, index) => {
+            const docTitle = group.title || `Документ ${group.doc_id}`
+            const docLink = group.url ? `/preview/${encodeURIComponent(group.url)}?embedded=1` : null
+            const headerId = `rag-group-${group.doc_id}-${index}`
+            return (
+              <div key={headerId} className="mb-3">
+                <div className="d-flex justify-content-between align-items-center mb-1">
+                  <strong>{docTitle}</strong>
+                  {docLink && (
+                    <a href={docLink} target="_blank" rel="noopener" className="small">
+                      Открыть
+                    </a>
+                  )}
+                </div>
+                {group.language && (
+                  <div className="text-muted" style={{ fontSize: '0.8rem' }}>
+                    Язык: {group.language}
+                  </div>
+                )}
+                {typeof group.combined_score === 'number' && (
+                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>Максимальный score: {formatScore(group.combined_score)}</div>
+                )}
+                <div className="mt-2">
+                  {group.chunks.map(chunk => {
+                    const extraEntries = chunk.extra && typeof chunk.extra === 'object'
+                      ? Object.entries(chunk.extra).slice(0, 3)
+                      : []
+                    return (
+                      <div key={`${group.doc_id}-${chunk.chunk_id}`} className="border rounded p-2 mb-2 bg-white">
+                        <div className="d-flex justify-content-between align-items-center mb-1">
+                          <span className="text-muted" style={{ fontSize: '0.8rem' }}>Чанк {chunk.chunk_id}</span>
+                          {typeof chunk.combined_score === 'number' && (
+                            <span className="badge bg-secondary-subtle text-secondary" style={{ fontSize: '0.7rem' }}>
+                              score {formatScore(chunk.combined_score)}
+                            </span>
+                          )}
+                        </div>
+                        {chunk.section_path && (
+                          <div className="text-muted" style={{ fontSize: '0.75rem' }}>Раздел: {chunk.section_path}</div>
+                        )}
+                        {chunk.preview && (
+                          <div className="mt-1" style={{ fontSize: '0.85rem' }} dangerouslySetInnerHTML={renderMultiline(chunk.preview, 400)} />
+                        )}
+                        {chunk.reasoning_hint && (
+                          <div className="text-warning" style={{ fontSize: '0.75rem' }}>{chunk.reasoning_hint}</div>
+                        )}
+                        {chunk.translation_hint && (
+                          <div className="text-info" style={{ fontSize: '0.75rem' }}>{chunk.translation_hint}</div>
+                        )}
+                        {extraEntries.length > 0 && (
+                          <ul className="mt-1 mb-0 ps-3" style={{ fontSize: '0.7rem', color: '#6c757d' }}>
+                            {extraEntries.map(([key, value]) => (
+                              <li key={key}><strong>{key}:</strong> {String(value)}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      ) : null}
     </>
   )
 }

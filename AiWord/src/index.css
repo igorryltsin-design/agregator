@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 /* Темная тема */
-.dark {
+.aiword-dark {
   color-scheme: dark;
 }
 
@@ -14,15 +14,27 @@
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-gray-100 dark:bg-gray-700;
+  @apply bg-gray-100;
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-gray-300 dark:bg-gray-600 rounded-full;
+  @apply bg-gray-300 rounded-full;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-gray-400 dark:bg-gray-500;
+  @apply bg-gray-400;
+}
+
+.aiword-dark ::-webkit-scrollbar-track {
+  @apply bg-gray-700;
+}
+
+.aiword-dark ::-webkit-scrollbar-thumb {
+  @apply bg-gray-600 rounded-full;
+}
+
+.aiword-dark ::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-500;
 }
 
 /* Анимация для состояний загрузки */
@@ -161,20 +173,20 @@ button:active {
 }
 
 /* Улучшенные стили для форм в темной теме */
-.dark input,
-.dark textarea,
-.dark select {
+.aiword-dark input,
+.aiword-dark textarea,
+.aiword-dark select {
   @apply bg-gray-700 border-gray-600 text-white;
 }
 
-.dark input:focus,
-.dark textarea:focus,
-.dark select:focus {
+.aiword-dark input:focus,
+.aiword-dark textarea:focus,
+.aiword-dark select:focus {
   @apply border-blue-500 ring-blue-500;
 }
 
 /* Стили для кнопок в темной теме */
-.dark button:not(.bg-blue-600):not(.bg-green-600):not(.bg-yellow-600):not(.bg-purple-600):not(.bg-red-600):not(.bg-indigo-600):not(.bg-gray-600) {
+.aiword-dark button:not(.bg-blue-600):not(.bg-green-600):not(.bg-yellow-600):not(.bg-purple-600):not(.bg-red-600):not(.bg-indigo-600):not(.bg-gray-600) {
  /* ВАЖНО: без @apply, чтобы не было циклической зависимости Tailwind */
  /* Эквивалентно: bg-gray-700 text-gray-200 border border-gray-600 */
  background-color: theme('colors.gray.700');
@@ -187,16 +199,16 @@ button:active {
 
 
 /* Стили для карточек в темной теме */
-.dark .bg-white {
+.aiword-dark .bg-white {
   @apply bg-gray-800;
 }
 
 /* Стили для границ в темной теме */
-.dark .border-gray-200 {
+.aiword-dark .border-gray-200 {
   @apply border-gray-700;
 }
 
-.dark .border-gray-300 {
+.aiword-dark .border-gray-300 {
   @apply border-gray-600;
 }
 
@@ -207,7 +219,7 @@ button:active {
   line-height: 0;
 }
 
-.dark .aiword-logo-badge {
+.aiword-dark .aiword-logo-badge {
   background: rgba(255, 255, 255, 0.92);
   box-shadow: 0 14px 28px rgba(15, 23, 42, 0.4);
 }
@@ -217,28 +229,28 @@ button:active {
 }
 
 /* Стили для текста в темной теме */
-.dark .text-gray-900 {
+.aiword-dark .text-gray-900 {
   @apply text-white;
 }
 
-.dark .text-gray-700 {
+.aiword-dark .text-gray-700 {
   @apply text-gray-300;
 }
 
-.dark .text-gray-600 {
+.aiword-dark .text-gray-600 {
   @apply text-gray-400;
 }
 
-.dark .text-gray-500 {
+.aiword-dark .text-gray-500 {
   @apply text-gray-400;
 }
 
 /* Стили для фона в темной теме */
-.dark .bg-gray-50 {
+.aiword-dark .bg-gray-50 {
   @apply bg-gray-700;
 }
 
-.dark .bg-gray-100 {
+.aiword-dark .bg-gray-100 {
   @apply bg-gray-700;
 }
 
@@ -261,7 +273,7 @@ button:active {
   @apply bg-green-100 text-green-800;
 }
 
-.dark .cache-indicator.cached {
+.aiword-dark .cache-indicator.cached {
   @apply bg-green-900 text-green-200;
 }
 
@@ -276,7 +288,7 @@ button:active {
   @apply flex items-center justify-center p-2 bg-white border border-gray-200 rounded hover:bg-gray-50 transition-colors;
 }
 
-.dark .quick-format-button {
+.aiword-dark .quick-format-button {
   @apply bg-gray-600 border-gray-500 hover:bg-gray-500;
 }
 
@@ -293,7 +305,7 @@ button:active {
   @apply border-blue-500 bg-blue-50 shadow-lg;
 }
 
-.dark .criteria-profile.selected {
+.aiword-dark .criteria-profile.selected {
   @apply bg-blue-900/20;
 }
 
@@ -302,7 +314,7 @@ button:active {
   @apply bg-gradient-to-br from-blue-50 to-indigo-100 p-4 rounded-lg;
 }
 
-.dark .stats-card {
+.aiword-dark .stats-card {
   @apply from-blue-900/20 to-indigo-900/20;
 }
 
