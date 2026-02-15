@@ -1,102 +1,103 @@
-# Локальная разработка и деплой
+# Развертывание Agregator
 
-Этот документ описывает практические сценарии запуска Agregator с помощью Docker Compose на целевой платформе **linux/amd64** и без него.
+Документ описывает рабочие сценарии выката: Docker Compose, запуск без Docker и поставка релизного артефакта.
 
-## Предварительные требования
-- Docker 24+ и Docker Compose v2.
-- 6–8 ГБ RAM на хосте (OCR/Whisper при первом старте могут потребовать больше времени).
-- 15+ ГБ свободного места для библиотеки, кешей и резервных копий.
-- Опционально: LM Studio или другой OpenAI-совместимый сервер, доступный с хоста.
+## 1. Стратегии деплоя
 
-## Файлы окружения
-- `docker/app.env` — базовые настройки контейнера (production-like).
-- `docker/app.dev.env` — dev-профиль: включает debug, отключает тяжёлые фоновые задачи.
-- `docker/app.test.env` — профиль для юнит-тестов.
+- **Docker Compose (рекомендуется):** быстрый и повторяемый запуск.
+- **Bare-metal (Python):** для сред без контейнеров.
+- **Релизный пакет + Ansible:** для контролируемого промышленного rollout.
 
-> ⚠️ Не храните в репозитории секреты. Если нужно переопределить значения, используйте `docker-compose.override.yml` или экспортируйте переменные в среду перед запуском (`export LMSTUDIO_API_KEY=...`).
+## 2. Docker Compose
 
-## Сценарии Docker Compose
-### Production-like (docker-compose.yml)
+### 2.1 Базовые команды
+
 ```bash
 docker compose build
-# первый запуск
 docker compose up -d
-# обновление
+docker compose ps
+```
+
+Обновление:
+
+```bash
 docker compose pull
 docker compose up -d --force-recreate agregator
 ```
 
-### Локальная разработка с горячей перезагрузкой
-`docker-compose.dev.yml` наследует базовый сервис и добавляет монтирование исходников + команду `flask run --reload`.
+### 2.2 Важные volume-пути
+
+- `./library -> /data` - рабочая библиотека.
+- `./backups -> /app/backups` - резервные копии и экспорт.
+- `./models -> /app/models` - модели и кэш артефактов.
+- `./logs -> /app/logs` - журналы приложения.
+
+### 2.3 Проверка после выката
+
+- Проверить HTTP-доступность `http://<host>:5050/app`.
+- Проверить логи `docker compose logs agregator`.
+- Выполнить smoke-сценарий: login -> импорт -> поиск -> AI-поиск.
+
+## 3. Локальный сервер без Docker
+
+1. Подготовить virtualenv и зависимости.
+2. Собрать frontend (`frontend`, `AiWord`).
+3. Запустить `python app.py`.
+4. При сервисном режиме использовать systemd/supervisord.
+
+Пример запуска через Flask debug:
 
 ```bash
-# 1. Соберите образ (однократно):
-docker compose -f docker-compose.dev.yml build
-
-# 2. Поднимите контейнер с дев-настройками:
-docker compose -f docker-compose.dev.yml up --remove-orphans
-
-# 3. Откройте http://localhost:5050/app. Изменения Python-кода применяются автоматически.
+flask --app app run --debug --port 5050
 ```
 
-> Чтобы переопределить dev-настройки, создайте `docker-compose.override.yml` и добавьте блок `services.agregator-dev.environment` со своими значениями.
+## 4. Релизный пакет
 
-### Запуск юнит-тестов в контейнере
-`docker-compose.test.yml` наслаивается на базовый сервис и запускает `pytest`.
+В репозитории предусмотрен упаковочный сценарий:
 
 ```bash
-# Выполнить тесты и удалить контейнер после завершения
-docker compose -f docker-compose.test.yml run --rm agregator-test
+./scripts/package_release.sh
 ```
 
-### Обновление фронтенда
-Образ автоматически собирает `frontend` и `AiWord`. Для локальной разработки без Docker можно:
-```bash
-npm --prefix frontend install
-npm --prefix frontend run build
-npm --prefix AiWord install
-npm --prefix AiWord run build
-```
-Статические файлы появятся в `frontend/dist` и `AiWord/dist`.
+Результат: архив в `dist/` с backend, frontend-сборками и служебными файлами.
 
-### Резервные копии и каталоги данных
-- `./library` → `/data` — директория с материалами (настраивается через `SCAN_ROOT`).
-- `./backups` → `/app/backups` — архивы БД/метаданных.
-- `./logs` → `/app/logs` — журналы `agregator.log` и фоновых задач.
+## 5. Развертывание через Ansible
 
-Регулярно копируйте `library` и `backups` на внешний носитель.
+Если используется `deploy/ansible`:
 
-## Альтернативный запуск без Docker
-Инструкции в разделе «Установка и запуск» README остаются актуальны: используйте virtualenv, `pip install -r requirements.txt`, `python app.py`. Для Watch-mode можно установить `pip install watchdog` и запускать `flask --app app --debug run`.
+1. Подготовить inventory.
+2. Передать путь к релизному архиву.
+3. Выполнить playbook.
 
-## Пакетирование релиза
-Для выкладки без Docker предусмотрен сборочный скрипт:
+Пример:
 
 ```bash
-./scripts/package_release.sh            # создаст dist/agregator-<version>.tar.gz
-./scripts/package_release.sh v3.0.0     # зафиксировать версию вручную
+ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml \
+  -e agregator_release_tarball=/tmp/agregator-<version>.tar.gz \
+  -e agregator_release_id=<version>
 ```
 
-Скрипт собирает фронтенд (`frontend/dist`, `AiWord/dist`) и упаковывает исходники в `dist/agregator-<version>.tar.gz`. Артефакт можно копировать на целевой сервер или использовать в Ansible.
+## 6. Регламент обновления
 
-## Развёртывание через Ansible
-В каталоге `deploy/ansible` находится базовый шаблон:
+1. Создать резервную копию БД и `runtime_settings.json`.
+2. Зафиксировать текущую версию и окружение.
+3. Выполнить обновление.
+4. Прогнать smoke-тест.
+5. Подтвердить работоспособность AI и задач.
+6. Обновить внутренний журнал изменений.
 
-1. Отредактируйте `inventory.sample`, указав адрес сервера и пользователя, затем сохраните как `inventory`.
-2. Запустите playbook, передав путь к релизу:
-   ```bash
-   ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml \
-     -e agregator_release_tarball=/tmp/agregator-<version>.tar.gz \
-     -e agregator_release_id=<version>
-   ```
+## 7. План отката
 
-Роль создаёт пользователя `agregator`, разворачивает релиз в `/opt/agregator/releases/<version>`, настраивает виртуальное окружение и systemd unit `agregator.service` (см. шаблон `deploy/ansible/roles/agregator/templates/agregator.service.j2`). Настройки можно переопределять через `-e` или vars-файл.
+При неуспешном обновлении:
 
-> Секреты и переменные среды следует хранить в `{{ agregator_root }}/shared/env/.env`. Playbook не создаёт файл автоматически.
+1. Остановить новую версию.
+2. Восстановить предыдущий контейнер/артефакт.
+3. Вернуть резервную копию БД.
+4. Перезапустить сервис и повторить проверку ключевых функций.
 
-## Типовые проблемы
-- **Контейнер падает сразу после старта.** Проверьте логи `docker compose logs agregator` и корректность `FLASK_SECRET_KEY`.
-- **LM Studio недоступен из контейнера.** На macOS/Windows используйте `http://host.docker.internal:1234/v1`.
-- **OCR не работает в образе.** Убедитесь, что `docker/system-packages.txt` содержит нужные языковые пакеты (`tesseract-ocr-rus` и т.п.), пересоберите образ.
+## 8. Эксплуатационные рекомендации
 
-Дополнительно смотрите `docs/architecture.md` и README для обзора функций и API.
+- Выделять отдельную БД PostgreSQL для прод-режима.
+- Ограничивать прямой доступ к admin endpoint-ам.
+- Настроить ротацию логов и мониторинг диска.
+- Регулярно проверять восстановление из резервной копии.

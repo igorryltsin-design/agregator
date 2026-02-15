@@ -1,61 +1,46 @@
-# UX Metrics Baseline
+# UX-метрики и контроль качества интерфейса
 
-## Purpose
+Документ задает базовый набор UX-метрик и чек-лист проверки интерфейса перед релизом.
 
-This document tracks UX improvements introduced in the interface upgrade and provides a repeatable checklist for phase-by-phase verification.
+## 1. Цели
 
-## Core Metrics
+- снижать количество действий до ключевых функций;
+- поддерживать единообразные состояния интерфейса;
+- предотвращать визуальные и поведенческие регрессии.
 
-| Metric | Baseline Method | Target |
-|---|---|---|
-| Clicks to key admin flows | Count click path from `/` to `admin/status`, `admin/tasks`, `admin/collections` | -20% vs current baseline |
-| Coverage of unified states | Audit key routes for `empty/loading/error` consistency | 100% on key routes |
-| UI regressions per release | Count UX-related bugs in release notes/issues | Downward trend |
-| Token consistency | Search for hardcoded color values in UI modules | No new hardcoded tokens in shared UI |
+## 2. Базовые метрики
 
-## Baseline Snapshot Procedure
+| Метрика | Как измерять | Цель |
+| --- | --- | --- |
+| Путь до ключевых admin-экранов | Количество кликов | Снижение на 20% к базовой версии |
+| Покрытие состояний UI | Проверка `loading/empty/error` на критичных страницах | 100% |
+| UX-дефекты на релиз | Количество дефектов в релиз-заметках | Тренд на снижение |
+| Консистентность темы | Поиск hardcoded цветов и исключений | Без новых нарушений |
 
-1. Use a standard admin account and standard editor account.
-2. Record click count for:
-   - catalog -> service status
-   - catalog -> tasks
-   - catalog -> collections
-3. Visit key routes and record whether each has:
-   - empty state
-   - loading state
-   - error boundary fallback
-4. Run code search for hardcoded color literals in `frontend/src` and log count.
-
-## Key Route Coverage Checklist
+## 3. Обязательные маршруты проверки
 
 - `/`
-- `/doc-chat`
-- `/osint`
+- `/settings`
 - `/stats`
 - `/ingest`
-- `/profile`
-- `/settings`
+- `/doc-chat` (если включен)
 - `/admin/status`
 - `/admin/tasks`
 - `/admin/logs`
-- `/admin/llm`
 - `/admin/collections`
 - `/admin/ai-metrics`
-- `/admin/facets`
 
-## Release Validation Checklist
+## 4. Релизный чек-лист UX
 
-For each UX release phase:
+- [ ] Проверен путь пользователя к целевым задачам.
+- [ ] На ключевых страницах корректны `loading`, `empty`, `error`.
+- [ ] Нет критичных визуальных дефектов в светлой/темной теме.
+- [ ] Проверены уведомления, ошибки и fallback-поведение.
+- [ ] Итоги проверки зафиксированы в истории ниже.
 
-- [ ] Navigation path click counts measured and compared to baseline
-- [ ] Key route coverage checklist re-validated
-- [ ] No critical visual regressions in dark/light themes
-- [ ] Toast, offline, and error fallback behavior manually verified
-- [ ] Result summary added to this file under "History"
+## 5. История проверок
 
-## History
+### 2026-02-15
 
-### 2026-02-13
-
-- Created baseline template and validation checklist.
-- Added measurable target definitions for navigation efficiency and UX state coverage.
+- Документ обновлен и приведен к единому стандарту.
+- Зафиксирован базовый чек-лист для следующих релизов.
